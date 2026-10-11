@@ -106,6 +106,7 @@ final class IPTVLiveOverlayController {
     browsingGroup = nil
     listIndex = 0
     installKeyMonitor()
+    IPTVBrowseOverlayController.shared.noteLiveSession()
     show(.banner)
   }
 
@@ -163,6 +164,7 @@ final class IPTVLiveOverlayController {
     }
     let anchor = main.videoView.superview === container ? main.videoView : nil
     container.addSubview(host, positioned: .above, relativeTo: anchor)
+    IPTVBrowseOverlayController.shared.bringToFront()
     GlassesEyeControls.shared.bringToFront()
     host.needsLayout = true
     ensureClock()
@@ -172,6 +174,7 @@ final class IPTVLiveOverlayController {
   // MARK: - Input
 
   func handleKeyDown(_ event: NSEvent) -> Bool {
+    if IPTVBrowseOverlayController.shared.capturesInput { return false }
     guard session != nil else { return false }
     if !PlayerCore.playerCores.isEmpty, PlayerCore.active.mainWindow.window?.firstResponder is NSTextView {
       return false
@@ -287,6 +290,7 @@ final class IPTVLiveOverlayController {
 
   /// Remote next/previous. Returns true when a live session consumed the key.
   func zapFromRemote(next: Bool) -> Bool {
+    if IPTVBrowseOverlayController.shared.capturesInput { return false }
     guard session != nil else { return false }
     if mode == .list {
       moveList(by: next ? 1 : -1)
@@ -301,6 +305,7 @@ final class IPTVLiveOverlayController {
   }
 
   func handleScroll(_ event: NSEvent) -> Bool {
+    if IPTVBrowseOverlayController.shared.capturesInput { return false }
     guard session != nil else { return false }
     let horizontal = abs(event.scrollingDeltaX) > abs(event.scrollingDeltaY)
     if horizontal && mode != .list && mode != .guide { return false }
@@ -337,6 +342,7 @@ final class IPTVLiveOverlayController {
   }
 
   func handleClick(in pane: IPTVLiveOverlayPane, event: NSEvent) {
+    if IPTVBrowseOverlayController.shared.capturesInput { return }
     clearDigits()
     guard let session else { return }
     if event.clickCount >= 2 {
@@ -382,6 +388,7 @@ final class IPTVLiveOverlayController {
   /// Pointer moved over one eye half. The pane's local point is already that half,
   /// so the same row lights up in both eyes.
   func handleHover(_ event: NSEvent) {
+    if IPTVBrowseOverlayController.shared.capturesInput { return }
     guard session != nil, mode == .list || mode == .guide else { return }
     guard let pane = pane(containing: event) else { return }
     let point = pane.convert(event.locationInWindow, from: nil)
@@ -499,6 +506,8 @@ final class IPTVLiveOverlayController {
     guard keyMonitor == nil else { return }
     keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
       guard let self, self.session != nil else { return event }
+      // The movies and series overlay is in front. Let its monitor take the key.
+      if IPTVBrowseOverlayController.shared.capturesInput { return event }
       let source: String
       if self.shouldRoute(event) {
         source = "monitor"
@@ -1205,10 +1214,10 @@ enum IPTVLiveDraw {
     text(letter.isEmpty ? "?" : letter, in: rect, font: .systemFont(ofSize: 14, weight: .bold), color: .white, align: .center)
   }
 
-  static func text(_ string: String, in rect: NSRect, font: NSFont, color: NSColor, align: NSTextAlignment = .left) {
+  static func text(_ string: String, in rect: NSRect, font: NSFont, color: NSColor, align: NSTextAlignment = .left, wrap: Bool = false) {
     guard rect.width > 2, rect.height > 2 else { return }
     let style = NSMutableParagraphStyle()
-    style.lineBreakMode = .byTruncatingTail
+    style.lineBreakMode = wrap ? .byWordWrapping : .byTruncatingTail
     style.alignment = align
     let attributes: [NSAttributedString.Key: Any] = [
       .font: font,

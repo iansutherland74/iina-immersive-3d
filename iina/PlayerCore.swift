@@ -2112,6 +2112,8 @@ class PlayerCore: NSObject {
     DispatchQueue.main.async {
       IPTVLiveOverlayController.shared.noteFileStarted(path: startedPath)
       IPTVLiveOverlayController.shared.attachIfNeeded()
+      IPTVBrowseOverlayController.shared.noteForeignFile()
+      IPTVBrowseOverlayController.shared.attachIfNeeded()
     }
     if let url = info.currentURL {
       info.mpvMd5 = Utility.mpvWatchLaterMd5(url, ignorePathInWatchLaterConfig)
@@ -2286,6 +2288,7 @@ class PlayerCore: NSObject {
 
   func fileEnded(_ dueToStopCommand: Bool) {
     syncPositionIfNeeded()
+    IPTVBrowseOverlayController.shared.noteFileEnded(position: info.videoPosition?.second, duration: info.videoDuration?.second, stopped: dueToStopCommand)
     IPTVLibrary.shared.playbackEnded(position: info.videoPosition?.second, duration: info.videoDuration?.second)
     // The stand-in is only needed while this file is current. History was written in fileLoaded.
     IPTVLibrary.shared.consumeHistoryStandIn(for: info.currentURL)

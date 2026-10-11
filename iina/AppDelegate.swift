@@ -1479,6 +1479,7 @@ class RemoteCommandController {
       return .success
     }
     remoteCommand.nextTrackCommand.addTarget { _ in
+      if IPTVBrowseOverlayController.shared.moveFromRemote(next: true) { return .success }
       if IPTVLiveOverlayController.shared.zapFromRemote(next: true) { return .success }
       if let action = PlayerCore.keyBindings["NEXT"] {
         PlayerCore.lastActive.mainWindow.handleKeyBinding(action)
@@ -1488,6 +1489,7 @@ class RemoteCommandController {
       return .success
     }
     remoteCommand.previousTrackCommand.addTarget { _ in
+      if IPTVBrowseOverlayController.shared.moveFromRemote(next: false) { return .success }
       if IPTVLiveOverlayController.shared.zapFromRemote(next: false) { return .success }
       if let action = PlayerCore.keyBindings["PREV"] {
         PlayerCore.lastActive.mainWindow.handleKeyBinding(action)
