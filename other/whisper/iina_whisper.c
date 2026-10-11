@@ -10,6 +10,8 @@
 static struct whisper_context * g_ctx = NULL;
 static char g_error[512];
 static volatile int g_abort = 0;
+static volatile int g_epoch = 0;
+static int g_segments = -1;
 
 static bool iina_abort(void * userdata) {
   (void)userdata;
@@ -22,7 +24,17 @@ static void set_error(const char * message) {
 
 __attribute__((visibility("default")))
 void iina_whisper_set_abort(int flag) {
-  g_abort = flag;
+  if (flag) {
+    g_epoch += 1;
+    g_abort = 1;
+  } else {
+    g_abort = 0;
+  }
+}
+
+__attribute__((visibility("default")))
+int iina_whisper_last_segments(void) {
+  return g_segments;
 }
 
 __attribute__((visibility("default")))
@@ -114,9 +126,13 @@ int iina_whisper_transcribe(
   params.suppress_nst = true;
   params.temperature = 0.0f;
   params.initial_prompt = NULL;
-  // "auto" makes whisper.cpp detect the language and then keep transcribing.
-  // detect_language must stay false: that flag returns as soon as the language
-  // id is known, so the caller gets an empty string and the screen stays blank.
+  // Sung lyrics often score as non-speech or as low-probability tokens, so the
+  // stock 0.6 / -1.0 cutoffs return an empty result for a music video. The
+  // caller already drops near-silent chunks by RMS. "auto" still detects the
+  // language and then transcribes; detect_language must stay false because
+  // that flag returns before any words are decoded.
+  params.no_speech_thold = 0.95f;
+  params.logprob_thold = -1.5f;
   params.language = (language && language[0] && strcmp(language, "auto") != 0) ? language : "auto";
   params.detect_language = false;
   if (beam > 1) {
@@ -127,8 +143,25 @@ int iina_whisper_transcribe(
   params.abort_callback = iina_abort;
   params.abort_callback_user_data = NULL;
 
-  int rc = whisper_full(g_ctx, params, samples, n_samples);
+  g_segments = -1;
+  int epoch = g_epoch;
   if (g_abort) {
+    g_segments = 0;
+    set_error("aborted");
+    return 4;
+  }
+
+  int rc = whisper_full(g_ctx, params, samples, n_samples);
+  int stopped = g_abort || g_epoch != epoch;
+  int nseg = 0;
+  if (rc == 0) {
+    nseg = whisper_full_n_segments(g_ctx);
+  }
+  g_segments = nseg;
+  // A new file can set the abort flag while this chunk is finishing. Keep the
+  // text when segments were produced; the caller drops it if that file is gone.
+  // An abort with no segments must not stick and cancel the next chunk.
+  if (stopped && nseg <= 0) {
     set_error("aborted");
     return 4;
   }
@@ -137,7 +170,6 @@ int iina_whisper_transcribe(
     return rc;
   }
 
-  int nseg = whisper_full_n_segments(g_ctx);
   size_t cap = 1024;
   char * buf = (char *)malloc(cap);
   if (!buf) {
