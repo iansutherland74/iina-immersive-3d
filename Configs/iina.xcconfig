@@ -18,6 +18,7 @@ INFOPLIST_PREFIX_HEADER = $(DERIVED_FILE_DIR)/Info.h
 INFOPLIST_PREPROCESS = YES
 INFOPLIST_KEY_NSPrincipalClass = NSApplication
 LD_RUNPATH_SEARCH_PATHS = $(inherited) @executable_path/../Frameworks
+OTHER_LDFLAGS = $(inherited) -weak_framework ScreenCaptureKit
 LIBRARY_SEARCH_PATHS = $(inherited) $(SRCROOT)/deps/lib
 PRODUCT_BUNDLE_IDENTIFIER = com.colliderli.$(TARGET_NAME)
 PRODUCT_NAME = IINA

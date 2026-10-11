@@ -108,6 +108,14 @@ Open a local file or an online URL (yt-dlp, already part of IINA). Then:
 
 Depth runs at the model's fixed size (518×392 for Apple's package, or whatever size you converted). Similar frames reuse the last map, and successive maps are smoothed so the stereo does not flicker. Until the first map arrives, the shift uses a flat depth so the layout is already side-by-side.
 
+## Browser Capture
+
+**Video → Choose Capture Window…**, **Start Capture**, and **Send Capture to Glasses** take one other app's window and run it through the same depth pass and side-by-side shader as a video frame. The player framebuffer and this source both call `Immersive3DController.submitFrame`. ScreenCaptureKit (`SCShareableContent`, an `SCContentFilter` for that window, and an `SCStream`) delivers `CVPixelBuffer`s on a dedicated queue. Those become Metal textures through `CVMetalTextureCache`, then the existing depth model and stereo kernel. **Send Capture to Glasses** uses the same display choice, mirror split, shielding level, and full-screen frame as **Play on Glasses**, on its own window, so the player window is not moved. A resolution change pins that window again.
+
+Audio is not captured. The stream does not add an audio output, and on macOS 13 and later `capturesAudio` is off, so sound keeps playing in the browser or other app. The cursor is not copied into the picture. IINA's own capture window, the chooser, and the player window while it is on the glasses are left out of the list so the glasses picture is not captured back.
+
+This uses only the normal Screen Recording permission (`NSScreenCaptureUsageDescription`, `CGRequestScreenCaptureAccess`). If macOS marks a frame blank, or the picture stays black, the window says so. That is how protected video (DRM) is handed out. Nothing in this path tries to read a window another way, turn sharing back on, or break that protection. Pick a window whose picture is already visible, or open the file in IINA. The feature needs macOS 12.3. The deployment target stays 12, and ScreenCaptureKit is weak-linked.
+
 ## IPTV
 
 **File → IPTV…** (Option-Command-I) opens a TV-style browser. It is not a sidebar tab. Playback goes through the normal player, so **Video → Immersive 3D** and **Play on Glasses** apply to these streams the same way they apply to any other URL.
@@ -179,6 +187,7 @@ Saved sources and favourites live in `~/Library/Application Support/com.collider
 - Square 504×504 DA3 inference stretches the frame for the depth pass. A 16:9-friendly alternative that is still a multiple of 14 is `--width 364 --height 210`, which the loader will pick up because the name starts with `DepthAnything3`.
 - A device test showed the live list and guide on screen, with no response to Up/Down or selecting a channel. The key-routing change after that test was not tried again on the glasses. Channel up/down, with the list closed, follows the current group; the number keys use the position in the full live list. The per-eye control bar and cursor were not shown on the glasses either.
 - The movies and series overlay (M / Home, poster grid, details, seasons, next-episode card) was not shown on the glasses or with a playlist. It reuses the catalog, title, artwork, and progress code paths; those paths were not run here.
+- Browser Capture was not run on a Mac. No window was captured, Screen Recording was not prompted, and the glasses output was not shown. A protected window was not tested; the blank-frame message is the intended result, and there is no second capture path behind it.
 - Live captions were not run on a Mac. The delay, the M2 load, Metal, Core ML, the second audio decode, lookahead, the live cache hold, and both-eye drawing were not measured. No Whisper model was downloaded here, and no translation API was called.
 - IPTV was not compiled or opened. No playlist was fetched, no Xtream server was contacted, no TMDB host was contacted, and the Keychain was not written. The M3U, XMLTV-offset, stream-URL, catch-up, title-field, TMDB-merge, and resume-threshold checks were a Python transcription of those rules, then deleted.
 - An `iptv://` history row does not play again. Resume-from-history and watch-later are off for these streams.

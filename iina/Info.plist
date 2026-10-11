@@ -1381,6 +1381,8 @@
       </dict>
     </dict>
 	</array>
+	<key>NSScreenCaptureUsageDescription</key>
+	<string>IINA captures the window you choose and turns that picture into side-by-side 3D on the glasses. Audio stays in the other app. Protected video stays black; IINA does not bypass it.</string>
 	<key>com.colliderli.iina.build.branch</key>
 	<string>IINA_BUILD_BRANCH</string>
 	<key>com.colliderli.iina.build.commit</key>
