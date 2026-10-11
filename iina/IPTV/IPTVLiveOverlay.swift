@@ -59,8 +59,12 @@ final class IPTVLiveOverlayController {
   private(set) var guideRow = 0
   private(set) var guideAnchor = Date()
   private(set) var guideFocus = Date()
+  private(set) var listIndex = 0
+  /// Group shown in the channel list. Nil follows the channel that is playing.
+  private var browsingGroup: String?
 
   private let host = IPTVLiveOverlayHost()
+  private var keyMonitor: Any?
   private var hideTimer: Timer?
   private var digitTimer: Timer?
   private var clock: Timer?
@@ -99,6 +103,9 @@ final class IPTVLiveOverlayController {
     playGeneration += 1
     digits = ""
     notice = nil
+    browsingGroup = nil
+    listIndex = 0
+    installKeyMonitor()
     show(.banner)
   }
 
@@ -109,10 +116,13 @@ final class IPTVLiveOverlayController {
   }
 
   func end() {
+    removeKeyMonitor()
     session = nil
     mode = .hidden
     digits = ""
     notice = nil
+    browsingGroup = nil
+    listIndex = 0
     hideTimer?.invalidate()
     digitTimer?.invalidate()
     clock?.invalidate()
@@ -186,11 +196,13 @@ final class IPTVLiveOverlayController {
       }
       return false
     }
-    if code == 51 || code == 117 || plain == "\u{7f}" {
+    if code == 51 || code == 117 || plain == "\u{7f}" || plain == "\u{8}" {
       if !digits.isEmpty {
         digits.removeLast()
         armDigits()
         redraw()
+      } else if mode == .list || mode == .guide {
+        hide()
       } else {
         toggleLastChannel()
       }
@@ -210,7 +222,7 @@ final class IPTVLiveOverlayController {
       }
       switch mode {
       case .list:
-        hide()
+        activateListSelection()
       case .guide:
         activateGuide()
       case .hidden, .banner:
@@ -223,57 +235,97 @@ final class IPTVLiveOverlayController {
       return true
     }
     if code == 126 || plain == "\u{f700}" {
-      if mode == .guide { moveGuide(rows: -1) } else { changeChannel(by: -1) }
+      if mode == .guide { moveGuide(rows: -1) }
+      else if mode == .list { moveList(by: -1) }
+      else { changeChannel(by: -1) }
       return true
     }
     if code == 125 || plain == "\u{f701}" {
-      if mode == .guide { moveGuide(rows: 1) } else { changeChannel(by: 1) }
+      if mode == .guide { moveGuide(rows: 1) }
+      else if mode == .list { moveList(by: 1) }
+      else { changeChannel(by: 1) }
       return true
     }
     if code == 116 || plain == "\u{f72c}" {
-      if mode == .guide { moveGuide(rows: -8) } else { changeChannel(by: -10) }
+      if mode == .guide { moveGuide(rows: -visibleGuideRows()) }
+      else if mode == .list { moveList(by: -visibleListRows()) }
+      else { changeChannel(by: -10) }
       return true
     }
     if code == 121 || plain == "\u{f72d}" {
-      if mode == .guide { moveGuide(rows: 8) } else { changeChannel(by: 10) }
+      if mode == .guide { moveGuide(rows: visibleGuideRows()) }
+      else if mode == .list { moveList(by: visibleListRows()) }
+      else { changeChannel(by: 10) }
       return true
     }
-    if mode == .guide && (code == 123 || plain == "\u{f702}") {
-      moveGuide(programmes: -1)
-      return true
+    if code == 123 || plain == "\u{f702}" {
+      if mode == .guide { moveGuide(programmes: -1); return true }
+      if mode == .list { switchGroup(by: -1); return true }
+      return false
     }
-    if mode == .guide && (code == 124 || plain == "\u{f703}") {
-      moveGuide(programmes: 1)
-      return true
+    if code == 124 || plain == "\u{f703}" {
+      if mode == .guide { moveGuide(programmes: 1); return true }
+      if mode == .list { switchGroup(by: 1); return true }
+      return false
     }
     return false
+  }
+
+  /// One line per navigation key while a live session exists, including keys that
+  /// were not consumed, so a glasses test can see where the event went.
+  func logKey(_ event: NSEvent, source: String, consumed: Bool) {
+    guard session != nil else { return }
+    let code = event.keyCode
+    let navigation = [36, 51, 53, 76, 116, 117, 121, 123, 124, 125, 126].contains(Int(code))
+    guard navigation || mode == .list || mode == .guide else { return }
+    let eventWindow = event.window
+    let keyWindow = NSApp.keyWindow
+    let message = "IPTV key route source=\(source) code=\(code) chars=\(event.charactersIgnoringModifiers ?? "") mode=\(mode) consumed=\(consumed) eventWindow=\(eventWindow.map { String(describing: type(of: $0)) } ?? "nil") eventIsKey=\(eventWindow?.isKeyWindow ?? false) keyWindow=\(keyWindow.map { String(describing: type(of: $0)) } ?? "nil") keyTitle=\(keyWindow?.title ?? "") glasses=\(Immersive3DController.shared.glassesActive) canBecomeKey=\((eventWindow as? MainWindow)?.canBecomeKey ?? (keyWindow as? MainWindow)?.canBecomeKey ?? false)"
+    NSLog("%@", message)
+    Logger.log(message, level: .warning)
   }
 
   /// Remote next/previous. Returns true when a live session consumed the key.
   func zapFromRemote(next: Bool) -> Bool {
     guard session != nil else { return false }
+    if mode == .list {
+      moveList(by: next ? 1 : -1)
+      return true
+    }
+    if mode == .guide {
+      moveGuide(rows: next ? 1 : -1)
+      return true
+    }
     changeChannel(by: next ? 1 : -1)
     return true
   }
 
   func handleScroll(_ event: NSEvent) -> Bool {
     guard session != nil else { return false }
-    if abs(event.scrollingDeltaX) > abs(event.scrollingDeltaY) { return false }
+    let horizontal = abs(event.scrollingDeltaX) > abs(event.scrollingDeltaY)
+    if horizontal && mode != .list && mode != .guide { return false }
     if event.momentumPhase.contains(.began) || event.momentumPhase.contains(.changed) {
-      return true
+      return mode == .list || mode == .guide
     }
-    let delta = event.scrollingDeltaY
-    guard abs(delta) > 0.4 else { return false }
-    if mode == .guide {
+    if mode == .list || mode == .guide {
+      if horizontal {
+        let step = event.scrollingDeltaX > 0 ? -1 : 1
+        if mode == .list { switchGroup(by: step) } else { moveGuide(programmes: step) }
+        return true
+      }
+      let delta = event.scrollingDeltaY
+      guard abs(delta) > 0.4 else { return true }
       let step = delta > 0 ? -1 : 1
       if event.hasPreciseScrollingDeltas {
         scrollAccum += delta
         guard abs(scrollAccum) >= 36 else { return true }
         scrollAccum = 0
       }
-      moveGuide(rows: step)
+      if mode == .list { moveList(by: step) } else { moveGuide(rows: step) }
       return true
     }
+    let delta = event.scrollingDeltaY
+    guard abs(delta) > 0.4 else { return false }
     let direction = delta > 0 ? -1 : 1
     if event.hasPreciseScrollingDeltas {
       let now = Date()
@@ -303,10 +355,11 @@ final class IPTVLiveOverlayController {
       return
     }
     if mode == .list, let row = IPTVLiveChrome.listRow(at: point, in: chrome.list) {
-      let group = session.groupChannels()
+      let rows = listedChannels()
       let index = listTop + row
-      guard group.indices.contains(index) else { return }
-      play(group[index], catchup: nil)
+      guard rows.indices.contains(index) else { return }
+      listIndex = index
+      play(rows[index], catchup: nil)
       return
     }
     if mode == .guide, let hit = guideHit(at: point, in: chrome.guide) {
@@ -324,6 +377,184 @@ final class IPTVLiveOverlayController {
     } else {
       showList()
     }
+  }
+
+  /// Pointer moved over one eye half. The pane's local point is already that half,
+  /// so the same row lights up in both eyes.
+  func handleHover(_ event: NSEvent) {
+    guard session != nil, mode == .list || mode == .guide else { return }
+    guard let pane = pane(containing: event) else { return }
+    let point = pane.convert(event.locationInWindow, from: nil)
+    let chrome = IPTVLiveChrome.layout(in: pane.bounds, mode: mode)
+    if mode == .list, let row = IPTVLiveChrome.listRow(at: point, in: chrome.list) {
+      let index = listTop + row
+      guard listedChannels().indices.contains(index), index != listIndex else { return }
+      listIndex = index
+      armHide()
+      redraw()
+      return
+    }
+    if mode == .guide, let hit = guideHit(at: point, in: chrome.guide) {
+      let previous = selectedProgramme()?.start
+      let nextStart = hit.programme?.start
+      guard guideRow != hit.row || previous != nextStart else { return }
+      guideRow = hit.row
+      if let programme = hit.programme {
+        guideFocus = programme.start.addingTimeInterval(1)
+      }
+      revealGuideSelection()
+      armHide()
+      redraw()
+    }
+  }
+
+  func listedChannels() -> [IPTVItem] {
+    guard let session else { return [] }
+    let group = browsingGroup ?? session.item.group
+    let matched = session.channels.filter { $0.group == group }
+    return matched.isEmpty ? session.channels : matched
+  }
+
+  func listedGroupTitle() -> String {
+    let group = browsingGroup ?? session?.item.group ?? ""
+    let name = group.isEmpty ? "Ungrouped" : group
+    return listedGroups().count > 1 ? "\(name)   ← →" : name
+  }
+
+  private func listedGroups() -> [String] {
+    guard let session else { return [] }
+    var ordered: [String] = []
+    var seen = Set<String>()
+    for channel in session.channels where seen.insert(channel.group).inserted {
+      ordered.append(channel.group)
+    }
+    return ordered
+  }
+
+  private func moveList(by delta: Int) {
+    let rows = listedChannels()
+    guard !rows.isEmpty else { return }
+    let count = rows.count
+    listIndex = ((listIndex + delta) % count + count) % count
+    revealListSelection()
+    armHide()
+    redraw()
+  }
+
+  private func switchGroup(by delta: Int) {
+    let groups = listedGroups()
+    guard let session, groups.count > 1 else { return }
+    let current = browsingGroup ?? session.item.group
+    let index = groups.firstIndex(of: current) ?? 0
+    let count = groups.count
+    let next = ((index + delta) % count + count) % count
+    browsingGroup = groups[next]
+    let rows = listedChannels()
+    listIndex = rows.firstIndex { $0.id == session.item.id } ?? 0
+    listTop = 0
+    revealListSelection()
+    notice = groups[next].isEmpty ? "Ungrouped" : groups[next]
+    armHide()
+    redraw()
+  }
+
+  private func activateListSelection() {
+    let rows = listedChannels()
+    guard rows.indices.contains(listIndex) else { return }
+    play(rows[listIndex], catchup: nil)
+  }
+
+  private func visibleListRows() -> Int {
+    guard let pane = host.panes.first(where: { !$0.isHidden }) else { return 8 }
+    let height = IPTVLiveChrome.layout(in: pane.bounds, mode: .list).list.height
+    return max(1, Int((height - 50) / 54))
+  }
+
+  private func visibleGuideRows() -> Int {
+    guard let pane = host.panes.first(where: { !$0.isHidden }) else { return 8 }
+    let height = IPTVLiveChrome.layout(in: pane.bounds, mode: .guide).guide.height
+    return max(1, Int((height - 46) / 46))
+  }
+
+  private func pane(containing event: NSEvent) -> IPTVLiveOverlayPane? {
+    host.panes.first { pane in
+      guard !pane.isHidden, pane.window != nil else { return false }
+      let local = pane.convert(event.locationInWindow, from: nil)
+      return pane.bounds.contains(local)
+    }
+  }
+
+  private func claimKeyWindow() {
+    guard !PlayerCore.playerCores.isEmpty, let main = PlayerCore.active.mainWindow else { return }
+    guard let window = main.window else { return }
+    if Immersive3DController.shared.glassesActive, let mainWindow = window as? MainWindow {
+      mainWindow.forceKeyAndMain = true
+    }
+    NSApp.activate(ignoringOtherApps: true)
+    window.makeKeyAndOrderFront(nil)
+    window.makeFirstResponder(window.contentView)
+  }
+
+  private func installKeyMonitor() {
+    guard keyMonitor == nil else { return }
+    keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+      guard let self, self.session != nil else { return event }
+      let source: String
+      if self.shouldRoute(event) {
+        source = "monitor"
+      } else if self.shouldRouteGlasses(event) {
+        source = "monitor-glasses"
+      } else {
+        self.logKey(event, source: "monitor-pass", consumed: false)
+        return event
+      }
+      let consumed = self.handleKeyDown(event)
+      self.logKey(event, source: source, consumed: consumed)
+      // Swallow the event when the overlay handled it so mpv bindings and the
+      // player window do not see it a second time.
+      return consumed ? nil : event
+    }
+  }
+
+  private func removeKeyMonitor() {
+    if let keyMonitor {
+      NSEvent.removeMonitor(keyMonitor)
+      self.keyMonitor = nil
+    }
+  }
+
+  /// Overlay list or guide is open, so this key must not fall through to an mpv binding.
+  private func shouldRoute(_ event: NSEvent) -> Bool {
+    guard session != nil, mode == .list || mode == .guide else { return false }
+    if !event.modifierFlags.intersection([.command, .option, .control]).isEmpty { return false }
+    if event.window?.firstResponder is NSTextView { return false }
+    if NSApp.keyWindow?.firstResponder is NSTextView { return false }
+    guard !PlayerCore.playerCores.isEmpty, let main = PlayerCore.active.mainWindow else { return false }
+    if event.window === main.window { return true }
+    // The glasses window is borderless. If it is not key yet, the utility panel may
+    // still be the key window. Route those keys while the overlay is open.
+    return Immersive3DController.shared.glassesActive
+  }
+
+  /// Channel keys while Play on Glasses is up, even if the borderless window is not key
+  /// and the utility panel received the event. List and guide use `shouldRoute` instead.
+  private func shouldRouteGlasses(_ event: NSEvent) -> Bool {
+    guard Immersive3DController.shared.glassesActive, session != nil else { return false }
+    guard mode != .list, mode != .guide else { return false }
+    if !event.modifierFlags.intersection([.command, .option, .control]).isEmpty { return false }
+    if event.window?.firstResponder is NSTextView || NSApp.keyWindow?.firstResponder is NSTextView { return false }
+    return Self.isNavigationKey(event)
+  }
+
+  private static func isNavigationKey(_ event: NSEvent) -> Bool {
+    let code = Int(event.keyCode)
+    if [36, 51, 53, 76, 116, 117, 121, 123, 124, 125, 126].contains(code) { return true }
+    let plain = (event.charactersIgnoringModifiers ?? "").lowercased()
+    if plain == "g" || plain == "\u{1b}" || plain == "\r" || plain == "\u{3}" { return true }
+    if plain.count == 1, let scalar = plain.unicodeScalars.first, CharacterSet.decimalDigits.contains(scalar) {
+      return true
+    }
+    return false
   }
 
   // MARK: - Tuning
@@ -498,16 +729,23 @@ final class IPTVLiveOverlayController {
 
   private func revealCurrent() {
     guard let session else { return }
-    let group = session.groupChannels()
-    let index = group.firstIndex { $0.id == session.item.id } ?? 0
-    if index < listTop { listTop = index }
-    if index >= listTop + 8 { listTop = max(0, index - 7) }
+    browsingGroup = nil
+    let rows = listedChannels()
+    listIndex = rows.firstIndex { $0.id == session.item.id } ?? 0
+    revealListSelection()
+  }
+
+  private func revealListSelection() {
+    let page = visibleListRows()
+    if listIndex < listTop { listTop = listIndex }
+    if listIndex >= listTop + page { listTop = max(0, listIndex - page + 1) }
   }
 
   private func revealGuideSelection() {
     guard session != nil else { return }
+    let page = visibleGuideRows()
     if guideRow < guideTop { guideTop = guideRow }
-    if guideRow >= guideTop + 8 { guideTop = max(0, guideRow - 7) }
+    if guideRow >= guideTop + page { guideTop = max(0, guideRow - page + 1) }
     if let programme = selectedProgramme() {
       let visible = 90 * 60.0
       if programme.start < guideAnchor {
@@ -546,6 +784,9 @@ final class IPTVLiveOverlayController {
 
   private func show(_ next: Mode) {
     mode = next
+    if next == .list || next == .guide {
+      claimKeyWindow()
+    }
     armHide()
     attachIfNeeded()
     redraw()
@@ -743,6 +984,21 @@ final class IPTVLiveOverlayPane: NSView {
     fatalError("init(coder:) has not been implemented")
   }
 
+  override func updateTrackingAreas() {
+    super.updateTrackingAreas()
+    trackingAreas.forEach { removeTrackingArea($0) }
+    addTrackingArea(NSTrackingArea(
+      rect: bounds,
+      options: [.mouseMoved, .activeAlways, .inVisibleRect, .enabledDuringMouseDrag],
+      owner: self,
+      userInfo: nil
+    ))
+  }
+
+  override func mouseMoved(with event: NSEvent) {
+    IPTVLiveOverlayController.shared.handleHover(event)
+  }
+
   override func mouseDown(with event: NSEvent) {
     IPTVLiveOverlayController.shared.handleClick(in: self, event: event)
   }
@@ -801,19 +1057,20 @@ final class IPTVLiveOverlayPane: NSView {
   private func drawList(_ session: IPTVLiveSession, in rect: NSRect, controller: IPTVLiveOverlayController) {
     guard rect.width > 40, rect.height > 40 else { return }
     IPTVLiveDraw.panel(rect, radius: 14)
-    let group = session.item.group.isEmpty ? "Ungrouped" : session.item.group
-    IPTVLiveDraw.text(group, in: NSRect(x: rect.minX + 14, y: rect.minY + 6, width: rect.width - 28, height: 22), font: .systemFont(ofSize: 13, weight: .semibold), color: NSColor(calibratedWhite: 1, alpha: 0.8))
-    let rows = session.groupChannels()
+    IPTVLiveDraw.text(controller.listedGroupTitle(), in: NSRect(x: rect.minX + 14, y: rect.minY + 6, width: rect.width - 28, height: 22), font: .systemFont(ofSize: 13, weight: .semibold), color: NSColor(calibratedWhite: 1, alpha: 0.8))
+    let rows = controller.listedChannels()
     let rowHeight: CGFloat = 54
     let header: CGFloat = 32
     var y = rect.minY + header
     var index = controller.listTop
     let now = Date()
-    while index < rows.count && y + rowHeight <= rect.maxY {
+    while index < rows.count && y + rowHeight <= rect.maxY - 18 {
       let item = rows[index]
       let row = NSRect(x: rect.minX + 8, y: y, width: rect.width - 16, height: rowHeight - 4)
-      if item.id == session.item.id {
-        IPTVLiveDraw.fill(row, radius: 8, color: NSColor(calibratedWhite: 1, alpha: 0.16))
+      if index == controller.listIndex {
+        IPTVLiveDraw.fill(row, radius: 8, color: NSColor(calibratedRed: 0.20, green: 0.48, blue: 0.90, alpha: 0.92))
+      } else if item.id == session.item.id {
+        IPTVLiveDraw.fill(row, radius: 8, color: NSColor(calibratedWhite: 1, alpha: 0.14))
       }
       let logo = NSRect(x: row.minX + 6, y: row.minY + 6, width: 36, height: 36)
       IPTVLiveDraw.logo(controller.logo(for: item), in: logo, title: item.name)
@@ -825,6 +1082,8 @@ final class IPTVLiveOverlayPane: NSView {
       y += rowHeight
       index += 1
     }
+    let hint = controller.notice ?? "↑↓ select    ←→ group    ⏎ play    Esc close"
+    IPTVLiveDraw.text(hint, in: NSRect(x: rect.minX + 12, y: rect.maxY - 18, width: rect.width - 24, height: 14), font: .systemFont(ofSize: 10, weight: .medium), color: NSColor(calibratedWhite: 1, alpha: 0.7))
   }
 
   private func drawGuide(_ session: IPTVLiveSession, in rect: NSRect, controller: IPTVLiveOverlayController) {
@@ -851,7 +1110,7 @@ final class IPTVLiveOverlayPane: NSView {
       let item = session.channels[index]
       let row = NSRect(x: rect.minX + 6, y: y, width: rect.width - 12, height: rowHeight - 4)
       if index == controller.guideRow {
-        IPTVLiveDraw.fill(row, radius: 6, color: NSColor(calibratedWhite: 1, alpha: 0.08))
+        IPTVLiveDraw.fill(row, radius: 6, color: NSColor(calibratedRed: 0.20, green: 0.48, blue: 0.90, alpha: 0.28))
       }
       IPTVLiveDraw.text("\(session.number(of: item))  \(item.name)", in: NSRect(x: rect.minX + 10, y: y + 12, width: channelWidth - 18, height: 18), font: .systemFont(ofSize: 12, weight: .semibold), color: .white)
       let programmes = session.guide.programmes(for: item)
@@ -890,7 +1149,7 @@ final class IPTVLiveOverlayPane: NSView {
       y += rowHeight
       index += 1
     }
-    let hint = controller.notice ?? "Arrows move · Return plays live or catch-up · Esc closes"
+    let hint = controller.notice ?? "↑↓ select · ←→ time · ⏎ play · Esc close · hover highlights"
     IPTVLiveDraw.text(hint, in: NSRect(x: rect.minX + 12, y: rect.maxY - 20, width: rect.width - 24, height: 16), font: .systemFont(ofSize: 11, weight: .regular), color: NSColor(calibratedWhite: 1, alpha: 0.75))
   }
 

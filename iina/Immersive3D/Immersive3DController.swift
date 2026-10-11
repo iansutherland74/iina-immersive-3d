@@ -501,7 +501,10 @@ final class Immersive3DController: NSObject, NSWindowDelegate {
     player.mainWindow.videoView.videoLayer.contentsScale = scale
     window.contentView?.layoutSubtreeIfNeeded()
     player.mainWindow.updateWindowParametersForMPV(withFrame: screen.frame)
-    window.orderFrontRegardless()
+    // Borderless windows are not key by default, so arrow and Return never arrive.
+    (window as? MainWindow)?.forceKeyAndMain = true
+    NSApp.activate(ignoringOtherApps: true)
+    window.makeKeyAndOrderFront(nil)
 
     rememberGlasses(screen)
     let fullSize = Self.isFullWidthSBS(screen)
@@ -784,6 +787,8 @@ final class Immersive3DController: NSObject, NSWindowDelegate {
         player?.mainWindow.setWindowToolbar()
         player?.mainWindow.videoView.videoLayer.contentsScale = window.backingScaleFactor
       }
+      let borderlessOnly = saved.styleMask.intersection([.titled, .fullScreen]).isEmpty
+      (window as? MainWindow)?.forceKeyAndMain = borderlessOnly
     }
     if let saved, let player {
       player.disableUI = saved.disableUI

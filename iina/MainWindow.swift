@@ -51,11 +51,15 @@ class MainWindow: CommonWindow {
   }
 
   override var canBecomeKey: Bool {
-    forceKeyAndMain ? true : super.canBecomeKey
+    // A borderless shielding window cannot take keys unless this is true. Play on Glasses
+    // is that window, and the live-TV overlay is driven from the keyboard.
+    if forceKeyAndMain || Immersive3DController.shared.glassesActive { return true }
+    return super.canBecomeKey
   }
-  
+
   override var canBecomeMain: Bool {
-    forceKeyAndMain ? true : super.canBecomeMain
+    if forceKeyAndMain || Immersive3DController.shared.glassesActive { return true }
+    return super.canBecomeMain
   }
 
   /// Play on Glasses must use `NSScreen.frame` in global desktop coordinates, including a
