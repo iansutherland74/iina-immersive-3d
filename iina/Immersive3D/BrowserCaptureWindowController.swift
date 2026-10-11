@@ -38,6 +38,7 @@ final class BrowserCaptureWindowController: NSWindowController, NSTableViewDataS
   private var leftLabel: NSTextField?
   private var rightLabel: NSTextField?
   private var suppressControls = false
+  private var refreshingPixels = false
   private var chooseItem: NSMenuItem?
   private var toggleItem: NSMenuItem?
   private var glassesItem: NSMenuItem?
@@ -70,7 +71,7 @@ final class BrowserCaptureWindowController: NSWindowController, NSTableViewDataS
       self?.renderer.consume(buffer, at: time)
     }
     manager.onIdle = { [weak self] in
-      self?.renderer.redrawHeld()
+      self?.renderer.presentHeld()
     }
     manager.excludedWindowIDs = { [weak self] in
       self?.excludedWindowIDs() ?? []
@@ -196,9 +197,9 @@ final class BrowserCaptureWindowController: NSWindowController, NSTableViewDataS
   @objc func toggleGlasses(_ sender: Any?) {
     guard let output = ensureOutput() else { return }
     if onGlasses {
-      Immersive3DController.shared.returnWindowFromGlasses(output, previewFrame: previewFrame)
       onGlasses = false
       renderer.setFullSizeEyes(false)
+      Immersive3DController.shared.returnWindowFromGlasses(output, previewFrame: previewFrame)
       fitRendererToWindow()
       syncMenu()
       return
@@ -559,10 +560,12 @@ final class BrowserCaptureWindowController: NSWindowController, NSTableViewDataS
       renderer.addSubview(message)
       outputMessage = message
     }
-    window.setFrame(previewFrame, display: false)
-    fitRendererToWindow()
+    window.setContentSize(NSSize(width: 960, height: 540))
+    window.center()
+    previewFrame = window.frame
     window.orderFront(nil)
     outputWindow = window
+    fitRendererToWindow()
     return window
   }
 
@@ -570,15 +573,40 @@ final class BrowserCaptureWindowController: NSWindowController, NSTableViewDataS
     guard onGlasses, let outputWindow else { return }
     renderer.setFullSizeEyes(fullSizeEyes)
     let pixels = Immersive3DController.pixelSize(of: screen)
-    renderer.setPixelSize(width: pixels.width, height: pixels.height, scale: screen.backingScaleFactor)
+    renderer.setPixelSize(width: pixels.width, height: pixels.height, scale: screen.backingScaleFactor, lock: true)
     Immersive3DController.shared.repinExternalWindow(outputWindow, on: screen)
   }
 
   private func fitRendererToWindow() {
-    guard let outputWindow else { return }
-    let scale = outputWindow.backingScaleFactor
-    let size = outputWindow.contentView?.bounds.size ?? outputWindow.frame.size
-    renderer.setPixelSize(width: Int((size.width * scale).rounded()), height: Int((size.height * scale).rounded()), scale: scale)
+    guard let outputWindow, !onGlasses else { return }
+    let scale = max(outputWindow.backingScaleFactor, 1)
+    outputWindow.layoutIfNeeded()
+    var size = renderer.bounds.size
+    if size.width < 32 || size.height < 32 {
+      outputWindow.setContentSize(NSSize(width: 960, height: 540))
+      outputWindow.layoutIfNeeded()
+      size = renderer.bounds.size
+    }
+    if size.width < 32 || size.height < 32 {
+      size = NSSize(width: 960, height: 540)
+    }
+    renderer.setPixelSize(
+      width: Int((size.width * scale).rounded()),
+      height: Int((size.height * scale).rounded()),
+      scale: scale,
+      lock: false
+    )
+  }
+
+  private func refreshOutputPixels() {
+    if refreshingPixels { return }
+    refreshingPixels = true
+    defer { refreshingPixels = false }
+    if onGlasses, let screen = outputWindow?.screen {
+      applyGlassesScreen(screen, fullSizeEyes: Immersive3DController.isFullWidthSBS(screen))
+    } else {
+      fitRendererToWindow()
+    }
   }
 
   private func showOutputMessage(_ text: String?) {
@@ -602,12 +630,27 @@ final class BrowserCaptureWindowController: NSWindowController, NSTableViewDataS
     }
   }
 
+  func windowDidResize(_ notification: Notification) {
+    guard (notification.object as? NSWindow) == outputWindow else { return }
+    refreshOutputPixels()
+  }
+
+  func windowDidChangeScreen(_ notification: Notification) {
+    guard (notification.object as? NSWindow) == outputWindow else { return }
+    refreshOutputPixels()
+  }
+
+  func windowDidChangeBackingProperties(_ notification: Notification) {
+    guard (notification.object as? NSWindow) == outputWindow else { return }
+    refreshOutputPixels()
+  }
+
   func windowShouldClose(_ sender: NSWindow) -> Bool {
     guard sender == outputWindow else { return true }
     if onGlasses {
-      Immersive3DController.shared.returnWindowFromGlasses(sender, previewFrame: previewFrame)
       onGlasses = false
       renderer.setFullSizeEyes(false)
+      Immersive3DController.shared.returnWindowFromGlasses(sender, previewFrame: previewFrame)
       fitRendererToWindow()
       syncMenu()
       return false
