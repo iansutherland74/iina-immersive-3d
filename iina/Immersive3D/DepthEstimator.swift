@@ -68,10 +68,13 @@ enum DepthModelLocator {
       switch self {
       case .v2Small:
         return """
-        Immersive 3D is set to Depth Anything V2 Small. On your Mac, run \
-        other/fetch_depth_model.sh (Apple's 518×392 Core ML package) or \
-        other/convert_depth_anything_v2.py (364×280, better for real time). \
-        Packages load from ~/Library/Application Support/com.colliderli.iina/Models/ \
+        Immersive 3D is set to Depth Anything V2 Small. On macOS 13, run \
+        other/convert_depth_anything_v2.py and install \
+        DepthAnythingV2SmallF16-364x280.mlpackage (input image 364×280, depth \
+        as a float16 multiarray). Apple's DepthAnythingV2SmallF16.mlpackage is \
+        an ios17 specialization and needs macOS 14 or later; fetch_depth_model.sh \
+        downloads that package. Packages load from \
+        ~/Library/Application Support/com.colliderli.iina/Models/ \
         or from IINA_DEPTH_MODEL. Weights are not included in this fork.
         """
       case .da3Small:
@@ -112,14 +115,19 @@ enum DepthModelLocator {
     return urls
   }
 
-  /// `nil` when nothing matches. A set but missing `IINA_DEPTH_MODEL` does not fall through.
-  static func locate(kind: Kind) -> URL? {
+  /// Preferred packages that exist, then any other package in the family.
+  /// A set but missing `IINA_DEPTH_MODEL` does not fall through.
+  static func existingCandidates(kind: Kind) -> [URL] {
     if let override = ProcessInfo.processInfo.environment["IINA_DEPTH_MODEL"], !override.isEmpty {
-      let url = URL(fileURLWithPath: override)
-      return FileManager.default.fileExists(atPath: url.path) ? url : nil
+      let url = URL(fileURLWithPath: (override as NSString).expandingTildeInPath)
+      return FileManager.default.fileExists(atPath: url.path) ? [url] : []
     }
-    if let exact = candidateURLs(for: kind).first(where: { FileManager.default.fileExists(atPath: $0.path) }) {
-      return exact
+    var found: [URL] = []
+    var seen = Set<String>()
+    for url in candidateURLs(for: kind) where FileManager.default.fileExists(atPath: url.path) {
+      if seen.insert(url.path).inserted {
+        found.append(url)
+      }
     }
     let preferred = Set(kind.packageNames)
     for dir in searchDirectories() {
@@ -127,11 +135,33 @@ enum DepthModelLocator {
       let extras = names.filter { name in
         name.hasPrefix(kind.familyPrefix) && name.hasSuffix(".mlpackage") && !preferred.contains(name)
       }.sorted()
-      if let name = extras.first {
-        return dir.appendingPathComponent(name)
+      for name in extras {
+        let url = dir.appendingPathComponent(name)
+        if seen.insert(url.path).inserted {
+          found.append(url)
+        }
       }
     }
-    return nil
+    return found
+  }
+
+  /// `nil` when nothing matches. A set but missing `IINA_DEPTH_MODEL` does not fall through.
+  static func locate(kind: Kind) -> URL? {
+    existingCandidates(kind: kind).first
+  }
+
+  /// Apple's published V2 packages are an `ios17` specialization. They load on macOS 14+, not 13.
+  static let appleIOS17PackageNames: Set<String> = [
+    "DepthAnythingV2SmallF16.mlpackage",
+    "DepthAnythingV2SmallF16P6.mlpackage"
+  ]
+
+  static var isMacOS14OrNewer: Bool {
+    ProcessInfo.processInfo.operatingSystemVersion.majorVersion >= 14
+  }
+
+  static func isAppleIOS17Package(_ url: URL) -> Bool {
+    appleIOS17PackageNames.contains(url.lastPathComponent)
   }
 
   static var environmentOverride: String? {
@@ -150,8 +180,9 @@ struct DepthImage {
 /// Runs the selected depth model on the Neural Engine / GPU and temporally smooths the map.
 ///
 /// Depth Anything V2 Small is the default. Apple's published package is a fixed
-/// 518×392 RGB input with a float16 grayscale `depth` output (Core ML 6, macOS 13+).
-/// A model converted at 364×280 is preferred when its feature description allows that size.
+/// 518×392 RGB input with a float16 grayscale `depth` image (Core ML 6, an ios17
+/// specialization, macOS 14+). The 364×280 conversion used on macOS 13 takes an
+/// `image` input and returns `depth` as a float16 multiarray `[1, 1, 280, 364]`.
 /// Depth Anything 3 Small is loaded the same way when that package is selected in settings.
 final class DepthEstimator {
   static let shared = DepthEstimator()
@@ -304,7 +335,8 @@ final class DepthEstimator {
     lock.unlock()
 
     let kind = DepthModelLocator.currentKind()
-    guard let url = DepthModelLocator.locate(kind: kind) else {
+    let candidates = DepthModelLocator.existingCandidates(kind: kind)
+    guard !candidates.isEmpty else {
       lock.lock()
       let current = ticket == loadGeneration
       if current {
@@ -319,61 +351,158 @@ final class DepthEstimator {
       return
     }
 
-    do {
-      let config = MLModelConfiguration()
-      config.computeUnits = .all
-      let loaded = try MLModel(contentsOf: url, configuration: config)
-      let description = loaded.modelDescription
-      let input = description.inputDescriptionsByName["image"]
-        ?? description.inputDescriptionsByName["input"]
-        ?? description.inputDescriptionsByName.values.first
-      let output = description.outputDescriptionsByName["depth"]
-        ?? description.outputDescriptionsByName["output"]
-        ?? description.outputDescriptionsByName.values.first
-      guard let input, let output, let constraint = input.imageConstraint else {
-        throw DepthModelError.unexpectedInterface
+    var lastError: String?
+    var skippedIOS17 = false
+    for url in candidates {
+      if !DepthModelLocator.isMacOS14OrNewer && DepthModelLocator.isAppleIOS17Package(url) {
+        skippedIOS17 = true
+        log3D("Skipping \(url.lastPathComponent): Apple's package is an ios17 specialization and needs macOS 14 or later.", level: .warning)
+        continue
       }
-      let size = Self.chooseInputSize(constraint)
-      let format = Self.pixelFormat(for: constraint)
-      var buffer: CVPixelBuffer?
-      let attrs: [String: Any] = [
-        kCVPixelBufferCGImageCompatibilityKey as String: true,
-        kCVPixelBufferCGBitmapContextCompatibilityKey as String: true,
-        kCVPixelBufferIOSurfacePropertiesKey as String: [:]
-      ]
-      let status = CVPixelBufferCreate(kCFAllocatorDefault, size.width, size.height, format, attrs as CFDictionary, &buffer)
-      guard status == kCVReturnSuccess, let buffer else {
-        throw DepthModelError.pixelBuffer
-      }
-      lock.lock()
-      guard ticket == loadGeneration else {
+      do {
+        let compiled = try Self.compiledModelURL(for: url)
+        let config = MLModelConfiguration()
+        config.computeUnits = .all
+        let loaded = try MLModel(contentsOf: compiled, configuration: config)
+        let description = loaded.modelDescription
+        let input = description.inputDescriptionsByName["image"]
+          ?? description.inputDescriptionsByName["input"]
+          ?? description.inputDescriptionsByName.values.first
+        let output = description.outputDescriptionsByName["depth"]
+          ?? description.outputDescriptionsByName["output"]
+          ?? description.outputDescriptionsByName.values.first
+        guard let input, let output, let constraint = input.imageConstraint else {
+          throw DepthModelError.unexpectedInterface
+        }
+        let size = Self.chooseInputSize(constraint)
+        let format = Self.pixelFormat(for: constraint)
+        var buffer: CVPixelBuffer?
+        let attrs: [String: Any] = [
+          kCVPixelBufferCGImageCompatibilityKey as String: true,
+          kCVPixelBufferCGBitmapContextCompatibilityKey as String: true,
+          kCVPixelBufferIOSurfacePropertiesKey as String: [:]
+        ]
+        let status = CVPixelBufferCreate(kCFAllocatorDefault, size.width, size.height, format, attrs as CFDictionary, &buffer)
+        guard status == kCVReturnSuccess, let buffer else {
+          throw DepthModelError.pixelBuffer
+        }
+        lock.lock()
+        guard ticket == loadGeneration else {
+          lock.unlock()
+          return
+        }
+        model = loaded
+        inputName = input.name
+        outputName = output.name
+        inputWidth = size.width
+        inputHeight = size.height
+        inputPixelFormat = format
+        inputBuffer = buffer
+        loadState = .ready
         lock.unlock()
+        let override = DepthModelLocator.environmentOverride == nil ? "" : " (IINA_DEPTH_MODEL override)"
+        log3D("Loaded \(kind.title)\(override): \(url.lastPathComponent) compiled \(compiled.lastPathComponent) input \(size.width)x\(size.height) \(input.name) -> \(output.name) \(Self.describe(output)), compute units all (ANE/GPU/CPU)", level: .warning)
         return
+      } catch {
+        let message = error.localizedDescription
+        if Self.isIOS17Specialization(error) {
+          skippedIOS17 = true
+          log3D("Skipping \(url.lastPathComponent): \(message)", level: .warning)
+          continue
+        }
+        lastError = "\(url.path)\n\n\(message)"
+        log3D("Failed to load depth model at \(url.path): \(message)", level: .error)
       }
-      model = loaded
-      inputName = input.name
-      outputName = output.name
-      inputWidth = size.width
-      inputHeight = size.height
-      inputPixelFormat = format
-      inputBuffer = buffer
-      loadState = .ready
-      lock.unlock()
-      let override = DepthModelLocator.environmentOverride == nil ? "" : " (IINA_DEPTH_MODEL override)"
-      log3D("Loaded \(kind.title)\(override): \(url.lastPathComponent) input \(size.width)x\(size.height) \(input.name) -> \(output.name), compute units all (ANE/GPU/CPU)", level: .warning)
-    } catch {
-      lock.lock()
-      let current = ticket == loadGeneration
-      if current {
-        loadState = .failed
-      }
-      lock.unlock()
-      guard current else { return }
-      log3D("Failed to load depth model at \(url.path): \(error.localizedDescription)", level: .error)
+    }
+
+    lock.lock()
+    let current = ticket == loadGeneration
+    if current {
+      loadState = .failed
+    }
+    lock.unlock()
+    guard current else { return }
+    if skippedIOS17 && lastError == nil {
+      alertOnce(
+        title: "Depth model needs macOS 14",
+        body: """
+        Apple's DepthAnythingV2SmallF16 package is an ios17 Core ML specialization and cannot load on this Mac. \
+        Install DepthAnythingV2SmallF16-364x280.mlpackage from other/convert_depth_anything_v2.py \
+        (a macOS 13 target) in ~/Library/Application Support/com.colliderli.iina/Models/.
+        """
+      )
+    } else {
+      let skipped = skippedIOS17
+        ? "\n\nApple's published package was skipped because it needs macOS 14 or later. The 364×280 macOS 13 conversion is DepthAnythingV2SmallF16-364x280.mlpackage."
+        : "\n\nFloat16 packages need macOS 13 or later. A raw .mlpackage is compiled on first load."
       alertOnce(
         title: "Depth model could not be loaded",
-        body: "\(url.path)\n\n\(error.localizedDescription)\n\nThese packages need macOS 13 or later when the output is float16 grayscale."
+        body: (lastError ?? kind.missingHelp) + skipped
       )
+    }
+  }
+
+  /// Compile a `.mlpackage` once and reuse the `.mlmodelc` until the package is newer.
+  /// An already-compiled model is loaded directly. Runs on the depth queue.
+  private static func compiledModelURL(for url: URL) throws -> URL {
+    if url.pathExtension.lowercased() == "mlmodelc" {
+      return url
+    }
+    let cacheDir = Utility.appSupportDirUrl.appendingPathComponent("Models", isDirectory: true)
+    try FileManager.default.createDirectory(at: cacheDir, withIntermediateDirectories: true)
+    let cached = cacheDir
+      .appendingPathComponent(url.deletingPathExtension().lastPathComponent)
+      .appendingPathExtension("mlmodelc")
+    let sourceDate = newestModificationDate(url)
+    if FileManager.default.fileExists(atPath: cached.path), newestModificationDate(cached) >= sourceDate {
+      return cached
+    }
+    let compiled = try MLModel.compileModel(at: url)
+    if FileManager.default.fileExists(atPath: cached.path) {
+      try FileManager.default.removeItem(at: cached)
+    }
+    do {
+      try FileManager.default.moveItem(at: compiled, to: cached)
+    } catch {
+      try FileManager.default.copyItem(at: compiled, to: cached)
+      try? FileManager.default.removeItem(at: compiled)
+    }
+    return cached
+  }
+
+  private static func newestModificationDate(_ url: URL) -> Date {
+    var newest = (try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+    guard let enumerator = FileManager.default.enumerator(
+      at: url,
+      includingPropertiesForKeys: [.contentModificationDateKey],
+      options: [.skipsHiddenFiles]
+    ) else {
+      return newest
+    }
+    for case let item as URL in enumerator {
+      if let date = try? item.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate, date > newest {
+        newest = date
+      }
+    }
+    return newest
+  }
+
+  private static func isIOS17Specialization(_ error: Error) -> Bool {
+    let text = error.localizedDescription.lowercased()
+    return text.contains("ios17") || text.contains("specialization")
+  }
+
+  private static func describe(_ output: MLFeatureDescription) -> String {
+    switch output.type {
+    case .image:
+      return "image"
+    case .multiArray:
+      let constraint = output.multiArrayConstraint
+      let shape = constraint?.shape.map { $0.intValue.description }.joined(separator: ",") ?? "?"
+      let dataType = constraint.map { String(describing: $0.dataType) } ?? "?"
+      return "multiArray \(dataType) [\(shape)]"
+    default:
+      return "type \(output.type.rawValue)"
     }
   }
 
@@ -515,40 +644,57 @@ final class DepthEstimator {
     return nil
   }
 
+  /// Reads the last two dimensions as width × height, honoring strides.
+  /// A packed `[1, 1, 280, 364]` float16 map is height 280, width 364.
+  /// Leading dimensions contribute only their index 0.
   private static func extract(_ array: MLMultiArray) -> (pixels: [Float], width: Int, height: Int)? {
-    let shape = array.shape.map { $0.intValue }
-    let count = array.count
-    guard count > 0, count < 4_000_000 else { return nil }
-    var pixels = [Float](repeating: 0, count: count)
+    let shape = array.shape.map(\.intValue)
+    let strides = array.strides.map(\.intValue)
+    guard shape.count >= 2, strides.count == shape.count else { return nil }
+    let width = shape[shape.count - 1]
+    let height = shape[shape.count - 2]
+    guard width > 0, height > 0, width * height < 4_000_000 else { return nil }
+    let strideX = strides[strides.count - 1]
+    let strideY = strides[strides.count - 2]
+    guard strideX != 0, strideY != 0 else { return nil }
+    var maxIndex = 0
+    for index in 0..<shape.count where shape[index] > 0 {
+      maxIndex += (shape[index] - 1) * strides[index]
+    }
+    let capacity = max(maxIndex + 1, 1)
+    var pixels = [Float](repeating: 0, count: width * height)
     switch array.dataType {
     case .float32:
-      let pointer = array.dataPointer.bindMemory(to: Float.self, capacity: count)
-      pixels.withUnsafeMutableBufferPointer { dest in
-        dest.baseAddress!.update(from: pointer, count: count)
+      let pointer = array.dataPointer.bindMemory(to: Float.self, capacity: capacity)
+      for y in 0..<height {
+        for x in 0..<width {
+          pixels[y * width + x] = pointer[y * strideY + x * strideX]
+        }
       }
     case .float16:
-      let pointer = array.dataPointer.bindMemory(to: Float16.self, capacity: count)
-      for i in 0..<count {
-        pixels[i] = Float(pointer[i])
+      let pointer = array.dataPointer.bindMemory(to: Float16.self, capacity: capacity)
+      for y in 0..<height {
+        for x in 0..<width {
+          pixels[y * width + x] = Float(pointer[y * strideY + x * strideX])
+        }
       }
     case .double:
-      let pointer = array.dataPointer.bindMemory(to: Double.self, capacity: count)
-      for i in 0..<count {
-        pixels[i] = Float(pointer[i])
+      let pointer = array.dataPointer.bindMemory(to: Double.self, capacity: capacity)
+      for y in 0..<height {
+        for x in 0..<width {
+          pixels[y * width + x] = Float(pointer[y * strideY + x * strideX])
+        }
       }
     default:
-      for i in 0..<count {
-        pixels[i] = array[i].floatValue
+      let prefix = Array(repeating: NSNumber(value: 0), count: shape.count - 2)
+      for y in 0..<height {
+        for x in 0..<width {
+          let index = prefix + [NSNumber(value: y), NSNumber(value: x)]
+          pixels[y * width + x] = array[index].floatValue
+        }
       }
     }
-    if shape.count >= 2 {
-      let width = shape[shape.count - 1]
-      let height = shape[shape.count - 2]
-      if width > 0, height > 0, width * height == count {
-        return (pixels, width, height)
-      }
-    }
-    return (pixels, count, 1)
+    return (pixels, width, height)
   }
 
   private static func extract(_ buffer: CVPixelBuffer, context: CIContext) -> (pixels: [Float], width: Int, height: Int)? {

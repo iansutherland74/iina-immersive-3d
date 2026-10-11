@@ -7,7 +7,8 @@
 //  Licensed under the GNU General Public License, version 3.
 //
 //  Video menu, strength presets, and "Play on glasses" for TCL NXTWEAR S.
-//  The glasses enumerate as a normal external display (typically 1920×1080).
+//  The glasses enumerate as "SmartGlasses": 1920×1080 in 2D, 3840×1080 after
+//  the long-press into 3D. Mirroring leaves a single NSScreen.
 
 import Cocoa
 
@@ -21,6 +22,8 @@ final class Immersive3DController: NSObject, NSWindowDelegate {
     var invertDepth = false
     var verticalFlip = false
     var passThroughSBS = false
+    /// 3840×1080 glasses: sample the fitted picture into each full-size half.
+    var fullSizeEyes = false
     var shouldProcess: Bool { enabled && !passThroughSBS }
   }
 
@@ -55,7 +58,17 @@ final class Immersive3DController: NSObject, NSWindowDelegate {
     case alwaysConvert = 2
   }
 
-  static let glassesReminder = "Long-press the right-side button on your glasses to switch to 3D mode."
+  static func glassesReminder(fullSizeEyes: Bool) -> String {
+    if fullSizeEyes {
+      return "Each eye fills one half of the glasses (1920×1080). The window stays on this display if the size changes."
+    }
+    return "Long-press the right-side button on your glasses to switch to 3D mode. The picture is half side-by-side until the display widens, and the window follows that size change."
+  }
+
+  /// Above normal windows, the menu bar, and other apps on the glasses display.
+  static var glassesWindowLevel: NSWindow.Level {
+    NSWindow.Level(rawValue: Int(CGShieldingWindowLevel()))
+  }
 
   private let lock = NSLock()
   private var snapshot = Snapshot()
@@ -77,6 +90,7 @@ final class Immersive3DController: NSObject, NSWindowDelegate {
   private var v2ModelItem: NSMenuItem?
   private var da3ModelItem: NSMenuItem?
   private var glassesItem: NSMenuItem?
+  private var autoGlassesItem: NSMenuItem?
   private let prefObserver = Preference.Observer()
 
   private var savedWindow: SavedWindow?
@@ -86,8 +100,19 @@ final class Immersive3DController: NSObject, NSWindowDelegate {
   private var playButton: NSButton?
   private var panelSlider: NSSlider?
   private var panelStatus: NSTextField?
+  private var panelReminder: NSTextField?
   private var glassesScreen: NSScreen?
+  private var glassesDisplayID: CGDirectDisplayID?
+  private var glassesUUID: UUID?
+  private var glassesFullSizeEyes = false
+  private var isPinningGlasses = false
+  private var applyingDisplayConfig = false
+  private var lastMirrorConfigure = Date.distantPast
+  private var savedMirrorLinks: [SavedMirrorLink]?
+  private var screenParameterObserver: NSObjectProtocol?
   private(set) var glassesActive = false
+
+  private static let mirrorPromptDefaultsKey = "immersive3DDidExplainMirroring"
 
   private override init() {
     super.init()
@@ -197,6 +222,10 @@ final class Immersive3DController: NSObject, NSWindowDelegate {
     glasses.target = self
     glassesItem = glasses
 
+    let autoGlasses = NSMenuItem(title: "Automatically Set Up Glasses Display", action: #selector(toggleAutoGlassesDisplay(_:)), keyEquivalent: "")
+    autoGlasses.target = self
+    autoGlassesItem = autoGlasses
+
     let block = [
       enabled,
       strengthItem,
@@ -204,6 +233,7 @@ final class Immersive3DController: NSObject, NSWindowDelegate {
       sourceItem,
       NSMenuItem.separator(),
       glasses,
+      autoGlasses,
       NSMenuItem.separator()
     ]
     for (offset, item) in block.enumerated() {
@@ -233,7 +263,21 @@ final class Immersive3DController: NSObject, NSWindowDelegate {
     let model = Preference.DepthModelOption(rawValue: Preference.integer(for: .immersive3DDepthModel)) ?? .depthAnythingV2Small
     v2ModelItem?.state = model == .depthAnythingV2Small ? .on : .off
     da3ModelItem?.state = model == .depthAnything3Small ? .on : .off
+    autoGlassesItem?.state = Preference.bool(for: .immersive3DAutoGlassesDisplay) ? .on : .off
     rebuildGlassesItem()
+  }
+
+  @objc func toggleAutoGlassesDisplay(_ sender: Any?) {
+    let enabled = !Preference.bool(for: .immersive3DAutoGlassesDisplay)
+    Preference.set(enabled, for: .immersive3DAutoGlassesDisplay)
+    syncMenu()
+    guard glassesActive, enabled else { return }
+    if ensureGlassesExtended(), let screen = resolvedGlassesScreen() {
+      pinGlassesWindow(to: screen)
+      updatePanel(for: screen)
+      requestRedraw()
+      playerOSD("Glasses set to an extended display")
+    }
   }
 
   @objc func chooseDepthModel(_ sender: NSMenuItem) {
@@ -299,11 +343,11 @@ final class Immersive3DController: NSObject, NSWindowDelegate {
       exitGlasses()
       return
     }
-    let screens = Self.externalScreens()
+    let screens = Self.glassesCandidates()
     if screens.isEmpty {
       showMessage(
         title: "No glasses display found",
-        body: "Connect the TCL NXTWEAR S with USB-C. It should appear as an external 1920×1080 display. Then choose Video → Play on Glasses."
+        body: "Connect the TCL NXTWEAR S with USB-C. macOS should list it as SmartGlasses, usually 1920×1080 or 3840×1080. If the displays are mirrored there is only one screen; Play on Glasses still covers that screen. Then choose Video → Play on Glasses."
       )
       return
     }
@@ -371,24 +415,27 @@ final class Immersive3DController: NSObject, NSWindowDelegate {
         isMovable: window.isMovable,
         hasShadow: window.hasShadow,
         titlebarAppearsTransparent: window.titlebarAppearsTransparent,
+        titleVisibility: window.titleVisibility,
         aspectRatio: window.aspectRatio,
+        contentAspectRatio: window.contentAspectRatio,
+        minSize: window.minSize,
+        contentMinSize: window.contentMinSize,
+        resizeIncrements: window.resizeIncrements,
+        isOpaque: window.isOpaque,
+        backgroundColor: window.backgroundColor,
+        hidesOnDeactivate: window.hidesOnDeactivate,
         disableUI: player.disableUI,
         immersiveWasEnabled: Preference.bool(for: .immersive3DEnabled)
       )
     }
     player.disableUI = true
-    window.styleMask = [.borderless, .fullSizeContentView]
-    window.hasShadow = false
-    window.isMovable = false
-    window.titlebarAppearsTransparent = true
-    window.level = .floating
-    window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-    window.aspectRatio = screen.frame.size
-    window.setFrame(screen.frame, display: true, animate: false)
-    window.makeKeyAndOrderFront(nil)
-    player.mainWindow.hideUI(force: true)
-    glassesScreen = screen
     glassesActive = true
+    rememberGlasses(screen)
+    startObservingScreenParameters()
+    let extended = ensureGlassesExtended()
+    let target = resolvedGlassesScreen() ?? screen
+    pinGlassesWindow(to: target)
+    player.mainWindow.hideUI(force: true)
 
     let snap = currentSnapshot()
     if !snap.passThroughSBS {
@@ -397,19 +444,198 @@ final class Immersive3DController: NSObject, NSWindowDelegate {
       publishAndRedraw()
       playerOSD("Side-by-side source — passing the frame through")
     }
-    showPanel(for: screen)
-    player.sendOSD(.custom(Self.glassesReminder), autoHide: true, forcedTimeout: 8)
+    showPanel(for: target)
+    let reminder = Self.glassesReminder(fullSizeEyes: Self.isFullWidthSBS(target))
+    player.sendOSD(.custom(reminder), autoHide: true, forcedTimeout: 8)
+    if extended {
+      playerOSD("Glasses set to an extended display")
+    }
     requestRedraw()
-    log3D("Play on glasses: \(screen.localizedName) \(Int(screen.frame.width))x\(Int(screen.frame.height))", level: .warning)
+    let pixels = Self.pixelSize(of: target)
+    let frame = target.frame
+    log3D("Play on glasses: \(target.localizedName) origin (\(Int(frame.origin.x)), \(Int(frame.origin.y))) size \(Int(frame.width))x\(Int(frame.height)) scale \(target.backingScaleFactor) pixels \(pixels.width)x\(pixels.height) mirror \(Self.isMirrored(target))", level: .warning)
+    maybeExplainMirroring(target)
+  }
+
+  /// Borderless, above other windows, frame exactly `screen.frame`, drawable at the screen's pixel size.
+  private func pinGlassesWindow(to screen: NSScreen) {
+    guard !isPinningGlasses else { return }
+    let player = PlayerCore.active
+    guard let window = player.mainWindow.window else { return }
+    isPinningGlasses = true
+    defer { isPinningGlasses = false }
+
+    window.styleMask = [.borderless]
+    window.titleVisibility = .hidden
+    window.titlebarAppearsTransparent = true
+    window.toolbar = nil
+    window.isOpaque = true
+    window.backgroundColor = .black
+    window.hasShadow = false
+    window.isMovable = false
+    window.isMovableByWindowBackground = false
+    window.hidesOnDeactivate = false
+    window.level = Self.glassesWindowLevel
+    window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
+    window.minSize = NSSize(width: 1, height: 1)
+    window.contentMinSize = NSSize(width: 1, height: 1)
+    window.resizeIncrements = NSSize(width: 1, height: 1)
+    window.aspectRatio = .zero
+    window.contentAspectRatio = .zero
+    // `screen.frame` is in the global desktop. Extended SmartGlasses sit beside the
+    // built-in display, for example (1512, -98, 3840, 1080), not at (0, 0).
+    applyGlassesFrame(screen.frame, to: window)
+    player.mainWindow.setGlassesVideoFill(true)
+    let scale = screen.backingScaleFactor
+    player.mainWindow.videoView.videoLayer.contentsScale = scale
+    window.contentView?.layoutSubtreeIfNeeded()
+    player.mainWindow.updateWindowParametersForMPV(withFrame: screen.frame)
+    window.orderFrontRegardless()
+
+    rememberGlasses(screen)
+    let fullSize = Self.isFullWidthSBS(screen)
+    lock.lock()
+    glassesFullSizeEyes = fullSize
+    rebuildSnapshotLocked()
+    lock.unlock()
+
+    if !Self.framesMatch(window.frame, screen.frame) {
+      log3D("Play on glasses: window frame \(Self.frameDescription(window.frame)) does not match \(screen.localizedName) \(Self.frameDescription(screen.frame))", level: .error)
+    }
+  }
+
+  /// Puts the window on `target` exactly. Origin is applied last because `setContentSize`
+  /// keeps the top-left corner fixed.
+  private func applyGlassesFrame(_ target: NSRect, to window: NSWindow) {
+    window.setFrame(target, display: true, animate: false)
+    window.setFrameOrigin(target.origin)
+    let sizeDrift = abs(window.frame.width - target.width) > 0.5 || abs(window.frame.height - target.height) > 0.5
+    if sizeDrift || !Self.framesMatch(window.frame, target) {
+      window.setContentSize(target.size)
+      window.setFrameOrigin(target.origin)
+    }
+  }
+
+  private static func frameDescription(_ frame: NSRect) -> String {
+    "(\(Int(frame.origin.x.rounded())), \(Int(frame.origin.y.rounded())), \(Int(frame.width.rounded())), \(Int(frame.height.rounded())))"
+  }
+
+  /// Called after a resize that was not started by `pinGlassesWindow`. Resolution changes use the screen observer.
+  func repinGlassesWindowIfNeeded() {
+    guard glassesActive, !isPinningGlasses, let screen = resolvedGlassesScreen() else { return }
+    guard let window = PlayerCore.active.mainWindow.window else { return }
+    let scale = screen.backingScaleFactor
+    let layerScale = PlayerCore.active.mainWindow.videoView.videoLayer.contentsScale
+    let scaleMatches = abs(layerScale - scale) < 0.01
+    if Self.framesMatch(window.frame, screen.frame) && scaleMatches {
+      return
+    }
+    pinGlassesWindow(to: screen)
+    updatePanel(for: screen)
+    requestRedraw()
+  }
+
+  private func startObservingScreenParameters() {
+    guard screenParameterObserver == nil else { return }
+    screenParameterObserver = NotificationCenter.default.addObserver(
+      forName: NSApplication.didChangeScreenParametersNotification,
+      object: nil,
+      queue: .main
+    ) { [weak self] _ in
+      self?.glassesScreenParametersChanged()
+    }
+  }
+
+  private func stopObservingScreenParameters() {
+    if let screenParameterObserver {
+      NotificationCenter.default.removeObserver(screenParameterObserver)
+      self.screenParameterObserver = nil
+    }
+  }
+
+  private func glassesScreenParametersChanged() {
+    guard glassesActive, !isPinningGlasses, !applyingDisplayConfig else { return }
+    // A 2D/3D mode switch can put the glasses back into a mirror set.
+    if ensureGlassesExtended() {
+      playerOSD("Glasses set to an extended display")
+    }
+    guard let screen = resolvedGlassesScreen() else {
+      log3D("Play on glasses: display \(glassesDisplayID.map(String.init) ?? "?") is missing after a screen change", level: .warning)
+      return
+    }
+    let wasFull = glassesFullSizeEyes
+    pinGlassesWindow(to: screen)
+    updatePanel(for: screen)
+    if wasFull != Self.isFullWidthSBS(screen) {
+      let text = Self.glassesReminder(fullSizeEyes: Self.isFullWidthSBS(screen))
+      guard !PlayerCore.playerCores.isEmpty else { return }
+      PlayerCore.active.sendOSD(.custom(text), autoHide: true, forcedTimeout: 8)
+    }
+    requestRedraw()
+  }
+
+  private func rememberGlasses(_ screen: NSScreen) {
+    glassesScreen = screen
+    guard let id = screen.displayId else { return }
+    glassesDisplayID = id
+    glassesUUID = Self.displayUUID(id)
+  }
+
+  private func resolvedGlassesScreen() -> NSScreen? {
+    if let id = glassesDisplayID, let screen = NSScreen.screens.first(where: { $0.displayId == id }) {
+      rememberGlasses(screen)
+      return screen
+    }
+    if let glassesUUID, let screen = NSScreen.screens.first(where: { screen in
+      guard let id = screen.displayId else { return false }
+      return Self.displayUUID(id) == glassesUUID
+    }) {
+      rememberGlasses(screen)
+      return screen
+    }
+    if let screen = glassesScreen, NSScreen.screens.contains(where: { $0 == screen }) {
+      return screen
+    }
+    if let screen = Self.glassesCandidates().first {
+      rememberGlasses(screen)
+      return screen
+    }
+    return nil
+  }
+
+  private func maybeExplainMirroring(_ screen: NSScreen) {
+    guard Self.isMirrored(screen) else { return }
+    if UserDefaults.standard.bool(forKey: Self.mirrorPromptDefaultsKey) { return }
+    UserDefaults.standard.set(true, forKey: Self.mirrorPromptDefaultsKey)
+    let automatic = Preference.bool(for: .immersive3DAutoGlassesDisplay)
+    let body = automatic
+      ? "IINA tried to switch the glasses to an extended display for this login session, but they are still mirrored, so this window covers the shared screen. Turn mirroring off in System Settings → Displays. The permanent display arrangement is left unchanged."
+      : "The glasses are mirroring this Mac, so there is one shared screen and this window covers it. Turn on Settings → Video → Automatically set up glasses display, or turn mirroring off in System Settings → Displays."
+    DispatchQueue.main.async { [weak self] in
+      let alert = NSAlert()
+      alert.alertStyle = .informational
+      alert.messageText = "Glasses are mirroring this Mac"
+      alert.informativeText = body
+      alert.window.level = NSWindow.Level(rawValue: Self.glassesWindowLevel.rawValue + 2)
+      alert.runModal()
+      self?.panel?.orderFrontRegardless()
+    }
   }
 
   func exitGlasses(closePanel: Bool = true) {
     guard let saved = savedWindow else {
       hidePanel(close: closePanel)
       glassesActive = false
+      glassesFullSizeEyes = false
+      glassesUUID = nil
+      stopObservingScreenParameters()
+      restoreMirroringIfNeeded()
       return
     }
     let player = PlayerCore.active
+    glassesActive = false
+    glassesFullSizeEyes = false
+    stopObservingScreenParameters()
     if let window = player.mainWindow.window {
       window.styleMask = saved.styleMask
       window.level = saved.level
@@ -417,13 +643,25 @@ final class Immersive3DController: NSObject, NSWindowDelegate {
       window.isMovable = saved.isMovable
       window.hasShadow = saved.hasShadow
       window.titlebarAppearsTransparent = saved.titlebarAppearsTransparent
+      window.titleVisibility = saved.titleVisibility
+      window.isOpaque = saved.isOpaque
+      window.backgroundColor = saved.backgroundColor
+      window.hidesOnDeactivate = saved.hidesOnDeactivate
+      window.minSize = saved.minSize
+      window.contentMinSize = saved.contentMinSize
+      window.resizeIncrements = saved.resizeIncrements
       window.aspectRatio = saved.aspectRatio
+      window.contentAspectRatio = saved.contentAspectRatio
       window.setFrame(saved.frame, display: true, animate: false)
+      player.mainWindow.setGlassesVideoFill(false)
+      player.mainWindow.setWindowToolbar()
+      player.mainWindow.videoView.videoLayer.contentsScale = window.backingScaleFactor
     }
     player.disableUI = saved.disableUI
     savedWindow = nil
-    glassesActive = false
     glassesScreen = nil
+    glassesDisplayID = nil
+    glassesUUID = nil
     pendingDisplayID = nil
     hidePanel(close: closePanel)
     Preference.set(saved.immersiveWasEnabled, for: .immersive3DEnabled)
@@ -431,6 +669,7 @@ final class Immersive3DController: NSObject, NSWindowDelegate {
     if !saved.disableUI {
       player.mainWindow.showUI()
     }
+    restoreMirroringIfNeeded()
   }
 
   private func showPanel(for glasses: NSScreen) {
@@ -441,10 +680,8 @@ final class Immersive3DController: NSObject, NSWindowDelegate {
     let visible = host.visibleFrame
     let origin = NSPoint(x: visible.midX - size.width / 2, y: visible.minY + 48)
     panel.setFrameOrigin(origin)
-    let sameScreen = host == glasses
-    panelStatus?.stringValue = sameScreen
-      ? "Only one display is connected, so these controls sit on the glasses screen."
-      : "Showing on \(glasses.localizedName) (\(Int(glasses.frame.width))×\(Int(glasses.frame.height))). Controls stay on this Mac."
+    panel.level = Self.panelLevel
+    updatePanel(for: glasses)
     refreshTransport()
     panel.orderFrontRegardless()
     panelTimer?.invalidate()
@@ -455,7 +692,7 @@ final class Immersive3DController: NSObject, NSWindowDelegate {
 
   private func makePanel() -> NSPanel {
     let panel = NSPanel(
-      contentRect: NSRect(x: 0, y: 0, width: 460, height: 268),
+      contentRect: NSRect(x: 0, y: 0, width: 460, height: 312),
       styleMask: [.titled, .closable, .utilityWindow, .nonactivatingPanel],
       backing: .buffered,
       defer: false
@@ -471,14 +708,15 @@ final class Immersive3DController: NSObject, NSWindowDelegate {
     let content = panel.contentView!
     let title = NSTextField(labelWithString: "Play on glasses")
     title.font = .systemFont(ofSize: 15, weight: .semibold)
-    title.frame = NSRect(x: 20, y: 224, width: 420, height: 22)
-    let reminder = NSTextField(wrappingLabelWithString: Self.glassesReminder)
+    title.frame = NSRect(x: 20, y: 270, width: 420, height: 22)
+    let reminder = NSTextField(wrappingLabelWithString: Self.glassesReminder(fullSizeEyes: false))
     reminder.font = .systemFont(ofSize: 13, weight: .medium)
-    reminder.frame = NSRect(x: 18, y: 168, width: 424, height: 52)
+    reminder.frame = NSRect(x: 18, y: 190, width: 424, height: 72)
+    panelReminder = reminder
     let status = NSTextField(wrappingLabelWithString: "")
     status.font = .systemFont(ofSize: 12)
     status.textColor = .secondaryLabelColor
-    status.frame = NSRect(x: 18, y: 128, width: 424, height: 36)
+    status.frame = NSRect(x: 18, y: 136, width: 424, height: 48)
     panelStatus = status
     let strengthName = NSTextField(labelWithString: "Depth strength")
     strengthName.frame = NSRect(x: 20, y: 96, width: 120, height: 18)
@@ -516,6 +754,30 @@ final class Immersive3DController: NSObject, NSWindowDelegate {
     playButton = nil
     panelSlider = nil
     panelStatus = nil
+    panelReminder = nil
+  }
+
+  private func updatePanel(for glasses: NSScreen) {
+    let host = Self.builtInScreen(excluding: glasses) ?? NSScreen.screens.first { $0 != glasses } ?? glasses
+    let sameScreen = host == glasses || NSScreen.screens.count == 1
+    let pixels = Self.pixelSize(of: glasses)
+    panelReminder?.stringValue = Self.glassesReminder(fullSizeEyes: Self.isFullWidthSBS(glasses))
+    if sameScreen {
+      panelStatus?.stringValue = Self.isMirrored(glasses)
+        ? "Mirroring is on, so this panel shares the glasses screen (\(pixels.width)×\(pixels.height))."
+        : "Only one display is connected (\(pixels.width)×\(pixels.height)), so these controls sit on the glasses screen."
+    } else {
+      panelStatus?.stringValue = "Showing on \(glasses.localizedName) (\(pixels.width)×\(pixels.height)). Controls stay on this Mac."
+    }
+    panel?.level = Self.panelLevel
+    panel?.orderFrontRegardless()
+  }
+
+  private static var panelLevel: NSWindow.Level {
+    let video = glassesWindowLevel.rawValue
+    let maxLevel = Int(CGWindowLevelForKey(.maximumWindow))
+    let raw = video >= maxLevel ? video : video + 1
+    return NSWindow.Level(rawValue: raw)
   }
 
   private func refreshTransport() {
@@ -560,9 +822,207 @@ final class Immersive3DController: NSObject, NSWindowDelegate {
     NSScreen.screens.filter { !isBuiltIn($0) }
   }
 
+  static func pixelSize(of screen: NSScreen) -> (width: Int, height: Int) {
+    let scale = screen.backingScaleFactor
+    return (
+      Int((screen.frame.width * scale).rounded()),
+      Int((screen.frame.height * scale).rounded())
+    )
+  }
+
+  static func isMirrored(_ screen: NSScreen) -> Bool {
+    guard let id = screen.displayId else { return false }
+    return isMirrored(id)
+  }
+
+  static func isMirrored(_ id: CGDirectDisplayID) -> Bool {
+    id != 0 && CGDisplayIsInMirrorSet(id) != 0
+  }
+
+  /// Session-scoped. A mirrored glasses display becomes an extended desktop until Play on Glasses stops.
+  /// Returns true when a configuration was applied.
+  @discardableResult
+  private func ensureGlassesExtended() -> Bool {
+    guard Preference.bool(for: .immersive3DAutoGlassesDisplay) else { return false }
+    guard let id = glassesDisplayID, Self.isMirrored(id) else { return false }
+    if Date().timeIntervalSince(lastMirrorConfigure) < 0.4 { return false }
+    lastMirrorConfigure = Date()
+    return separateGlassesFromMirrorSet(id)
+  }
+
+  /// `CGConfigureDisplayMirrorOfDisplay(config, glassesID, kCGNullDirectDisplay)` plus the same
+  /// for any display that is mirroring the glasses, so a set whose primary is the glasses still splits.
+  private func separateGlassesFromMirrorSet(_ glassesID: CGDirectDisplayID) -> Bool {
+    let capturedNow = savedMirrorLinks == nil
+    if capturedNow {
+      savedMirrorLinks = Self.captureMirrorLinks()
+    }
+    let members = Self.mirrorSetMembers(including: glassesID)
+    var changes: [(CGDirectDisplayID, CGDirectDisplayID)] = [(glassesID, kCGNullDirectDisplay)]
+    for id in members where id != glassesID && CGDisplayMirrorsDisplay(id) != kCGNullDirectDisplay {
+      changes.append((id, kCGNullDirectDisplay))
+    }
+    if applyMirrorConfiguration(changes) {
+      log3D("Play on glasses: display \(glassesID) left the mirror set for this login session", level: .warning)
+      return true
+    }
+    let secondaries = changes.filter { $0.0 != glassesID }
+    if !secondaries.isEmpty, applyMirrorConfiguration(secondaries) {
+      log3D("Play on glasses: displays mirroring \(glassesID) left the mirror set for this login session", level: .warning)
+      return true
+    }
+    if capturedNow {
+      savedMirrorLinks = nil
+    }
+    log3D("Play on glasses: could not leave the mirror set", level: .error)
+    return false
+  }
+
+  private func restoreMirroringIfNeeded() {
+    guard let links = savedMirrorLinks else { return }
+    savedMirrorLinks = nil
+    let mirroring = links.filter { $0.master != kCGNullDirectDisplay }
+    guard !mirroring.isEmpty else { return }
+    var changes: [(CGDirectDisplayID, CGDirectDisplayID)] = []
+    for link in mirroring {
+      guard let display = Self.resolve(link.display, uuid: link.displayUUID),
+            let master = Self.resolve(link.master, uuid: link.masterUUID) else {
+        log3D("Skipping mirror restore; a display from the original mirror set is offline", level: .warning)
+        continue
+      }
+      changes.append((display, master))
+    }
+    guard applyMirrorConfiguration(changes) else {
+      log3D("Restoring glasses mirroring failed", level: .error)
+      return
+    }
+    log3D("Restored glasses mirroring", level: .warning)
+  }
+
+  private func applyMirrorConfiguration(_ changes: [(CGDirectDisplayID, CGDirectDisplayID)]) -> Bool {
+    guard !changes.isEmpty else { return false }
+    var config: CGDisplayConfigRef?
+    let began = CGBeginDisplayConfiguration(&config)
+    guard began == .success, let config else {
+      log3D("CGBeginDisplayConfiguration failed (\(began.rawValue))", level: .error)
+      return false
+    }
+    for (display, master) in changes {
+      let err = CGConfigureDisplayMirrorOfDisplay(config, display, master)
+      if err != .success {
+        log3D("CGConfigureDisplayMirrorOfDisplay(\(display), \(master)) failed (\(err.rawValue))", level: .error)
+        CGCancelDisplayConfiguration(config)
+        return false
+      }
+    }
+    applyingDisplayConfig = true
+    let done = CGCompleteDisplayConfiguration(config, .forSession)
+    applyingDisplayConfig = false
+    if done != .success {
+      log3D("CGCompleteDisplayConfiguration(.forSession) failed (\(done.rawValue))", level: .error)
+      return false
+    }
+    return true
+  }
+
+  private static func captureMirrorLinks() -> [SavedMirrorLink] {
+    onlineDisplayIDs().compactMap { id in
+      let master = CGDisplayMirrorsDisplay(id)
+      guard master != kCGNullDirectDisplay else { return nil }
+      return SavedMirrorLink(
+        display: id,
+        master: master,
+        displayUUID: displayUUID(id),
+        masterUUID: displayUUID(master)
+      )
+    }
+  }
+
+  /// Primary plus every display mirroring it, always including `glassesID`.
+  private static func mirrorSetMembers(including glassesID: CGDirectDisplayID) -> [CGDirectDisplayID] {
+    let mirrored = CGDisplayMirrorsDisplay(glassesID)
+    let primary: CGDirectDisplayID = mirrored == kCGNullDirectDisplay ? glassesID : mirrored
+    var members: [CGDirectDisplayID] = []
+    for id in onlineDisplayIDs() where id == primary || id == glassesID || CGDisplayMirrorsDisplay(id) == primary {
+      if !members.contains(id) {
+        members.append(id)
+      }
+    }
+    if !members.contains(glassesID) {
+      members.append(glassesID)
+    }
+    return members
+  }
+
+  private static func onlineDisplayIDs() -> [CGDirectDisplayID] {
+    var count: UInt32 = 0
+    guard CGGetOnlineDisplayList(0, nil, &count) == .success, count > 0 else { return [] }
+    var ids = [CGDirectDisplayID](repeating: 0, count: Int(count))
+    guard CGGetOnlineDisplayList(count, &ids, &count) == .success else { return [] }
+    return Array(ids.prefix(Int(count)))
+  }
+
+  private static func resolve(_ id: CGDirectDisplayID, uuid: UUID?) -> CGDirectDisplayID? {
+    let online = onlineDisplayIDs()
+    if online.contains(id) { return id }
+    guard let uuid else { return nil }
+    return online.first { displayUUID($0) == uuid }
+  }
+
+  private static func displayUUID(_ id: CGDirectDisplayID) -> UUID? {
+    guard id != 0, let raw = CGDisplayCreateUUIDFromDisplayID(id)?.takeRetainedValue() else { return nil }
+    let bytes = CFUUIDGetUUIDBytes(raw)
+    return UUID(uuid: (
+      bytes.byte0, bytes.byte1, bytes.byte2, bytes.byte3,
+      bytes.byte4, bytes.byte5, bytes.byte6, bytes.byte7,
+      bytes.byte8, bytes.byte9, bytes.byte10, bytes.byte11,
+      bytes.byte12, bytes.byte13, bytes.byte14, bytes.byte15
+    ))
+  }
+
+  static func isGlassesName(_ screen: NSScreen) -> Bool {
+    let name = screen.localizedName.lowercased()
+    return name.contains("smartglasses") || name.contains("nxtwear")
+  }
+
+  /// 3840×1080, or any similarly double-wide mode. Each eye is one full half.
+  static func isFullWidthSBS(_ screen: NSScreen) -> Bool {
+    let pixels = pixelSize(of: screen)
+    guard pixels.height > 0 else { return false }
+    if pixels.width == 3840 && pixels.height == 1080 { return true }
+    return Double(pixels.width) / Double(pixels.height) >= 3.2
+  }
+
+  /// 1920×1080. The shader packs half-width side-by-side into this frame.
+  static func isHalfWidthSBS(_ screen: NSScreen) -> Bool {
+    let pixels = pixelSize(of: screen)
+    return pixels.width == 1920 && pixels.height == 1080
+  }
+
   static func looksLikeNXTWEAR(_ screen: NSScreen) -> Bool {
-    let frame = screen.frame
-    return Int(frame.width) == 1920 && Int(frame.height) == 1080 && !isBuiltIn(screen)
+    if isGlassesName(screen) { return true }
+    if isBuiltIn(screen) { return false }
+    return isFullWidthSBS(screen) || isHalfWidthSBS(screen)
+  }
+
+  /// Named SmartGlasses / NXTWEAR first (including a mirrored main screen), then a
+  /// 3840×1080 or 1920×1080 external display.
+  static func glassesCandidates() -> [NSScreen] {
+    let screens = NSScreen.screens
+    let named = screens.filter { isGlassesName($0) }
+    if !named.isEmpty { return named }
+    let wide = screens.filter { isFullWidthSBS($0) && !isBuiltIn($0) }
+    if !wide.isEmpty { return wide }
+    let standard = screens.filter { isHalfWidthSBS($0) && !isBuiltIn($0) }
+    if !standard.isEmpty { return standard }
+    return []
+  }
+
+  static func framesMatch(_ lhs: NSRect, _ rhs: NSRect) -> Bool {
+    abs(lhs.origin.x - rhs.origin.x) < 0.5
+      && abs(lhs.origin.y - rhs.origin.y) < 0.5
+      && abs(lhs.size.width - rhs.size.width) < 0.5
+      && abs(lhs.size.height - rhs.size.height) < 0.5
   }
 
   static func builtInScreen(excluding glasses: NSScreen) -> NSScreen? {
@@ -579,7 +1039,7 @@ final class Immersive3DController: NSObject, NSWindowDelegate {
       glassesItem.state = .on
       return
     }
-    let screens = Self.externalScreens()
+    let screens = Self.glassesCandidates()
     glassesItem.state = .off
     if screens.count <= 1 {
       glassesItem.submenu = nil
@@ -637,7 +1097,8 @@ final class Immersive3DController: NSObject, NSWindowDelegate {
       convergence: 0.5,
       invertDepth: Preference.bool(for: .immersive3DInvertDepth),
       verticalFlip: Preference.bool(for: .immersive3DVerticalFlip),
-      passThroughSBS: pass
+      passThroughSBS: pass,
+      fullSizeEyes: glassesFullSizeEyes
     )
   }
 
@@ -704,6 +1165,13 @@ final class Immersive3DController: NSObject, NSWindowDelegate {
   }
 }
 
+private struct SavedMirrorLink {
+  var display: CGDirectDisplayID
+  var master: CGDirectDisplayID
+  var displayUUID: UUID?
+  var masterUUID: UUID?
+}
+
 private struct SavedWindow {
   var frame: NSRect
   var styleMask: NSWindow.StyleMask
@@ -712,7 +1180,15 @@ private struct SavedWindow {
   var isMovable: Bool
   var hasShadow: Bool
   var titlebarAppearsTransparent: Bool
+  var titleVisibility: NSWindow.TitleVisibility
   var aspectRatio: NSSize
+  var contentAspectRatio: NSSize
+  var minSize: NSSize
+  var contentMinSize: NSSize
+  var resizeIncrements: NSSize
+  var isOpaque: Bool
+  var backgroundColor: NSColor
+  var hidesOnDeactivate: Bool
   var disableUI: Bool
   var immersiveWasEnabled: Bool
 }

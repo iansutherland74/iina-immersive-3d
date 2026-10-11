@@ -28,7 +28,7 @@ xattr -dr com.apple.quarantine /path/to/IINA.app
 
 ### macOS 13.7
 
-`Configs/Deployment.xcconfig` sets `MACOSX_DEPLOYMENT_TARGET` to 12, and `Info.plist` publishes that as `LSMinimumSystemVersion`. macOS 13.7.8 is above 12, so the system allows the app to start. The arm64 `libmpv` that `other/download_libs.sh` fetches from iina.io declares a minimum of macOS 11.0, so dyld will load it on 13.7. Float16 depth packages still need macOS 13 or later, which 13.7 satisfies. Compiling with the Xcode 26 SDK does not raise the deployment target. Each run prints `vtool -show-build` for `IINA` and the bundled libraries. The app has not been launched on 13.7; this is the deployment-target check, not a runtime test.
+`Configs/Deployment.xcconfig` sets `MACOSX_DEPLOYMENT_TARGET` to 12, and `Info.plist` publishes that as `LSMinimumSystemVersion`. macOS 13.7.8 is above 12, so the system allows the app to start. The arm64 `libmpv` that `other/download_libs.sh` fetches from iina.io declares a minimum of macOS 11.0, so dyld will load it on 13.7. A float16 model converted for macOS 13 (the 364×280 package) loads on 13.7. Apple's published Depth Anything package is an ios17 specialization and needs macOS 14 or later. Compiling with the Xcode 26 SDK does not raise the deployment target. Each run prints `vtool -show-build` for `IINA` and the bundled libraries.
 
 ## Build and run on an M2 Mac
 
@@ -40,7 +40,7 @@ xattr -dr com.apple.quarantine /path/to/IINA.app
    ```
 
 3. Put a depth model in place. Depth Anything V2 Small is the default; see the next section. The app launches without a model, and asks for one when Immersive 3D is turned on.
-4. Open `iina.xcodeproj`. Select the **IINA** scheme and **My Mac**. The deployment target is macOS 12; the float16 depth packages need **macOS 13 or later**.
+4. Open `iina.xcodeproj`. Select the **IINA** scheme and **My Mac**. The deployment target is macOS 12. A macOS 13 depth conversion needs **macOS 13 or later**. Apple's published package needs **macOS 14 or later**.
 5. Run. The first build compiles the new `iina/Immersive3D` sources (`Immersive3DController.swift`, `DepthEstimator.swift`, `Immersive3DCompositor.swift`, `Immersive3D.metal`) and the IPTV sources under `iina/IPTV` (`IPTVModels.swift`, `IPTVParsers.swift`, `IPTVLibrary.swift`, `IPTVGuideView.swift`, `IPTVTitles.swift`, `IPTVPosterView.swift`, `IPTVWindowController.swift`).
 
 Product name and bundle id stay `IINA` / `com.colliderli.iina`, so this build uses the same Application Support folder as a stock IINA install. Quit a stock IINA before launching this one if both are installed.
@@ -60,14 +60,14 @@ Any other `.mlpackage` in that folder whose name starts with `DepthAnythingV2` o
 
 ### Depth Anything V2 Small (default)
 
-Apple publishes a Core ML conversion. It is a **fixed 518×392** RGB input and a float16 grayscale depth output. Fetch it (about 50 MB, not committed):
+Apple publishes a Core ML conversion. It is a **fixed 518×392** RGB input and a float16 grayscale depth **image**. That package is an **ios17** specialization and needs **macOS 14 or later**. The player compiles a `.mlpackage` with `MLModel.compileModel(at:)` on a background queue and caches the `.mlmodelc` next to it under `Models/`, recompiling when the package is newer. Fetch Apple's package (about 50 MB, not committed):
 
 ```console
 python3 -m pip install --user huggingface_hub
 ./other/fetch_depth_model.sh
 ```
 
-`--p6` fetches the smaller palettized package instead. A 364×280 model is a better real-time size, but Apple's package cannot be resized at runtime, so that size has to be converted from the Apache-2.0 checkpoint:
+`--p6` fetches the smaller palettized package instead. Both Apple packages need macOS 14. A 364×280 model is a better real-time size, and it is the one that loads on macOS 13. Apple's package cannot be resized at runtime, so that size has to be converted from the Apache-2.0 checkpoint with a macOS 13 deployment target. The converted package takes an `image` input (364×280 RGB) and returns `depth` as a float16 `MLMultiArray` of shape `[1, 1, 280, 364]`, which the player reads with the array's strides:
 
 ```console
 git clone https://github.com/DepthAnything/Depth-Anything-V2 /tmp/Depth-Anything-V2
@@ -103,7 +103,7 @@ Open a local file or an online URL (yt-dlp, already part of IINA). Then:
 
 - **Video → Immersive 3D** turns conversion on. The frame is read after mpv has drawn it, including burned-in subtitles, and replaced with side-by-side stereo. Soft / Standard / Enhanced and the slider live under **Video → Depth Strength**.
 - Files whose names contain `sbs`, `half-sbs`, `full-sbs`, or `side-by-side` are passed through unchanged while the source mode is Automatic. **Video → Source Is Side-by-Side** can force pass-through or force conversion.
-- **Video → Play on Glasses** looks for a non-built-in display. A 1920×1080 external display is labeled as the likely NXTWEAR S. If several external displays are attached, the menu lists them. The video window moves onto that display as a borderless full-frame window (not AppKit fullscreen, so the Mac menu bar stays), the on-screen controller is hidden on the glasses, and a small panel on the built-in screen says: **Long-press the right-side button on your glasses to switch to 3D mode.** That panel also has play/pause, the strength slider, and Exit. If the Mac is the only display, the panel sits on the glasses screen and says so.
+- **Video → Play on Glasses** looks for a display named SmartGlasses or NXTWEAR, including when that display is the main screen. Otherwise it uses an external 3840×1080 or 1920×1080 display. The video window becomes a borderless window at shielding level (above normal windows). Its frame is that screen's full `NSScreen.frame` in global desktop coordinates, origin included — an extended SmartGlasses display is not at (0, 0); the measured 3D frame is (1512, −98) and 3840×1080. There is no menu-bar, notch, or title-bar inset, and the window uses `canJoinAllSpaces` / `fullScreenAuxiliary`. It draws at the screen's backing pixel size and stays pinned there when the resolution changes (`didChangeScreenParametersNotification`). On the measured NXTWEAR S, 2D mode is 1920×1080 at scale 1 and the picture is half side-by-side; after the long-press, 3D mode is 3840×1080 at scale 1 and each eye is drawn at 1920×1080 into its half. The on-screen controller is hidden on the glasses. A small panel says to long-press the right-side button until the display widens, and switches to the full-half message once it does. That panel also has play/pause, the strength slider, and Exit. **Settings → Video → Automatically set up glasses display** (on by default) uses `CGBeginDisplayConfiguration`, `CGConfigureDisplayMirrorOfDisplay(..., kCGNullDirectDisplay)`, and `CGCompleteDisplayConfiguration(..., .forSession)` to leave a mirrored pair as an extended desktop for this login session. Play on Glasses restores the original mirroring when it stops, and it checks again after a 2D/3D mode change because mirroring can come back. The arrangement is not written as the permanent display configuration.
 - **Invert Depth** swaps near and far. **Flip 3D Picture Vertically** is there if the picture comes out upside down; the OpenGL framebuffer and the Metal shader do not agree on which row is the top, and that toggle is the escape hatch. It was not confirmed on hardware.
 
 Depth runs at the model's fixed size (518×392 for Apple's package, or whatever size you converted). Similar frames reuse the last map, and successive maps are smoothed so the stereo does not flicker. Until the first map arrives, the shift uses a flat depth so the layout is already side-by-side.
@@ -153,12 +153,12 @@ Xtream still requires the password in the stream path. mpv is given that real UR
 
 Saved sources and favourites live in `~/Library/Application Support/com.colliderli.iina/IPTV/library.json`. Cached catalogs are `cache-<uuid>.json` in that folder. An M3U cache contains the stream URLs from the playlist, so a playlist that already embeds credentials will be copied there. An Xtream `direct_source` is cached too. Neither file is UserDefaults.
 
-`Info.plist` sets `NSAllowsArbitraryLoads` so the catalog, guide, and logo requests can use the HTTP servers IPTV hosts usually are. That exception applies to the whole app, not only IPTV. mpv was already able to play HTTP URLs without it.
+`Info.plist` sets `NSAllowsArbitraryLoads` so the catalog, guide, and logo requests can use the HTTP servers IPTV hosts usually are. `NSAllowsArbitraryLoadsInWebContent` is not set: on macOS that key makes `NSAllowsArbitraryLoads` ignored. The assrt.net exception (`NSExceptionAllowsInsecureHTTPLoads` and `NSIncludesSubdomains`) stays. The arbitrary-loads exception applies to the whole app, not only IPTV. mpv was already able to play HTTP URLs without it.
 
 ## Known gaps
 
 - The Release app is compiled by the macOS Release workflow. It has not been launched. Metal, Core ML, and the OpenGL `IOSurface` share are unchecked on a Mac.
-- The glasses image is half side-by-side inside the existing frame, not a double-width buffer. That matches a 1920×1080 panel in 3D mode.
+- At 1920×1080 the glasses image is half side-by-side inside that frame. At 3840×1080 each eye is a full 1920×1080 half. The window is the screen frame, not a floating player window.
 - The copy into the stereo pass is 8-bit BGRA, so HDR is flattened for the 3D view.
 - Subtitles drawn by mpv are part of the picture that gets shifted.
 - Depth is about a frame behind the picture, and it is a horizontal shift plus a short hole search, not a full inpaint.

@@ -889,6 +889,32 @@ class MainWindowController: PlayerWindowController {
     layoutSides.forEach { videoContainerConstraints[$0]?.isActive = true }
   }
 
+  /// While Play on Glasses is active the picture has to fill the window, which is the screen frame.
+  /// The normal layout insets the video for the title bar, control bar, and sidebars.
+  func setGlassesVideoFill(_ fill: Bool) {
+    guard window?.contentView != nil else { return }
+    if fill {
+      guard let cv = window?.contentView else { return }
+      layoutSides.forEach { videoContainerConstraints[$0].flatMap(cv.removeConstraint) }
+      layoutSides.forEach { attr in
+        videoContainerConstraints[attr] = NSLayoutConstraint(
+          item: videoViewContainer!,
+          attribute: attr,
+          relatedBy: .equal,
+          toItem: cv,
+          attribute: attr,
+          multiplier: 1,
+          constant: 0
+        )
+      }
+      layoutSides.forEach { videoContainerConstraints[$0]?.isActive = true }
+      layoutSides.forEach { videoViewConstraints[$0]?.constant = 0 }
+    } else {
+      setupVideoContainerConstraints()
+    }
+    window?.contentView?.layoutSubtreeIfNeeded()
+  }
+
   private func updateVideoContainerConstraints(_ constraints: [NSLayoutConstraint.Attribute: CGFloat]) {
     for (attr, value) in constraints {
       videoContainerConstraints[attr]?.constant = value
@@ -1932,6 +1958,9 @@ class MainWindowController: PlayerWindowController {
 
   func windowDidResize(_ notification: Notification) {
     guard loaded, let window else { return }
+    if Immersive3DController.shared.glassesActive {
+      Immersive3DController.shared.repinGlassesWindowIfNeeded()
+    }
     if !window.inLiveResize {
       liveText.requestAnalysis()
     }
@@ -2344,6 +2373,11 @@ class MainWindowController: PlayerWindowController {
 
   private func setWindowAspectRatio(_ aspectRatio: NSSize) {
     guard let window else { return }
+    if Immersive3DController.shared.glassesActive {
+      window.aspectRatio = .zero
+      window.contentAspectRatio = .zero
+      return
+    }
     if Preference.unlockWindowAspectRatio {
       window.aspectRatio = .zero
       window.resizeIncrements = .init(width: 1, height: 1)
@@ -2464,6 +2498,11 @@ class MainWindowController: PlayerWindowController {
   /** Set window size when info available, or video size changed. */
   func handleVideoSizeChange(keepWindowSize: Bool) {
     guard loaded, let window else { return }
+    if Immersive3DController.shared.glassesActive {
+      window.aspectRatio = .zero
+      window.contentAspectRatio = .zero
+      return
+    }
 
     // When starting to play the file try and find the screen the window was previously on.
     let screen = player.info.justStartedFile ? determineScreenToUse(window) : window.selectDefaultScreen()
