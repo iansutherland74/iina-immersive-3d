@@ -800,8 +800,16 @@ class MPVController: NSObject {
   }
 
   /// Xtream stream URLs contain the password. Log the channel title when one was registered.
+  /// A `scheme://user:password@host` argument is logged without the userinfo.
   private func loggedCommandArgs(_ args: [String?]) -> String {
-    args.compactMap { $0 }.map { IPTVLibrary.shared.redactedForLog($0) }.joined(separator: " ")
+    args.compactMap { $0 }.map { redactUserinfo(IPTVLibrary.shared.redactedForLog($0)) }.joined(separator: " ")
+  }
+
+  private func redactUserinfo(_ raw: String) -> String {
+    guard let scheme = raw.range(of: "://") else { return raw }
+    let after = raw[scheme.upperBound...]
+    guard let at = after.firstIndex(of: "@"), !after[..<at].contains("/") else { return raw }
+    return String(raw[..<scheme.upperBound]) + String(after[raw.index(after: at)...])
   }
 
   func command(rawString: String, level: Logger.Level = .debug) -> Int32 {
