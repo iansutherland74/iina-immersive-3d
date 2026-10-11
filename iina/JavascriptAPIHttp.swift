@@ -17,6 +17,7 @@ fileprivate typealias JustRequestFunc = (URLComponentsConvertible, [String : Any
   func post(_ url: String, _ options: [String: Any]?) -> JSValue?
   func put(_ url: String, _ options: [String: Any]?) -> JSValue?
   func patch(_ url: String, _ options: [String: Any]?) -> JSValue?
+  func request(_ method: String, _ url: String, _ options: [String: Any]?) -> JSValue?
   func delete(_ url: String, _ options: [String: Any]?) -> JSValue?
   func xmlrpc(_ location: String) -> JavascriptAPIXmlrpc?
   func download(_ url: String, _ dest: String, _ options: [String: Any]?) -> JSValue?
@@ -42,6 +43,64 @@ class JavascriptAPIHttp: JavascriptAPI, JavascriptAPIHttpExportable {
 
   @objc func delete(_ url: String, _ options: [String: Any]?) -> JSValue? {
     return request(.delete, url: url, options: options)
+  }
+
+  /// Any method Just does not know, including WebDAV PROPFIND. The password stays in a header.
+  /// A URL that already contains a user or a password is rejected so this path does not record it.
+  @objc func request(_ method: String, _ url: String, _ options: [String: Any]?) -> JSValue? {
+    return whenPermitted(to: .networkRequest) {
+      let verb = method.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+      guard Self.allowedMethods.contains(verb) else {
+        throwError(withMessage: "HTTP method is not allowed.")
+        return nil
+      }
+      guard hostIsValid(url) else {
+        return JSValue(undefinedIn: context)
+      }
+      guard let target = URL(string: url), target.user == nil, target.password == nil else {
+        throwError(withMessage: "The password belongs in a header, not in the URL.")
+        return nil
+      }
+      let headers = stringHeaders(options?["headers"])
+      let body = options?["body"] as? String
+      let timeout = min(120, max(5, (options?["timeout"] as? NSNumber)?.doubleValue ?? 45))
+      return createPromise { resolve, reject in
+        var req = URLRequest(url: target, timeoutInterval: timeout)
+        req.httpMethod = verb
+        for (name, value) in headers {
+          req.setValue(value, forHTTPHeaderField: name)
+        }
+        if let body {
+          req.httpBody = Data(body.utf8)
+        }
+        let delegate = WebDAVRedirectDelegate()
+        let session = URLSession(configuration: .ephemeral, delegate: delegate, delegateQueue: nil)
+        session.dataTask(with: req) { data, response, _ in
+          let http = response as? HTTPURLResponse
+          let tooLarge = (data?.count ?? 0) > 8_000_000
+          let text = tooLarge ? "" : (data.flatMap { String(data: $0, encoding: .utf8) } ?? "")
+          let status = http?.statusCode ?? 0
+          let reason: String
+          if tooLarge {
+            reason = "The response is too large."
+          } else if http == nil {
+            reason = "The server could not be reached."
+          } else {
+            reason = HTTPURLResponse.localizedString(forStatusCode: status)
+          }
+          let dict: [String: Any] = [
+            "statusCode": status,
+            "reason": reason,
+            "text": text
+          ]
+          let ok = !tooLarge && (200...299).contains(status)
+          DispatchQueue.main.async {
+            (ok ? resolve : reject).call(withArguments: [dict])
+            session.finishTasksAndInvalidate()
+          }
+        }.resume()
+      }
+    }
   }
 
   @objc func xmlrpc(_ location: String) -> JavascriptAPIXmlrpc? {
@@ -111,6 +170,23 @@ class JavascriptAPIHttp: JavascriptAPI, JavascriptAPIHttpExportable {
     }
   }
 
+  private static let allowedMethods: Set<String> = [
+    "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS",
+    "PROPFIND", "PROPPATCH", "REPORT", "MKCOL", "COPY", "MOVE", "LOCK", "UNLOCK"
+  ]
+
+  private func stringHeaders(_ value: Any?) -> [String: String] {
+    if let raw = value as? [String: String] { return raw }
+    guard let raw = value as? [String: Any] else { return [:] }
+    var headers: [String: String] = [:]
+    for (name, item) in raw {
+      if let text = item as? String {
+        headers[name] = text
+      }
+    }
+    return headers
+  }
+
   private func hostIsValid(_ url: String) -> Bool {
     guard let urlComponents = URLComponents(string: url.addingPercentEncoding(withAllowedCharacters: .urlAllowed) ?? url) else {
       throwError(withMessage: "URL \(url) is invalid.")
@@ -153,6 +229,25 @@ class JavascriptAPIXmlrpc: JavascriptAPI, JavascriptAPIXmlrpcExportable {
         }
       }
     }
+  }
+}
+
+/// Drops Authorization when a redirect leaves the host that was asked.
+private final class WebDAVRedirectDelegate: NSObject, URLSessionTaskDelegate {
+  func urlSession(
+    _ session: URLSession,
+    task: URLSessionTask,
+    willPerformHTTPRedirection response: HTTPURLResponse,
+    newRequest request: URLRequest,
+    completionHandler: @escaping (URLRequest?) -> Void
+  ) {
+    var next = request
+    let from = task.originalRequest?.url?.host
+    let to = request.url?.host
+    if let from, let to, from.caseInsensitiveCompare(to) != .orderedSame {
+      next.setValue(nil, forHTTPHeaderField: "Authorization")
+    }
+    completionHandler(next)
   }
 }
 

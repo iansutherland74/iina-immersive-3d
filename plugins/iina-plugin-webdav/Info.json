@@ -1,0 +1,20 @@
+{
+  "name": "WebDAV",
+  "identifier": "io.iina.webdav",
+  "version": "1.0.0",
+  "author": {
+    "name": "IINA Immersive 3D contributors",
+    "url": "https://github.com/iansutherland74/iina-immersive-3d"
+  },
+  "description": "Browse a WebDAV server and play video files in IINA. Works with FebBox, Nextcloud, and a NAS.",
+  "entry": "main.js",
+  "permissions": ["network-request"],
+  "allowedDomains": ["*"],
+  "sidebarTab": {
+    "name": "WebDAV"
+  },
+  "preferenceDefaults": {
+    "serverURL": "https://webdav.febbox.com",
+    "username": ""
+  }
+}

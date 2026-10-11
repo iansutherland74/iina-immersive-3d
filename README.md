@@ -108,6 +108,16 @@ Open a local file or an online URL (yt-dlp, already part of IINA). Then:
 
 Depth runs at the model's fixed size (518×392 for Apple's package, or whatever size you converted). Similar frames reuse the last map, and successive maps are smoothed so the stereo does not flicker. Until the first map arrives, the shift uses a flat depth so the layout is already side-by-side.
 
+## WebDAV
+
+The WebDAV browser is a JavaScript plugin in `plugins/iina-plugin-webdav`. It is not compiled into IINA. **Plugins → WebDAV Browser** (or the WebDAV sidebar tab) lists a folder with `PROPFIND` and plays a video with `iina.core.open`, so **Immersive 3D** and **Play on Glasses** apply the same way they do for any other URL.
+
+**Settings → Plugins → Install Local Package…** takes the `iina-plugin-webdav-1.0.0.iinaplgz` artifact from the macOS Release run. **Get Plugins…** installs a GitHub repository that has `Info.json` at its root, or a release asset ending in `.iinaplgz`. This plugin is a folder inside the player repository, so that GitHub install does not see it. Use the package file. The plugin asks for network access to any host, because the server address is typed in later.
+
+FebBox's WebDAV address is `https://webdav.febbox.com` (create the account in the FebBox console; add the effective path if one is shown). Nextcloud is `https://host/remote.php/dav/files/USERNAME/`. A NAS can be `http://` on the local network; the sidebar says the password is then unencrypted. The username and server address are plugin preferences. The password goes to the Keychain through `iina.utils.keychainWrite`. If that write fails, the sidebar says so and the password stays in memory until IINA quits. It is not stored in the preference file.
+
+Folders and video files are shown. Other files are left out. Play sets mpv `http-header-fields` to `Authorization: Basic …` and opens the file URL with no user and no password in it, so history does not receive the password. The header stays while that host is the current file and is restored when another host starts. Opening the same URL again from history does not send the password; play it from the sidebar. `iina.http.get` and `post` cannot send `PROPFIND`. `iina.http.request` does. The debug log hides the header value.
+
 ## IPTV
 
 **File → IPTV…** (Option-Command-I) opens a TV-style browser. It is not a sidebar tab. Playback goes through the normal player, so **Video → Immersive 3D** and **Play on Glasses** apply to these streams the same way they apply to any other URL.
@@ -175,6 +185,7 @@ Saved sources and favourites live in `~/Library/Application Support/com.collider
 - An `iptv://` history row does not play again. Resume-from-history and watch-later are off for these streams.
 - The guide was not compiled or shown. It keeps listings from 7 days ago through 26 hours ahead, not every programme in a multi-week XMLTV file, and not catch-up older than that even when `catchup-days` is larger. Quoted `#EXTINF` values are not unescaped (`\"` stays as two characters). A junk token before an attribute is skipped. Catch-up URL assembly was checked as a Python transcription of the rules above, then deleted; the Swift was not compiled, and no provider was contacted.
 - The poster grid and the details page were not compiled or shown. Series episodes come from `get_series_info` when the details page opens, not with the first catalog request. Movies and series do not use the EPG columns. An episode opened from Continue watching keeps its series only when that series is still in the catalog; otherwise the page uses the fields already stored on the episode.
+- The WebDAV plugin was not installed in IINA and was not pointed at FebBox, Nextcloud, or a NAS. No PROPFIND was sent and the Keychain was not written. The sample listing parser was run locally. Playback through Immersive 3D and Play on Glasses was not tried.
 
 ---
 

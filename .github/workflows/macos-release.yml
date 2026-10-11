@@ -29,6 +29,30 @@ jobs:
           # directory named iina. The repo directory is iina-immersive-3d.
           path: iina
 
+      - name: Package the WebDAV plugin
+        working-directory: iina
+        run: |
+          set -euo pipefail
+          plugin="plugins/iina-plugin-webdav"
+          test -f "$plugin/Info.json"
+          test -f "$plugin/main.js"
+          test -f "$plugin/sidebar.html"
+          version="$(python3 -c 'import json; print(json.load(open("plugins/iina-plugin-webdav/Info.json"))["version"])')"
+          archive="iina-plugin-webdav-${version}.iinaplgz"
+          rm -f "$archive"
+          (cd "$plugin" && zip -ryq "../../${archive}" . -x '.*' -x 'test/*' -x 'test/**')
+          test -s "$archive"
+          unzip -l "$archive"
+          ls -lh "$archive"
+
+      - name: Upload WebDAV plugin
+        uses: actions/upload-artifact@v7
+        with:
+          name: iina-plugin-webdav.iinaplgz
+          path: iina/iina-plugin-webdav-*.iinaplgz
+          if-no-files-found: error
+          archive: false
+
       - name: Select latest stable Xcode
         run: |
           set -euo pipefail

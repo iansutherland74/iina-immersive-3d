@@ -853,7 +853,8 @@ class MPVController: NSObject {
 
   @discardableResult
   func setString(_ name: String, _ value: String, level: Logger.Level = .debug) -> Int32 {
-    log("Set property: \(name)=\(value)", level: level)
+    let shown = name == MPVOption.Network.httpHeaderFields ? "(header hidden)" : value
+    log("Set property: \(name)=\(shown)", level: level)
     return mpv_set_property_string(mpv, name, value)
   }
 

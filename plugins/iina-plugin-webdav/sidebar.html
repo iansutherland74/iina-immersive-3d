@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>WebDAV</title>
+  <style>
+    :root {
+      color-scheme: dark light;
+      --line: rgba(127, 127, 127, 0.35);
+      --muted: #8e8e93;
+      --accent: #0a84ff;
+      --warn: #ff9f0a;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font: 13px/1.35 -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif;
+      padding: 12px;
+    }
+    h1 { font-size: 15px; margin: 0 0 8px; }
+    label { display: block; margin: 8px 0 4px; color: var(--muted); }
+    input {
+      width: 100%;
+      font: inherit;
+      padding: 6px 8px;
+      border-radius: 6px;
+      border: 1px solid var(--line);
+      background: transparent;
+      color: inherit;
+    }
+    button {
+      font: inherit;
+      border: 0;
+      border-radius: 6px;
+      padding: 6px 10px;
+      background: var(--accent);
+      color: white;
+      margin-top: 10px;
+    }
+    button.plain {
+      background: transparent;
+      color: var(--accent);
+      padding: 6px 0;
+      margin: 0 8px 0 0;
+    }
+    .row { display: flex; align-items: center; margin-top: 8px; }
+    .note { color: var(--muted); margin: 8px 0; }
+    .warn { color: var(--warn); margin: 8px 0; }
+    .path {
+      margin: 12px 0 6px;
+      word-break: break-all;
+      color: var(--muted);
+    }
+    ul { list-style: none; margin: 0; padding: 0; }
+    li {
+      border-top: 1px solid var(--line);
+    }
+    li button.item {
+      width: 100%;
+      text-align: left;
+      background: transparent;
+      color: inherit;
+      border-radius: 0;
+      margin: 0;
+      padding: 8px 2px;
+    }
+    li button.item span { color: var(--muted); float: right; }
+    .folder { font-weight: 600; }
+  </style>
+</head>
+<body>
+  <h1>WebDAV</h1>
+  <p class="note">FebBox uses https://webdav.febbox.com. If the site shows an effective path, add it to the end. Nextcloud looks like https://host/remote.php/dav/files/name/</p>
+  <label for="server">Server address</label>
+  <input id="server" autocomplete="off" spellcheck="false" placeholder="https://webdav.febbox.com">
+  <label for="user">Username</label>
+  <input id="user" autocomplete="username">
+  <label for="password">Password</label>
+  <input id="password" type="password" autocomplete="current-password" placeholder="Saved in the Keychain">
+  <button id="connect" type="button">Connect</button>
+  <p id="warning" class="warn" hidden></p>
+  <div class="row">
+    <button id="up" class="plain" type="button" hidden>Up</button>
+    <button id="refresh" class="plain" type="button">Refresh</button>
+  </div>
+  <div id="path" class="path"></div>
+  <p id="status" class="note"></p>
+  <ul id="list"></ul>
+  <script>
+    var current = "";
+    var stack = [];
+
+    function post(name, data) {
+      iina.postMessage(name, data || {});
+    }
+
+    function setWarning(text) {
+      var node = document.getElementById("warning");
+      node.hidden = !text;
+      node.textContent = text || "";
+    }
+
+    function setStatus(text) {
+      document.getElementById("status").textContent = text || "";
+    }
+
+    function sizeText(bytes) {
+      if (!bytes) return "";
+      var units = ["B", "KB", "MB", "GB"];
+      var value = bytes;
+      var unit = 0;
+      while (value >= 1024 && unit < units.length - 1) {
+        value /= 1024;
+        unit += 1;
+      }
+      return (unit === 0 ? value : value.toFixed(1)) + " " + units[unit];
+    }
+
+    function render(entries) {
+      var list = document.getElementById("list");
+      list.textContent = "";
+      entries.forEach(function (entry) {
+        var item = document.createElement("li");
+        var button = document.createElement("button");
+        button.type = "button";
+        button.className = "item" + (entry.folder ? " folder" : "");
+        button.textContent = (entry.folder ? "Folder  " : "") + entry.name;
+        if (!entry.folder && entry.size) {
+          var meta = document.createElement("span");
+          meta.textContent = sizeText(entry.size);
+          button.appendChild(meta);
+        }
+        button.addEventListener("click", function () {
+          if (entry.folder) {
+            stack.push(current);
+            post("open", { href: entry.href });
+          } else {
+            post("play", { href: entry.href });
+          }
+        });
+        item.appendChild(button);
+        list.appendChild(item);
+      });
+    }
+
+    document.getElementById("connect").addEventListener("click", function () {
+      stack = [];
+      post("save", {
+        serverURL: document.getElementById("server").value,
+        username: document.getElementById("user").value,
+        password: document.getElementById("password").value
+      });
+      document.getElementById("password").value = "";
+    });
+
+    document.getElementById("refresh").addEventListener("click", function () {
+      post("open", { href: current });
+    });
+
+    document.getElementById("up").addEventListener("click", function () {
+      var previous = stack.pop();
+      if (previous) post("open", { href: previous });
+    });
+
+    iina.onMessage("settings", function (data) {
+      if (!data) return;
+      document.getElementById("server").value = data.serverURL || "";
+      document.getElementById("user").value = data.username || "";
+      document.getElementById("password").placeholder = data.hasPassword ? "Saved in the Keychain" : "Password";
+      setWarning(data.warning || (data.https === false ? "This address is not HTTPS. The password crosses the network without encryption." : ""));
+    });
+
+    iina.onMessage("listing", function (data) {
+      if (!data) return;
+      current = data.url || current;
+      document.getElementById("path").textContent = current;
+      document.getElementById("up").hidden = stack.length === 0;
+      if (data.loading) {
+        setStatus("Loading…");
+        return;
+      }
+      setStatus(data.error || "");
+      render(data.entries || []);
+    });
+
+    iina.onMessage("status", function (data) {
+      setStatus(data && data.text || "");
+    });
+
+    post("ready");
+  </script>
+</body>
+</html>
