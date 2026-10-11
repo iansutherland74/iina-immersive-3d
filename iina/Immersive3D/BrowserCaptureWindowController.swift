@@ -21,7 +21,7 @@ final class BrowserCaptureWindowController: NSWindowController, NSTableViewDataS
   private var previewFrame = NSRect(x: 0, y: 0, width: 960, height: 540)
   private var onGlasses = false
   private var rows: [BrowserCaptureTarget] = []
-  private var selectedID: CGWindowID?
+  private var selected: BrowserCaptureTarget?
   private var table: NSTableView?
   private var statusLabel: NSTextField?
   private var outputMessage: NSTextField?
@@ -68,6 +68,12 @@ final class BrowserCaptureWindowController: NSWindowController, NSTableViewDataS
     buildChooser()
     manager.onFrame = { [weak self] buffer, time in
       self?.renderer.consume(buffer, at: time)
+    }
+    manager.onIdle = { [weak self] in
+      self?.renderer.redrawHeld()
+    }
+    manager.excludedWindowIDs = { [weak self] in
+      self?.excludedWindowIDs() ?? []
     }
     manager.onStatus = { [weak self] text in
       self?.showOutputMessage(text)
@@ -179,12 +185,12 @@ final class BrowserCaptureWindowController: NSWindowController, NSTableViewDataS
       }
       return
     }
-    guard let selectedID else {
+    guard let selected else {
       showChooser(sender)
       setStatus("Choose a window, then start capture.")
       return
     }
-    beginCapture(selectedID)
+    beginCapture(selected)
   }
 
   @objc func toggleGlasses(_ sender: Any?) {
@@ -263,7 +269,7 @@ final class BrowserCaptureWindowController: NSWindowController, NSTableViewDataS
 
   func tableViewSelectionDidChange(_ notification: Notification) {
     guard let table, table.selectedRow >= 0, rows.indices.contains(table.selectedRow) else { return }
-    selectedID = rows[table.selectedRow].id
+    selected = rows[table.selectedRow]
   }
 
   private func buildChooser() {
@@ -387,8 +393,8 @@ final class BrowserCaptureWindowController: NSWindowController, NSTableViewDataS
       return
     }
     let target = rows[table.selectedRow]
-    selectedID = target.id
-    beginCapture(target.id)
+    selected = target
+    beginCapture(target)
   }
 
   private func reload() {
@@ -400,7 +406,10 @@ final class BrowserCaptureWindowController: NSWindowController, NSTableViewDataS
         DispatchQueue.main.async {
           self?.rows = found
           self?.table?.reloadData()
-          self?.setStatus(found.isEmpty ? "No other windows are on screen." : "\(found.count) windows. IINA's own output is left out.")
+          if let selected = self?.selected, let match = found.first(where: { $0.key == selected.key }) {
+            self?.selected = match
+          }
+          self?.setStatus(found.isEmpty ? "No other windows are available." : "\(found.count) sources, including full-screen windows and Capture whole display. IINA's own output is left out.")
         }
       } catch {
         DispatchQueue.main.async {
@@ -410,7 +419,7 @@ final class BrowserCaptureWindowController: NSWindowController, NSTableViewDataS
     }
   }
 
-  private func beginCapture(_ id: CGWindowID) {
+  private func beginCapture(_ target: BrowserCaptureTarget) {
     guard ensurePermission() else { return }
     let excluded = excludedWindowIDs()
     guard ensureOutput() != nil else { return }
@@ -418,7 +427,7 @@ final class BrowserCaptureWindowController: NSWindowController, NSTableViewDataS
     showOutputMessage(nil)
     Task { [weak self] in
       do {
-        try await self?.manager.start(windowID: id, excluding: excluded)
+        try await self?.manager.start(target, excluding: excluded)
         DispatchQueue.main.async {
           self?.syncMenu()
           self?.setStatus(self?.captureStatus() ?? "Capturing.")
@@ -434,11 +443,14 @@ final class BrowserCaptureWindowController: NSWindowController, NSTableViewDataS
   }
 
   private func restartIfRunning() {
-    guard manager.isRunning, let id = manager.currentID ?? selectedID else { return }
-    beginCapture(id)
+    guard manager.isRunning, let target = manager.activeTarget ?? selected else { return }
+    beginCapture(target)
   }
 
   private func captureStatus() -> String {
+    if manager.activeTarget?.kind == .display {
+      return "Capturing the whole display."
+    }
     if !audioAvailable {
       return "Capturing. Window audio needs macOS 13, so sound stays in the other app."
     }

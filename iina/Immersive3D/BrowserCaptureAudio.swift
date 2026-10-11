@@ -90,8 +90,15 @@ final class BrowserCaptureAudioPlayer {
   }
 
   func stop() {
-    queue.sync { [weak self] in
-      self?.stopOnQueue()
+    // queue.sync from the main thread blocks the run loop for the whole audio teardown.
+    if Thread.isMainThread {
+      queue.async { [weak self] in
+        self?.stopOnQueue()
+      }
+    } else {
+      queue.sync { [weak self] in
+        self?.stopOnQueue()
+      }
     }
   }
 
@@ -109,11 +116,13 @@ final class BrowserCaptureAudioPlayer {
   }
 
   func consumeCapture(_ sampleBuffer: CMSampleBuffer) {
+    // OBS copies the audio bytes before the ScreenCaptureKit callback returns.
+    // The sample buffer is not owned past that callback.
+    guard let buffer = pcmBuffer(from: sampleBuffer) else { return }
+    let time = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+    let pts = time.isValid ? CMTimeGetSeconds(time) : CACurrentMediaTime()
     queue.async { [weak self] in
       guard let self, self.started else { return }
-      guard let buffer = self.pcmBuffer(from: sampleBuffer) else { return }
-      let time = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-      let pts = time.isValid ? CMTimeGetSeconds(time) : CACurrentMediaTime()
       self.enqueue(buffer, pts: pts, fromTap: false)
     }
   }
@@ -751,8 +760,12 @@ final class BrowserCaptureSourceMute {
       mScope: kAudioObjectPropertyScopeGlobal,
       mElement: kAudioObjectPropertyElementMain
     )
+    // kAudioDevicePropertyDeviceUID hands back one +1 CFString. The buffer is a
+    // single pointer. takeRetainedValue consumes that retain. Sizing the buffer
+    // as an Unmanaged optional (two words) makes Core Audio write a pointer into
+    // the wrong layout, and the next autorelease pop releases it again.
     var name: Unmanaged<CFString>?
-    var size = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+    var size = UInt32(MemoryLayout<UnsafeRawPointer?>.size)
     let status = AudioObjectGetPropertyData(device, &address, 0, nil, &size, &name)
     guard status == noErr, let name else { return nil }
     return name.takeRetainedValue() as String

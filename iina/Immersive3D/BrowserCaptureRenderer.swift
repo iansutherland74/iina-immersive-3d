@@ -28,15 +28,20 @@ final class BrowserCaptureRenderer: NSView {
   private var cropped: MTLTexture?
   private var croppedWidth = 0
   private var croppedHeight = 0
-  private var outputTexture: MTLTexture?
-  private var outputWidth = 0
-  private var outputHeight = 0
+  private var stageTextures: [MTLTexture?] = [nil, nil]
+  private var stageBusy: [Bool] = [false, false]
+  private let stageLock = NSLock()
+  private var pixelWidth = 2
+  private var pixelHeight = 2
   private var held: CVPixelBuffer?
   private var heldTime = CMTime.invalid
   private var fullSizeEyes = false
   private var blackFrames = 0
   private var showingBlack = false
   private var frameIndex = 0
+  private var loggedTexture = false
+  private var loggedSend = false
+  private var loggedSendFailure = false
 
   private struct CropUniform {
     var x: Float
@@ -69,6 +74,7 @@ final class BrowserCaptureRenderer: NSView {
       layer.pixelFormat = .bgra8Unorm
       layer.framebufferOnly = false
       layer.isOpaque = true
+      layer.allowsNextDrawableTimeout = true
     }
   }
 
@@ -82,13 +88,26 @@ final class BrowserCaptureRenderer: NSView {
     layer.pixelFormat = .bgra8Unorm
     layer.framebufferOnly = false
     layer.isOpaque = true
+    layer.allowsNextDrawableTimeout = true
     return layer
   }
 
   func setPixelSize(width: Int, height: Int, scale: CGFloat) {
-    guard let layer = self.layer as? CAMetalLayer else { return }
-    layer.contentsScale = scale
-    layer.drawableSize = CGSize(width: max(width, 2), height: max(height, 2))
+    let pixels = (max(width, 2), max(height, 2))
+    stageLock.lock()
+    pixelWidth = pixels.0
+    pixelHeight = pixels.1
+    stageLock.unlock()
+    let apply = {
+      guard let layer = self.layer as? CAMetalLayer else { return }
+      layer.contentsScale = scale
+      layer.drawableSize = CGSize(width: pixels.0, height: pixels.1)
+    }
+    if Thread.isMainThread {
+      apply()
+    } else {
+      DispatchQueue.main.async(execute: apply)
+    }
   }
 
   func setFullSizeEyes(_ enabled: Bool) {
@@ -99,14 +118,26 @@ final class BrowserCaptureRenderer: NSView {
     BrowserCaptureSettings.shared.requestAnalysis()
   }
 
-  /// Called on the capture queue.
+  /// Called on the capture queue. A call from the main thread is moved there so the GPU waits never block the run loop.
   func consume(_ pixelBuffer: CVPixelBuffer, at time: CMTime) {
+    if Thread.isMainThread {
+      BrowserCaptureManager.shared.perform { [weak self] in
+        self?.consume(pixelBuffer, at: time)
+      }
+      return
+    }
     held = pixelBuffer
     heldTime = time
     draw(pixelBuffer, at: time)
   }
 
   func redrawHeld() {
+    if Thread.isMainThread {
+      BrowserCaptureManager.shared.perform { [weak self] in
+        self?.redrawHeld()
+      }
+      return
+    }
     guard let held else { return }
     draw(held, at: heldTime)
   }
@@ -114,8 +145,7 @@ final class BrowserCaptureRenderer: NSView {
   private func draw(_ pixelBuffer: CVPixelBuffer, at time: CMTime) {
     guard let device = metalDevice,
           let commandQueue,
-          let cache = textureCache,
-          let layer = self.layer as? CAMetalLayer else { return }
+          let cache = textureCache else { return }
     let width = CVPixelBufferGetWidth(pixelBuffer)
     let height = CVPixelBufferGetHeight(pixelBuffer)
     guard width > 1, height > 1 else { return }
@@ -132,16 +162,29 @@ final class BrowserCaptureRenderer: NSView {
       0,
       &cvTexture
     )
-    guard result == kCVReturnSuccess, let cvTexture, let color = CVMetalTextureGetTexture(cvTexture) else { return }
+    guard result == kCVReturnSuccess, let cvTexture, let color = CVMetalTextureGetTexture(cvTexture) else {
+      browserCaptureLog.error("texture conversion failed \(result)")
+      CVMetalTextureCacheFlush(cache, 0)
+      return
+    }
+    if !loggedTexture {
+      loggedTexture = true
+      browserCaptureLog.info("texture conversion \(width)x\(height)")
+    }
     let framed = croppedFrame(from: color, device: device) ?? color
     let sample = scaleToDepth(framed, device: device, queue: commandQueue)
     if let sample {
       noteLuma(Self.meanLuma(sample))
     }
-    let pixelWidth = max(Int(layer.drawableSize.width), 2)
-    let pixelHeight = max(Int(layer.drawableSize.height), 2)
-    guard let drawable = layer.nextDrawable(),
-          let target = outputTarget(device: device, width: pixelWidth, height: pixelHeight) else {
+    stageLock.lock()
+    let viewWidth = pixelWidth
+    let viewHeight = pixelHeight
+    stageLock.unlock()
+    guard let stage = acquireStage(device: device, width: viewWidth, height: viewHeight) else {
+      if !loggedSendFailure {
+        loggedSendFailure = true
+        browserCaptureLog.error("glasses send skipped; previous frame is still on the GPU")
+      }
       CVMetalTextureCacheFlush(cache, 0)
       return
     }
@@ -149,7 +192,7 @@ final class BrowserCaptureRenderer: NSView {
     let aspect = Float(framed.width) / Float(max(framed.height, 1))
     let wrote = Immersive3DController.shared.submitFrame(
       color: framed,
-      output: target,
+      output: stage.texture,
       contentAspect: aspect,
       colorIsBottomUp: false,
       depthRGBA: sample,
@@ -162,27 +205,27 @@ final class BrowserCaptureRenderer: NSView {
         self?.redrawHeld()
       }
     }
+    // The CVMetalTexture owns the IOSurface-backed texture. submitFrame has
+    // waited for the GPU, so releasing cvTexture here is the single release.
     CVMetalTextureCacheFlush(cache, 0)
-    guard wrote,
-          drawable.texture.width == pixelWidth,
-          drawable.texture.height == pixelHeight,
-          let present = commandQueue.makeCommandBuffer(),
-          let blit = present.makeBlitCommandEncoder() else { return }
-    blit.copy(
-      from: target,
-      sourceSlice: 0,
-      sourceLevel: 0,
-      sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
-      sourceSize: MTLSize(width: pixelWidth, height: pixelHeight, depth: 1),
-      to: drawable.texture,
-      destinationSlice: 0,
-      destinationLevel: 0,
-      destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0)
-    )
-    blit.endEncoding()
-    present.present(drawable)
-    present.commit()
-    BrowserCaptureManager.shared.notePresentedVideo(time)
+    guard wrote else {
+      if !loggedSendFailure {
+        loggedSendFailure = true
+        browserCaptureLog.error("glasses send failed")
+      }
+      releaseStage(stage.index)
+      return
+    }
+    if !loggedSend {
+      loggedSend = true
+      browserCaptureLog.info("glasses send \(viewWidth)x\(viewHeight)")
+    }
+    let presented = stage.texture
+    let slot = stage.index
+    let stamp = time
+    DispatchQueue.main.async { [weak self] in
+      self?.present(presented, slot: slot, time: stamp)
+    }
   }
 
   private func analyzeIfNeeded(_ pixelBuffer: CVPixelBuffer) {
@@ -236,16 +279,66 @@ final class BrowserCaptureRenderer: NSView {
     return destination
   }
 
-  private func outputTarget(device: MTLDevice, width: Int, height: Int) -> MTLTexture? {
-    if let outputTexture, outputWidth == width, outputHeight == height { return outputTexture }
-    let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm, width: width, height: height, mipmapped: false)
-    desc.usage = [.shaderWrite, .shaderRead]
-    desc.storageMode = .private
-    guard let texture = device.makeTexture(descriptor: desc) else { return nil }
-    outputTexture = texture
-    outputWidth = width
-    outputHeight = height
-    return texture
+  private func acquireStage(device: MTLDevice, width: Int, height: Int) -> (index: Int, texture: MTLTexture)? {
+    stageLock.lock()
+    defer { stageLock.unlock() }
+    guard width > 1, height > 1 else { return nil }
+    for index in 0..<stageTextures.count {
+      if stageBusy[index] { continue }
+      if let existing = stageTextures[index], existing.width == width, existing.height == height {
+        stageBusy[index] = true
+        return (index, existing)
+      }
+      let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm, width: width, height: height, mipmapped: false)
+      desc.usage = [.shaderWrite, .shaderRead]
+      desc.storageMode = .private
+      guard let texture = device.makeTexture(descriptor: desc) else { continue }
+      stageTextures[index] = texture
+      stageBusy[index] = true
+      return (index, texture)
+    }
+    return nil
+  }
+
+  private func releaseStage(_ index: Int) {
+    stageLock.lock()
+    if stageTextures.indices.contains(index) {
+      stageBusy[index] = false
+    }
+    stageLock.unlock()
+  }
+
+  /// Drawable acquisition stays on the main thread and does not wait for the GPU. `allowsNextDrawableTimeout` makes `nextDrawable` return instead of blocking the run loop.
+  private func present(_ texture: MTLTexture, slot: Int, time: CMTime) {
+    guard let commandQueue,
+          let layer = self.layer as? CAMetalLayer,
+          let drawable = layer.nextDrawable(),
+          drawable.texture.width == texture.width,
+          drawable.texture.height == texture.height,
+          let buffer = commandQueue.makeCommandBuffer(),
+          let blit = buffer.makeBlitCommandEncoder() else {
+      browserCaptureLog.error("glasses present skipped \(texture.width)x\(texture.height)")
+      releaseStage(slot)
+      return
+    }
+    blit.copy(
+      from: texture,
+      sourceSlice: 0,
+      sourceLevel: 0,
+      sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+      sourceSize: MTLSize(width: texture.width, height: texture.height, depth: 1),
+      to: drawable.texture,
+      destinationSlice: 0,
+      destinationLevel: 0,
+      destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0)
+    )
+    blit.endEncoding()
+    buffer.addCompletedHandler { [weak self] _ in
+      self?.releaseStage(slot)
+    }
+    buffer.present(drawable)
+    buffer.commit()
+    BrowserCaptureManager.shared.notePresentedVideo(time)
   }
 
   private func scaleToDepth(_ color: MTLTexture, device: MTLDevice, queue: MTLCommandQueue) -> [UInt8]? {
