@@ -100,7 +100,7 @@ class SettingsPageNetwork: SettingsPage {
       SettingsList(title: .init("iptv.section")) {
         SettingsItem.LongInput()
           .bindTo(.iptvTMDBAPIKey)
-          .image(name: "film")
+          .image(name: ["film"])
           .hasDescription()
       }
     }

@@ -557,7 +557,7 @@ final class DepthEstimator {
     guard width > 0, height > 0, width * height < 4_000_000 else { return nil }
     let format = CVPixelBufferGetPixelFormatType(buffer)
     CVPixelBufferLockBaseAddress(buffer, .readOnly)
-    defer { CVPixelBufferUnlockBaseAddress(buffer) }
+    defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
     guard let base = CVPixelBufferGetBaseAddress(buffer) else { return nil }
     let rowBytes = CVPixelBufferGetBytesPerRow(buffer)
     if format == kCVPixelFormatType_OneComponent16Half || format == kCVPixelFormatType_DisparityFloat16 || format == kCVPixelFormatType_DepthFloat16 {

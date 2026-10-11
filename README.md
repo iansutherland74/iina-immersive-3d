@@ -8,9 +8,27 @@ The rest of this file, below the Immersive 3D section, is IINA's own readme.
 
 ## What was and was not verified
 
-This tree was written on a Linux cloud VM. **Xcode is not available there, so the fork was not compiled, linked, or run.** No Core ML conversion was executed, and no M2 timing was measured. The Swift and Metal below are integrated into the v1.5.0 project file, but the first real build is on your Mac. Treat a compiler error as a bug in this fork, not as something already green.
+This tree was written on a Linux cloud VM, so it was not launched there. No Core ML conversion was executed, and no M2 timing was measured. The Swift and Metal below are integrated into the v1.5.0 project file. Xcode 15.2 cannot compile that project: the asset catalogs use template format 7.0, which needs Xcode 16 or newer. The **macOS Release** workflow is the compile, on a hosted Apple Silicon runner. Treat a compiler error as a bug in this fork.
 
 The IPTV window, the guide grid, Keychain access, and HTTP catalog calls were not run. A Python transcription of the M3U line rules, the XMLTV timestamp offset, the listing window, now/next selection, the Xtream stream-URL assembly, and the catch-up URL rules (Xtream `/timeshift/…`, M3U `default` / `append` / `shift` / Flussonic / `xc`, placeholder order, and the archive-day window) was executed against sample strings. A second transcription checked `get_vod_info` / `get_series_info` field priority, trailer and year parsing, TMDB gap-fill (empty fields only), and the resume thresholds. Those scripts are not part of the app, and they are not a substitute for compiling the Swift.
+
+## Download a prebuilt app
+
+macOS 13.7 with Xcode 15.2 cannot compile this tree. [Actions → macOS Release](https://github.com/iansutherland74/iina-immersive-3d/actions/workflows/macos-release.yml) builds a Release `IINA.app` for Apple Silicon on GitHub's `macos-26` runner. The job selects the latest stable Xcode 16 or newer with `sudo xcode-select`. It runs on every push to `main`, and it can be started by hand (`workflow_dispatch`).
+
+1. Open the newest successful **macOS Release** run on `main`.
+2. Download the **`IINA-macos-arm64.zip`** artifact. The workflow zips `IINA.app` with `ditto` and uploads that zip as the artifact, so one unzip produces the app.
+3. Unzip it.
+
+The app is ad-hoc signed (`CODE_SIGN_IDENTITY=-`), not notarized. A normal double-click of a downloaded copy is blocked by quarantine. Right-click `IINA.app`, choose **Open**, then **Open** again. Or clear the quarantine flag:
+
+```console
+xattr -dr com.apple.quarantine /path/to/IINA.app
+```
+
+### macOS 13.7
+
+`Configs/Deployment.xcconfig` sets `MACOSX_DEPLOYMENT_TARGET` to 12, and `Info.plist` publishes that as `LSMinimumSystemVersion`. macOS 13.7.8 is above 12, so the system allows the app to start. The arm64 `libmpv` that `other/download_libs.sh` fetches from iina.io declares a minimum of macOS 11.0, so dyld will load it on 13.7. Float16 depth packages still need macOS 13 or later, which 13.7 satisfies. Compiling with the Xcode 26 SDK does not raise the deployment target. Each run prints `vtool -show-build` for `IINA` and the bundled libraries. The app has not been launched on 13.7; this is the deployment-target check, not a runtime test.
 
 ## Build and run on an M2 Mac
 
@@ -139,7 +157,7 @@ Saved sources and favourites live in `~/Library/Application Support/com.collider
 
 ## Known gaps
 
-- Not compiled or run. Metal, Core ML, and the OpenGL `IOSurface` share are unchecked on macOS.
+- The Release app is compiled by the macOS Release workflow. It has not been launched. Metal, Core ML, and the OpenGL `IOSurface` share are unchecked on a Mac.
 - The glasses image is half side-by-side inside the existing frame, not a double-width buffer. That matches a 1920×1080 panel in 3D mode.
 - The copy into the stereo pass is 8-bit BGRA, so HDR is flattened for the 3D view.
 - Subtitles drawn by mpv are part of the picture that gets shifted.

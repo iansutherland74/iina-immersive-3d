@@ -37,6 +37,7 @@ final class IPTVWindowController: NSWindowController, NSWindowDelegate, NSTableV
   private var detailSeriesID: String?
   private var detailSeriesTitle: String?
   private var scrollGuideToNow = false
+  private var spinnerBusy = false
 
   private var groupRows: [GroupRow] = [.all, .favourites]
   private var rows: [IPTVItem] = []
@@ -177,7 +178,7 @@ final class IPTVWindowController: NSWindowController, NSWindowDelegate, NSTableV
       self?.handleGuide(item, action: action)
     }
     guideBrowser.onToggleFavourite = { [weak self] item in
-      self?.toggleFavourite(item)
+      self?.toggleFavourite(item: item)
     }
     guideBrowser.isFavourite = { [weak self] item in
       guard let self, let source = self.currentSource else { return false }
@@ -549,7 +550,7 @@ final class IPTVWindowController: NSWindowController, NSWindowDelegate, NSTableV
     } else if library.sources.isEmpty {
       emptyField.stringValue = "Add an M3U playlist or an Xtream Codes login."
       emptyField.isHidden = false
-    } else if rows.isEmpty && !spinner.isAnimating {
+    } else if rows.isEmpty && !spinnerBusy {
       emptyField.stringValue = query.isEmpty ? "Nothing matches." : "Nothing matches that search."
       if query.isEmpty {
         emptyField.stringValue = showsPosters ? "No titles in this category." : "No channels in this category."
@@ -558,7 +559,7 @@ final class IPTVWindowController: NSWindowController, NSWindowDelegate, NSTableV
     } else {
       emptyField.isHidden = true
     }
-    if !spinner.isAnimating {
+    if !spinnerBusy {
       statusField.stringValue = statusCount()
     }
   }
@@ -605,6 +606,7 @@ final class IPTVWindowController: NSWindowController, NSWindowDelegate, NSTableV
 
   private func setStatus(_ text: String, busy: Bool = false) {
     statusField.stringValue = text
+    spinnerBusy = busy
     if busy {
       spinner.startAnimation(nil)
     } else {
@@ -680,10 +682,10 @@ final class IPTVWindowController: NSWindowController, NSWindowDelegate, NSTableV
   @objc private func toggleFavourite(_ sender: NSButton) {
     let row = sender.tag
     guard rows.indices.contains(row) else { return }
-    toggleFavourite(rows[row])
+    toggleFavourite(item: rows[row])
   }
 
-  private func toggleFavourite(_ item: IPTVItem) {
+  private func toggleFavourite(item: IPTVItem) {
     guard let source = currentSource else { return }
     library.toggleFavourite(item, source: source)
     applyFilter()
