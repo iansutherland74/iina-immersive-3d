@@ -115,6 +115,7 @@ browser/Firefox_Open_In_IINA/*
 
 deps/executable/youtube-dl
 deps/plugins
+deps/src/
 
 # Depth Anything weights. Fetch or convert on the Mac; do not commit them.
 *.mlpackage

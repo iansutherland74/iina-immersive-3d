@@ -32,6 +32,8 @@ class KeychainAccess {
     static let httpAuth = ServiceName(rawValue: "IINA Saved HTTP Password")
     /// One generic password per IPTV source. The account is the source UUID.
     static let iptvAccount = ServiceName(rawValue: "IINA IPTV Account")
+    /// Translation API key for live captions. The account is "api-key". Audio is not stored.
+    static let liveCaptionTranslate = ServiceName(rawValue: "IINA Live Caption Translation")
   }
 
   static func write(username: String, password: String, forService serviceName: ServiceName, server: String? = nil, port: Int? = nil) throws {

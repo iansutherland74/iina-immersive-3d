@@ -85,6 +85,19 @@ struct Preference {
     /** When Play on Glasses starts, leave a mirrored NXTWEAR S as an extended display for this login session (bool, default true). */
     static let immersive3DAutoGlassesDisplay = Key("immersive3DAutoGlassesDisplay")
 
+    /** On-device live captions (bool, default off). */
+    static let liveCaptionEnabled = Key("liveCaptionEnabled")
+    /** Whisper source language. "auto" detects it. */
+    static let liveCaptionSourceLanguage = Key("liveCaptionSourceLanguage")
+    /** "original", "en", or another language code. */
+    static let liveCaptionTargetLanguage = Key("liveCaptionTargetLanguage")
+    /** 0 base, 1 small. */
+    static let liveCaptionModel = Key("liveCaptionModel")
+    /** 0 low latency, 1 balanced, 2 accuracy. */
+    static let liveCaptionLatency = Key("liveCaptionLatency")
+    /** HTTPS translation endpoint used when an API key is saved. */
+    static let liveCaptionTranslateEndpoint = Key("liveCaptionTranslateEndpoint")
+
     /** Quit when no open window (bool) */
     static let quitWhenNoOpenedWindow = Key("quitWhenNoOpenedWindow")
 
@@ -779,6 +792,44 @@ struct Preference {
     }
   }
 
+  enum LiveCaptionModel: Int, InitializingFromKey, CaseIterable {
+    case base = 0
+    case small = 1
+
+    static var defaultValue = LiveCaptionModel.base
+
+    init?(key: Key) {
+      self.init(rawValue: Preference.integer(for: key))
+    }
+
+    var description: String {
+      switch self {
+      case .base: "base"
+      case .small: "small"
+      }
+    }
+  }
+
+  enum LiveCaptionLatency: Int, InitializingFromKey, CaseIterable {
+    case low = 0
+    case balanced = 1
+    case accuracy = 2
+
+    static var defaultValue = LiveCaptionLatency.balanced
+
+    init?(key: Key) {
+      self.init(rawValue: Preference.integer(for: key))
+    }
+
+    var description: String {
+      switch self {
+      case .low: "low"
+      case .balanced: "balanced"
+      case .accuracy: "accuracy"
+      }
+    }
+  }
+
   enum HardwareDecoderOption: Int, InitializingFromKey, CaseIterable {
     case disabled = 0
     case auto
@@ -1147,6 +1198,12 @@ struct Preference {
     .immersive3DVerticalFlip: false,
     .immersive3DDepthModel: DepthModelOption.defaultValue.rawValue,
     .immersive3DAutoGlassesDisplay: true,
+    .liveCaptionEnabled: false,
+    .liveCaptionSourceLanguage: "auto",
+    .liveCaptionTargetLanguage: "original",
+    .liveCaptionModel: LiveCaptionModel.base.rawValue,
+    .liveCaptionLatency: LiveCaptionLatency.balanced.rawValue,
+    .liveCaptionTranslateEndpoint: "https://api-free.deepl.com/v2/translate",
     .pauseWhenMinimized: false,
     .pauseWhenInactive: false,
     .pauseWhenLeavingFullScreen: false,
