@@ -875,18 +875,22 @@ final class LiveCaptionController {
       return remote
     }
     if target != "en" {
-      setStatus("Showing the recognized language. macOS 13 has no system translator for this pair, and no translation API key is saved. Whisper itself only translates into English.")
+      setStatus("Showing the recognized language. This macOS version has no system translator for this pair, and no translation API key is saved. Whisper itself only translates into English.")
     }
     return text
   }
 
   private func systemTranslate(_ text: String, source: String, target: String) -> String? {
     #if canImport(Translation)
-    guard #available(macOS 15.0, *) else { return nil }
+    guard #available(macOS 26.0, *) else { return nil }
     let semaphore = DispatchSemaphore(value: 0)
     var output: String?
     DispatchQueue.main.async {
       Task {
+        guard #available(macOS 26.0, *) else {
+          semaphore.signal()
+          return
+        }
         output = await LiveCaptionTranslator.system(text, source: source, target: target)
         semaphore.signal()
       }
@@ -974,7 +978,7 @@ final class LiveCaptionController {
 }
 
 #if canImport(Translation)
-@available(macOS 15.0, *)
+@available(macOS 26.0, *)
 enum LiveCaptionTranslator {
   static func system(_ text: String, source: String, target: String) async -> String? {
     guard source != "auto", source != "original", !target.isEmpty else { return nil }
@@ -1809,7 +1813,7 @@ final class LiveCaptionSettingsView: NSView {
     syncLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
     refreshStatus()
 
-    let note = NSTextField(wrappingLabelWithString: "The player decodes the same URL a second time. libmpv does not provide its PCM, and a lavfi graph cannot export it without replacing playback. With captions on, a file, a movie, or catch-up is read ahead of the playhead, so the line is ready before it is spoken and playback is not delayed. A live channel, or another stream that cannot be seeked, is detected on its own and the picture and sound wait in mpv's cache (about 4–6 seconds unless transcription takes longer). Changing channel detects again. Turning captions off jumps that channel back to live. Delay live TV, above, turns the hold off and leaves the channel at the live edge. The banner shows Subtitles synced, live +Ns while the hold is on. Depth is computed from the frame already on screen, so it waits with that picture. Each line uses the audio time, not the time the text arrived. Base is lighter; Small uses more CPU and GPU on an M2. Whisper translates into English only. Other languages use the macOS 15 system translator when that language is installed, or the API key (caption text only). On macOS 13 without a key, the line stays in the recognized language. Place ggml-base-encoder.mlmodelc or ggml-small-encoder.mlmodelc next to the ggml file to use the Core ML encoder; otherwise Metal or the CPU runs the model. This was not timed on a Mac.")
+    let note = NSTextField(wrappingLabelWithString: "The player decodes the same URL a second time. libmpv does not provide its PCM, and a lavfi graph cannot export it without replacing playback. With captions on, a file, a movie, or catch-up is read ahead of the playhead, so the line is ready before it is spoken and playback is not delayed. A live channel, or another stream that cannot be seeked, is detected on its own and the picture and sound wait in mpv's cache (about 4–6 seconds unless transcription takes longer). Changing channel detects again. Turning captions off jumps that channel back to live. Delay live TV, above, turns the hold off and leaves the channel at the live edge. The banner shows Subtitles synced, live +Ns while the hold is on. Depth is computed from the frame already on screen, so it waits with that picture. Each line uses the audio time, not the time the text arrived. Base is lighter; Small uses more CPU and GPU on an M2. Whisper translates into English only. Other languages use the macOS 26 system translator when that language is installed, or the API key (caption text only). On earlier macOS, without a key, the line stays in the recognized language. Place ggml-base-encoder.mlmodelc or ggml-small-encoder.mlmodelc next to the ggml file to use the Core ML encoder; otherwise Metal or the CPU runs the model. This was not timed on a Mac.")
     note.preferredMaxLayoutWidth = 400
     note.textColor = .secondaryLabelColor
     note.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
