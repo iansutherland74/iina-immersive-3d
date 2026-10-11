@@ -451,6 +451,7 @@ final class IPTVWindowController: NSWindowController, NSWindowDelegate, NSTableV
   }
 
   private func loadGuide(_ raw: String?, generation: Int) {
+    let sourceID = currentSource?.id
     guard let raw, !raw.isEmpty, let url = URL(string: raw) else { return }
     setStatus("Loading programme guide…", busy: true)
     library.loadEPG(url: url) { [weak self] result in
@@ -461,6 +462,9 @@ final class IPTVWindowController: NSWindowController, NSWindowDelegate, NSTableV
           self.setStatus("Channels are ready. Programme guide failed: \(error.localizedDescription)")
         case .success(let epg):
           self.guide = epg
+          if let sourceID {
+            IPTVLiveOverlayController.shared.replaceGuide(epg, sourceID: sourceID)
+          }
           self.scrollGuideToNow = true
           self.applyFilter()
           let listings = epg.programmeCount
@@ -644,6 +648,12 @@ final class IPTVWindowController: NSWindowController, NSWindowDelegate, NSTableV
       setStatus("No stream URL. If this is an Xtream login, edit it and enter the password again.")
       return
     }
+    if item.kind == .live {
+      let channels = catalog?.items.filter { $0.kind == .live } ?? []
+      IPTVLiveOverlayController.shared.begin(source: source, item: item, channels: channels, guide: guide, catchup: nil)
+    } else {
+      IPTVLiveOverlayController.shared.end()
+    }
     let status: String
     if let programmeTitle, !programmeTitle.isEmpty {
       status = "Playing \(item.name) — \(programmeTitle)"
@@ -668,6 +678,8 @@ final class IPTVWindowController: NSWindowController, NSWindowDelegate, NSTableV
     }
     let label = "\(item.name) — \(programme.title)"
     let status = restart ? "Restarting \(label)" : "Playing \(label) from the start"
+    let channels = catalog?.items.filter { $0.kind == .live } ?? []
+    IPTVLiveOverlayController.shared.begin(source: source, item: item, channels: channels, guide: guide, catchup: programme)
     openStream(url, item: item, source: source, historyTitle: label, status: status)
   }
 
@@ -676,6 +688,7 @@ final class IPTVWindowController: NSWindowController, NSWindowDelegate, NSTableV
     let player = PlayerCore.activeOrNew
     player.openURL(url)
     player.mainWindow.window?.makeKeyAndOrderFront(nil)
+    IPTVLiveOverlayController.shared.attachIfNeeded()
     setStatus(status)
   }
 
@@ -791,6 +804,7 @@ final class IPTVWindowController: NSWindowController, NSWindowDelegate, NSTableV
       openDetail(item)
       return
     }
+    IPTVLiveOverlayController.shared.end()
     let record = library.watchProgress(for: item.id, source: source)
     let seconds = resume ? record.flatMap { IPTVWatch.resumeSeconds($0) } : nil
     guard let url = library.playbackURL(for: item, source: source) else {

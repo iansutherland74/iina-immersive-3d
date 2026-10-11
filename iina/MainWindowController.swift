@@ -859,6 +859,7 @@ class MainWindowController: PlayerWindowController {
       .bottom: videoViewContainer.bottomAnchor.constraint(equalTo: videoView.bottomAnchor)
     ]
     layoutSides.forEach { videoViewConstraints[$0]?.isActive = true }
+    IPTVLiveOverlayController.shared.attachIfNeeded()
   }
 
   func updateVideoViewConstraints(_ constraints: [NSLayoutConstraint.Attribute: CGFloat]) {
@@ -1077,6 +1078,7 @@ class MainWindowController: PlayerWindowController {
   // MARK: - Mouse / Trackpad events
 
   override func keyDown(with event: NSEvent) {
+    if IPTVLiveOverlayController.shared.handleKeyDown(event) { return }
     if isShowingPersistentOSD {
       let keyCode = KeyCodeHelper.mpvKeyCode(from: event)
       let normalizedKeyCode = KeyCodeHelper.normalizeMpv(keyCode)
@@ -1244,6 +1246,11 @@ class MainWindowController: PlayerWindowController {
   }
 
   override func scrollWheel(with event: NSEvent) {
+    if let container = videoViewContainer,
+       container.bounds.contains(container.convert(event.locationInWindow, from: nil)),
+       IPTVLiveOverlayController.shared.handleScroll(event) {
+      return
+    }
     guard !interactiveMode.isActive else { return }
     if !isMomentumScrollingAllowed && !event.momentumPhase.isEmpty {
       // ignore delta caused by abrupt momentum phases

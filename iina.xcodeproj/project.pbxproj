@@ -168,6 +168,7 @@
 		B1E7000A2F00000100BEEF0A /* IPTVGuideView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1E7000B2F00000100BEEF0B /* IPTVGuideView.swift */; };
 		B1E7000C2F00000100BEEF0C /* IPTVTitles.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1E7000D2F00000100BEEF0D /* IPTVTitles.swift */; };
 		B1E7000E2F00000100BEEF0E /* IPTVPosterView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1E7000F2F00000100BEEF0F /* IPTVPosterView.swift */; };
+		B1E700112F00000100BEEF11 /* IPTVLiveOverlay.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1E700102F00000100BEEF10 /* IPTVLiveOverlay.swift */; };
 		840820111ECF6C1800361416 /* FileGroup.swift in Sources */ = {isa = PBXBuildFile; fileRef = 840820101ECF6C1800361416 /* FileGroup.swift */; };
 		840AF5821E732C8F00F4AF92 /* JustXMLRPC.swift in Sources */ = {isa = PBXBuildFile; fileRef = 840AF5811E732C8F00F4AF92 /* JustXMLRPC.swift */; };
 		840AF5841E73CE3900F4AF92 /* OpenSubSubtitle.swift in Sources */ = {isa = PBXBuildFile; fileRef = 840AF5831E73CE3900F4AF92 /* OpenSubSubtitle.swift */; };
@@ -1215,6 +1216,7 @@
 		B1E7000B2F00000100BEEF0B /* IPTVGuideView.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = IPTVGuideView.swift; sourceTree = "<group>"; };
 		B1E7000D2F00000100BEEF0D /* IPTVTitles.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = IPTVTitles.swift; sourceTree = "<group>"; };
 		B1E7000F2F00000100BEEF0F /* IPTVPosterView.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = IPTVPosterView.swift; sourceTree = "<group>"; };
+		B1E700102F00000100BEEF10 /* IPTVLiveOverlay.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = IPTVLiveOverlay.swift; sourceTree = "<group>"; };
 		840820101ECF6C1800361416 /* FileGroup.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = FileGroup.swift; sourceTree = "<group>"; };
 		840AF5811E732C8F00F4AF92 /* JustXMLRPC.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = JustXMLRPC.swift; sourceTree = "<group>"; };
 		840AF5831E73CE3900F4AF92 /* OpenSubSubtitle.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = OpenSubSubtitle.swift; sourceTree = "<group>"; };
@@ -2389,6 +2391,7 @@
 				B1E7000B2F00000100BEEF0B /* IPTVGuideView.swift */,
 				B1E7000D2F00000100BEEF0D /* IPTVTitles.swift */,
 				B1E7000F2F00000100BEEF0F /* IPTVPosterView.swift */,
+				B1E700102F00000100BEEF10 /* IPTVLiveOverlay.swift */,
 			);
 			path = IPTV;
 			sourceTree = "<group>";
@@ -3131,6 +3134,7 @@
 				B1E7000A2F00000100BEEF0A /* IPTVGuideView.swift in Sources */,
 				B1E7000C2F00000100BEEF0C /* IPTVTitles.swift in Sources */,
 				B1E7000E2F00000100BEEF0E /* IPTVPosterView.swift in Sources */,
+				B1E700112F00000100BEEF11 /* IPTVLiveOverlay.swift in Sources */,
 				E3B93C872FE9F77600803513 /* InteractiveMode.swift in Sources */,
 				E3D94E822FD0649A00B08618 /* UIHelper.swift in Sources */,
 				E3A239B12FCB4D0900CE6ACC /* SidebarPane.swift in Sources */,

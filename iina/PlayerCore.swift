@@ -2108,6 +2108,11 @@ class PlayerCore: NSObject {
       URL(string: path.addingPercentEncoding(withAllowedCharacters: .urlAllowed) ?? path) :
       URL(fileURLWithPath: path)
     Immersive3DController.shared.noteMediaURL(info.currentURL)
+    let startedPath = path
+    DispatchQueue.main.async {
+      IPTVLiveOverlayController.shared.noteFileStarted(path: startedPath)
+      IPTVLiveOverlayController.shared.attachIfNeeded()
+    }
     if let url = info.currentURL {
       info.mpvMd5 = Utility.mpvWatchLaterMd5(url, ignorePathInWatchLaterConfig)
     }
