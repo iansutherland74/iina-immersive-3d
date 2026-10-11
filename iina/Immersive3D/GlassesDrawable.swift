@@ -31,4 +31,29 @@ enum GlassesDrawable {
     return pixels(pointsWidth: previewPointWidth, pointsHeight: previewPointHeight, scale: safe)
       ?? (width: Int(previewPointWidth), height: Int(previewPointHeight))
   }
+
+  /// While the capture window is on the glasses, a Space change reports the Mac's
+  /// screen (1512×982 at 2x is 3024×1964) or a half-moved frame (3840×1027).
+  /// Those sizes are not the drawable. The glasses pixel size wins.
+  static func lockedPixels(lockedWidth: Int, lockedHeight: Int, interimWidth: Int, interimHeight: Int) -> (width: Int, height: Int) {
+    if lockedWidth >= minimumPixels, lockedHeight >= minimumPixels {
+      return (lockedWidth, lockedHeight)
+    }
+    return (interimWidth, interimHeight)
+  }
+
+  enum PresentFit: Equatable {
+    case blit
+    case scale
+    case drop
+  }
+
+  /// A texture from the previous size is scaled onto the drawable. Skipping it
+  /// left the glasses on the last frame that happened to match.
+  static func presentFit(textureWidth: Int, textureHeight: Int, drawableWidth: Int, drawableHeight: Int) -> PresentFit {
+    guard textureWidth >= minimumPixels, textureHeight >= minimumPixels,
+          drawableWidth >= minimumPixels, drawableHeight >= minimumPixels else { return .drop }
+    if textureWidth == drawableWidth && textureHeight == drawableHeight { return .blit }
+    return .scale
+  }
 }

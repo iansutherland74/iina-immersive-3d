@@ -26,7 +26,6 @@ final class BrowserCaptureWindowController: NSWindowController, NSTableViewDataS
   private var statusLabel: NSTextField?
   private var outputMessage: NSTextField?
   private var audioCheckbox: NSButton?
-  private var muteCheckbox: NSButton?
   private var hintLabel: NSTextField?
   private var cropSegments: NSSegmentedControl?
   private var topSlider: NSSlider?
@@ -43,17 +42,11 @@ final class BrowserCaptureWindowController: NSWindowController, NSTableViewDataS
   private var toggleItem: NSMenuItem?
   private var glassesItem: NSMenuItem?
   private var audioItem: NSMenuItem?
-  private var muteItem: NSMenuItem?
   private var chromeItem: NSMenuItem?
   private var videoItem: NSMenuItem?
 
   private var audioAvailable: Bool {
     if #available(macOS 13.0, *) { return true }
-    return false
-  }
-
-  private var muteAvailable: Bool {
-    if #available(macOS 14.2, *) { return true }
     return false
   }
 
@@ -67,8 +60,8 @@ final class BrowserCaptureWindowController: NSWindowController, NSTableViewDataS
     chooser.title = "Choose Capture Window"
     super.init(window: chooser)
     buildChooser()
-    manager.onFrame = { [weak self] buffer, time in
-      self?.renderer.consume(buffer, at: time)
+    manager.onFrame = { [weak self] buffer, time, received in
+      self?.renderer.consume(buffer, at: time, received: received)
     }
     manager.onIdle = { [weak self] in
       self?.renderer.presentHeld()
@@ -85,10 +78,6 @@ final class BrowserCaptureWindowController: NSWindowController, NSTableViewDataS
       if self?.window?.isVisible != true {
         self?.showOutputMessage(text)
       }
-    }
-    manager.onMuteChanged = { [weak self] in
-      self?.reflectSettings()
-      self?.syncMenu()
     }
     manager.onStopped = {
       DispatchQueue.main.async {
@@ -120,29 +109,28 @@ final class BrowserCaptureWindowController: NSWindowController, NSTableViewDataS
     let glasses = NSMenuItem(title: "Send Capture to Glasses", action: #selector(toggleGlasses(_:)), keyEquivalent: "")
     glasses.target = self
     glassesItem = glasses
-    let audio = NSMenuItem(title: "Play Capture Audio", action: #selector(toggleAudioMenu(_:)), keyEquivalent: "")
+    let audio = NSMenuItem(title: "Play Capture Audio from Virtual Device", action: #selector(toggleAudioMenu(_:)), keyEquivalent: "")
     audio.target = self
     audioItem = audio
-    let mute = NSMenuItem(title: "Mute Source App", action: #selector(toggleMuteMenu(_:)), keyEquivalent: "")
-    mute.target = self
-    muteItem = mute
     let chrome = NSMenuItem(title: "Crop Window Chrome", action: #selector(cropChromeMenu(_:)), keyEquivalent: "")
     chrome.target = self
     chromeItem = chrome
     let video = NSMenuItem(title: "Detect Video Area", action: #selector(detectVideoMenu(_:)), keyEquivalent: "")
     video.target = self
     videoItem = video
-    return [choose, toggle, glasses, audio, mute, chrome, video]
+    return [choose, toggle, glasses, audio, chrome, video]
   }
 
   func syncMenu() {
     toggleItem?.title = manager.isRunning ? "Stop Capture" : "Start Capture"
     glassesItem?.title = onGlasses ? "Stop Sending Capture to Glasses" : "Send Capture to Glasses"
     glassesItem?.isEnabled = manager.isRunning || onGlasses
-    audioItem?.state = audioAvailable && settings.wantsAudio ? .on : .off
-    audioItem?.isEnabled = audioAvailable
-    muteItem?.state = muteAvailable && settings.wantsMute ? .on : .off
-    muteItem?.isEnabled = muteAvailable
+    let virtual = audioAvailable && VirtualAudioDevices.anyInstalled()
+    audioItem?.state = virtual && settings.wantsAudio ? .on : .off
+    audioItem?.isEnabled = virtual
+    if !virtual && settings.wantsAudio {
+      settings.setPlayAudio(false)
+    }
     let mode = settings.cropMode
     chromeItem?.state = mode == .autoChrome ? .on : .off
     videoItem?.state = mode == .videoArea ? .on : .off
@@ -217,13 +205,17 @@ final class BrowserCaptureWindowController: NSWindowController, NSTableViewDataS
       onGlasses = false
       return false
     }
+    let pixels = Immersive3DController.pixelSize(of: screen)
+    renderer.setFullSizeEyes(Immersive3DController.isFullWidthSBS(screen))
+    renderer.setPixelSize(width: pixels.width, height: pixels.height, scale: screen.backingScaleFactor, lock: true)
     guard Immersive3DController.shared.placeWindowOnGlasses(outputWindow) != nil else {
       onGlasses = false
+      renderer.unlockPixelSize()
+      fitRendererToWindow()
       setStatus("No SmartGlasses, NXTWEAR, or 3840×1080 / 1920×1080 display is connected.")
       return false
     }
     applyGlassesScreen(screen, fullSizeEyes: Immersive3DController.isFullWidthSBS(screen))
-    let pixels = Immersive3DController.pixelSize(of: screen)
     browserCaptureLog.info("glasses source capture \(pixels.width)x\(pixels.height) \(screen.localizedName, privacy: .public)")
     syncMenu()
     return true
@@ -232,31 +224,23 @@ final class BrowserCaptureWindowController: NSWindowController, NSTableViewDataS
   func returnCaptureToPreview() {
     guard let output = outputWindow else {
       onGlasses = false
+      renderer.unlockPixelSize()
       return
     }
     onGlasses = false
     renderer.setFullSizeEyes(false)
+    renderer.unlockPixelSize()
     Immersive3DController.shared.returnWindowFromGlasses(output, previewFrame: previewFrame)
     fitRendererToWindow()
     syncMenu()
   }
 
   @objc func toggleAudioMenu(_ sender: Any?) {
-    guard audioAvailable else { return }
+    guard audioAvailable, VirtualAudioDevices.anyInstalled() else { return }
     settings.setPlayAudio(!settings.wantsAudio)
     reflectSettings()
     syncMenu()
     restartIfRunning()
-  }
-
-  @objc func toggleMuteMenu(_ sender: Any?) {
-    guard muteAvailable else {
-      setStatus(BrowserCaptureManager.muteNeedsNewerOS)
-      return
-    }
-    manager.setSourceMuted(!settings.wantsMute)
-    reflectSettings()
-    syncMenu()
   }
 
   @objc func cropChromeMenu(_ sender: Any?) {
@@ -313,17 +297,9 @@ final class BrowserCaptureWindowController: NSWindowController, NSTableViewDataS
     scroll.hasVerticalScroller = true
     self.table = table
 
-    let audio = NSButton(checkboxWithTitle: "Play window audio", target: self, action: #selector(audioCheckboxChanged(_:)))
-    audio.frame = NSRect(x: 20, y: 326, width: 240, height: 22)
-    audio.state = audioAvailable && settings.wantsAudio ? .on : .off
-    audio.isEnabled = audioAvailable
+    let audio = NSButton(checkboxWithTitle: "Play capture audio from a virtual device", target: self, action: #selector(audioCheckboxChanged(_:)))
+    audio.frame = NSRect(x: 20, y: 326, width: 520, height: 22)
     audioCheckbox = audio
-
-    let mute = NSButton(checkboxWithTitle: "Mute source app", target: self, action: #selector(muteCheckboxChanged(_:)))
-    mute.frame = NSRect(x: 280, y: 326, width: 240, height: 22)
-    mute.state = muteAvailable && settings.wantsMute ? .on : .off
-    mute.isEnabled = muteAvailable
-    muteCheckbox = mute
 
     let hint = NSTextField(wrappingLabelWithString: hintText())
     hint.font = .systemFont(ofSize: 11)
@@ -354,7 +330,6 @@ final class BrowserCaptureWindowController: NSWindowController, NSTableViewDataS
     statusLabel = status
     content.addSubview(scroll)
     content.addSubview(audio)
-    content.addSubview(mute)
     content.addSubview(hint)
     content.addSubview(segments)
     content.addSubview(refresh)
@@ -377,16 +352,14 @@ final class BrowserCaptureWindowController: NSWindowController, NSTableViewDataS
   }
 
   @objc private func audioCheckboxChanged(_ sender: NSButton) {
-    guard audioAvailable else { return }
+    guard audioAvailable, VirtualAudioDevices.anyInstalled() else {
+      sender.state = .off
+      settings.setPlayAudio(false)
+      return
+    }
     settings.setPlayAudio(sender.state == .on)
     syncMenu()
     restartIfRunning()
-  }
-
-  @objc private func muteCheckboxChanged(_ sender: NSButton) {
-    guard muteAvailable else { return }
-    manager.setSourceMuted(sender.state == .on)
-    syncMenu()
   }
 
   @objc private func cropModeChanged(_ sender: NSSegmentedControl) {
@@ -480,31 +453,29 @@ final class BrowserCaptureWindowController: NSWindowController, NSTableViewDataS
     if !audioAvailable {
       return "Capturing. Window audio needs macOS 13, so sound stays in the other app."
     }
-    if !settings.wantsAudio {
-      return "Capturing. Window audio is off, so sound stays in the other app."
+    if !settings.wantsAudio || !VirtualAudioDevices.anyInstalled() {
+      return "Capturing. Sound stays in the other app."
     }
-    if settings.wantsMute {
-      return "Capturing. Window audio plays with the picture, and the source app is muted."
-    }
-    return "Capturing. Window audio plays with the picture. The other app still plays until Mute source app is on."
+    return "Capturing. Playing audio from the virtual device, in time with the picture."
   }
 
   private func hintText() -> String {
     if !audioAvailable {
-      return "Window audio capture needs macOS 13. Sound stays in the other app."
+      return "Sound stays in the other app. Window audio capture needs macOS 13."
     }
-    if !muteAvailable {
-      return BrowserCaptureManager.muteNeedsNewerOS
+    if !VirtualAudioDevices.anyInstalled() {
+      return "Sound stays in the other app. Muting it would also mute the capture, and macOS cannot silence that app's speakers while still capturing its audio."
     }
-    return "Mute source app silences that app while IINA plays the capture."
+    return "Only if that app's output is a virtual device such as BlackHole. IINA then plays it in time with the picture. Otherwise leave this off and listen to the app itself."
   }
 
   private func reflectSettings() {
     suppressControls = true
-    audioCheckbox?.state = audioAvailable && settings.wantsAudio ? .on : .off
-    audioCheckbox?.isEnabled = audioAvailable
-    muteCheckbox?.state = muteAvailable && settings.wantsMute ? .on : .off
-    muteCheckbox?.isEnabled = muteAvailable
+    let virtual = audioAvailable && VirtualAudioDevices.anyInstalled()
+    audioCheckbox?.state = virtual && settings.wantsAudio ? .on : .off
+    audioCheckbox?.isEnabled = virtual
+    audioCheckbox?.isHidden = !virtual
+    hintLabel?.stringValue = hintText()
     cropSegments?.selectedSegment = settings.cropMode.rawValue
     let insets = settings.appliedInsets()
     topSlider?.doubleValue = insets.top
@@ -512,7 +483,6 @@ final class BrowserCaptureWindowController: NSWindowController, NSTableViewDataS
     leftSlider?.doubleValue = insets.left
     rightSlider?.doubleValue = insets.right
     updateCropLabels(insets)
-    hintLabel?.stringValue = hintText()
     suppressControls = false
   }
 
@@ -598,8 +568,21 @@ final class BrowserCaptureWindowController: NSWindowController, NSTableViewDataS
     guard onGlasses, let outputWindow else { return }
     renderer.setFullSizeEyes(fullSizeEyes)
     let pixels = Immersive3DController.pixelSize(of: screen)
-    renderer.setPixelSize(width: pixels.width, height: pixels.height, scale: screen.backingScaleFactor, lock: true)
-    Immersive3DController.shared.repinExternalWindow(outputWindow, on: screen)
+    guard pixels.width >= 32, pixels.height >= 32 else { return }
+    let locked = GlassesDrawable.lockedPixels(
+      lockedWidth: pixels.width,
+      lockedHeight: pixels.height,
+      interimWidth: pixels.width,
+      interimHeight: pixels.height
+    )
+    renderer.setPixelSize(width: locked.width, height: locked.height, scale: screen.backingScaleFactor, lock: true)
+    let frame = screen.frame
+    let placed = outputWindow.screen?.displayId == screen.displayId
+      && abs(outputWindow.frame.width - frame.width) < 1
+      && abs(outputWindow.frame.height - frame.height) < 1
+    if !placed {
+      Immersive3DController.shared.repinExternalWindow(outputWindow, on: screen)
+    }
   }
 
   private func fitRendererToWindow() {
@@ -621,8 +604,8 @@ final class BrowserCaptureWindowController: NSWindowController, NSTableViewDataS
     if refreshingPixels { return }
     refreshingPixels = true
     defer { refreshingPixels = false }
-    if onGlasses, let screen = outputWindow?.screen {
-      applyGlassesScreen(screen, fullSizeEyes: Immersive3DController.isFullWidthSBS(screen))
+    if onGlasses {
+      renderer.reapplyLockedSize()
     } else {
       fitRendererToWindow()
     }

@@ -78,4 +78,31 @@ enum StereoOffscreen {
     commandBuffer.waitUntilCompleted()
     return commandBuffer.error == nil
   }
+
+  /// Scales a BGRA picture onto a drawable of a different size. Same kernel the
+  /// preview uses when the glasses drawable is not the texture size.
+  static func scale(
+    commandQueue: MTLCommandQueue,
+    pipeline: MTLComputePipelineState,
+    source: MTLTexture,
+    destination: MTLTexture
+  ) -> Bool {
+    guard let commandBuffer = commandQueue.makeCommandBuffer(),
+          let encoder = commandBuffer.makeComputeCommandEncoder() else { return false }
+    var oriented: Float = 0
+    encoder.setComputePipelineState(pipeline)
+    encoder.setTexture(source, index: 0)
+    encoder.setTexture(destination, index: 1)
+    encoder.setBytes(&oriented, length: MemoryLayout<Float>.stride, index: 0)
+    let width = destination.width
+    let height = destination.height
+    encoder.dispatchThreads(
+      MTLSize(width: width, height: height, depth: 1),
+      threadsPerThreadgroup: MTLSize(width: min(16, width), height: min(16, height), depth: 1)
+    )
+    encoder.endEncoding()
+    commandBuffer.commit()
+    commandBuffer.waitUntilCompleted()
+    return commandBuffer.error == nil
+  }
 }

@@ -90,11 +90,18 @@ final class BrowserCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
   private var trackedOwner = ""
   private var trackedTitle = ""
   private var trackedDisplay: CGDirectDisplayID = 0
+  private var followClock = CaptureFollowClock.empty
+  private let frameLock = NSLock()
+  private let drawQueue = DispatchQueue(label: "com.colliderli.iina.browser-capture-draw", qos: .userInteractive)
+  private var latestOwned: CVPixelBuffer?
+  private var latestTime = CMTime.invalid
+  private var latestReceived: CFTimeInterval = 0
+  private var drawBusy = false
   private(set) var sourcePID: pid_t?
   private(set) var audioActive = false
 
-  /// Called on the capture queue with a pixel buffer this process owns.
-  var onFrame: ((CVPixelBuffer, CMTime) -> Void)?
+  /// Called on the draw queue with a pixel buffer this process owns, and the time the copy was made.
+  var onFrame: ((CVPixelBuffer, CMTime, CFTimeInterval) -> Void)?
   /// Called on the capture queue when the source did not send a new picture.
   var onIdle: (() -> Void)?
   var onStatus: ((String?) -> Void)?
@@ -158,11 +165,6 @@ final class BrowserCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
 
   var isRunning: Bool { running }
 
-  func setSourceMuted(_ on: Bool) {
-    BrowserCaptureSettings.shared.setMuteSource(on)
-    applyMute()
-  }
-
   func notePresentedVideo(_ time: CMTime) {
     guard audioActive else { return }
     audioPlayer.notePresentedVideo(time)
@@ -170,6 +172,11 @@ final class BrowserCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
 
   func perform(_ block: @escaping () -> Void) {
     queue.async(execute: block)
+  }
+
+  /// Depth and present run here, off the sample queue, so a slow frame does not pile up behind itself.
+  func performDraw(_ block: @escaping () -> Void) {
+    drawQueue.async(execute: block)
   }
 
   func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
@@ -189,20 +196,21 @@ final class BrowserCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
       DispatchQueue.main.async { [weak self] in
         self?.onStatus?(Self.protectedMessage)
       }
-      onIdle?()
+      deliverIdle()
       return
     }
-    // A complete frame is copied into a buffer this process owns. An idle frame
-    // usually has no image; that, and a stretch with no callback, redraws the last one.
-    if status != .idle, let image, let owned = Self.ownedCopy(of: image) {
-      lastComplete = CACurrentMediaTime()
-      onFrame?(owned, CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
+    // Copy inside this callback, then return. The draw queue keeps only the newest
+    // buffer so a slow depth pass does not play the frames that queued behind it.
+    let received = CACurrentMediaTime()
+    if status != .idle, let image, let owned = autoreleasepool(invoking: { Self.ownedCopy(of: image) }) {
+      lastComplete = received
+      publishFrame(owned, time: CMSampleBufferGetPresentationTimeStamp(sampleBuffer), received: received)
       return
     }
     if image != nil && status != .idle {
       browserCaptureLog.error("frame copy failed status=\(Self.statusName(status), privacy: .public)")
     }
-    onIdle?()
+    deliverIdle()
   }
 
   func stream(_ stream: SCStream, didStopWithError error: Error) {
@@ -230,10 +238,16 @@ final class BrowserCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
     configuration.height = resolved.pixelHeight
     configuration.pixelFormat = kCVPixelFormatType_32BGRA
     configuration.showsCursor = false
-    configuration.queueDepth = 8
+    // Three frames is enough for the capture to stay smooth. Eight frames sat
+    // behind the depth pass and showed up as extra latency on the glasses.
+    configuration.queueDepth = 3
     var captureAudio = false
     if #available(macOS 13.0, *) {
-      captureAudio = BrowserCaptureSettings.shared.wantsAudio
+      let virtual = VirtualAudioDevices.anyInstalled()
+      captureAudio = CaptureAudioPolicy.shouldCaptureAudio(
+        userEnabled: BrowserCaptureSettings.shared.wantsAudio,
+        virtualDevicePresent: virtual
+      )
       configuration.capturesAudio = captureAudio
       configuration.minimumFrameInterval = CMTime(value: 1, timescale: 30)
       if captureAudio {
@@ -274,6 +288,7 @@ final class BrowserCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
       trackedTitle = ""
       trackedDisplay = resolved.target.displayID
     }
+    followClock = .empty
     loggedFirstFrame = false
     framesInWindow = 0
     windowStarted = CACurrentMediaTime()
@@ -303,9 +318,6 @@ final class BrowserCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
     armRedraw()
     if captureAudio {
       audioPlayer.start()
-    }
-    if BrowserCaptureSettings.shared.wantsMute {
-      applyMute()
     }
     if let audioProblem {
       let note = onNote
@@ -340,7 +352,11 @@ final class BrowserCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
       trackedOwner = ""
       trackedTitle = ""
       trackedDisplay = 0
+      followClock = .empty
     }
+    frameLock.lock()
+    latestOwned = nil
+    frameLock.unlock()
     guard let stream else { return }
     self.stream = nil
     configuration = nil
@@ -387,7 +403,7 @@ final class BrowserCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
     }
   }
 
-  /// Every half second, the same interval OBS uses in `find_window`. Full-screen YouTube changes the window id and the title, so a missing id is followed by bundle id and then by the largest window on any Space. If that app has no window, the display it occupied is captured instead.
+  /// Every half second, the same interval OBS uses in `find_window`. The current id stays selected while it exists, including when full screen moves it to another Space. An untitled placeholder is not a new target. A missing id waits 1.5 seconds before the filter changes, and the filter is not updated when the id did not change.
   private func followTrackedWindow(token: Int) async {
     guard beginSession() else { return }
     defer { endSession() }
@@ -415,46 +431,63 @@ final class BrowserCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
       bundleID: trackedBundle,
       displayID: trackedDisplay
     )
-    let decision = CaptureWindowMatch.decide(
+    let outcome = CaptureWindowMatch.decide(
       track: track,
       windows: records,
-      displayIDs: content.displays.map(\.displayID)
+      displayIDs: content.displays.map(\.displayID),
+      now: CACurrentMediaTime(),
+      clock: followClock
     )
-    switch decision {
+    followClock = outcome.clock
+    switch outcome.decision {
     case .keep:
       if let current = windows.first(where: { $0.windowID == target.id }), target.kind == .window {
         let display = Self.displayID(covering: current.frame, displays: content.displays)
         if display != 0 { trackedDisplay = display }
+        let title = current.title ?? ""
+        if !title.isEmpty { trackedTitle = title }
       }
     case .window(let found, let reason):
+      if target.kind == .window && target.id == found.id {
+        if !found.title.isEmpty { trackedTitle = found.title }
+        return
+      }
       guard let window = windows.first(where: { $0.windowID == found.id }) else { return }
       browserCaptureLog.info("\(reason, privacy: .public)")
       var updated = target
       updated.kind = .window
       updated.id = window.windowID
-      updated.title = window.title ?? found.title
+      let title = window.title ?? found.title
+      updated.title = title.isEmpty ? trackedTitle : title
       updated.owner = window.owningApplication?.applicationName ?? found.owner
       updated.bundleID = window.owningApplication?.bundleIdentifier ?? found.bundleID
       updated.width = found.width
       updated.height = found.height
-      trackedTitle = updated.title
+      if !title.isEmpty { trackedTitle = title }
       trackedOwner = updated.owner
       trackedBundle = updated.bundleID
       if found.displayID != 0 { trackedDisplay = found.displayID }
-      await retarget(updated, window: window, token: token)
+      await retarget(updated, window: window, holding: content, token: token)
     case .display(let displayID, let reason):
+      if target.kind == .display && target.displayID == displayID { return }
       guard let display = content.displays.first(where: { $0.displayID == displayID }) ?? content.displays.first else { return }
       browserCaptureLog.info("\(reason, privacy: .public)")
       let skip = content.windows.filter { ids.contains($0.windowID) }
-      await retargetDisplay(display, excluding: skip, token: token)
+      await retargetDisplay(display, excluding: skip, holding: content, token: token)
     }
   }
 
-  private func retargetDisplay(_ display: SCDisplay, excluding skip: [SCWindow], token: Int) async {
+  private func retargetDisplay(_ display: SCDisplay, excluding skip: [SCWindow], holding content: SCShareableContent, token: Int) async {
     guard token == epoch, let stream else { return }
     let filter = SCContentFilter(display: display, excludingWindows: skip)
     let updated = await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
       stream.updateContentFilter(filter) { error in
+        // The filter and the shareable content stay alive until this callback
+        // returns. Releasing them as the main pool pops, while ScreenCaptureKit
+        // still has the same objects, is the objc_release crash.
+        withExtendedLifetime(content) {}
+        withExtendedLifetime(filter) {}
+        withExtendedLifetime(skip) {}
         if let error {
           browserCaptureLog.error("updateContentFilter failed: \(error.localizedDescription, privacy: .public)")
           continuation.resume(returning: false)
@@ -499,12 +532,15 @@ final class BrowserCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
     browserCaptureLog.info("capturing display \(display.displayID) \(size.width)x\(size.height)")
   }
 
-  private func retarget(_ target: BrowserCaptureTarget, window: SCWindow, token: Int) async {
+  private func retarget(_ target: BrowserCaptureTarget, window: SCWindow, holding content: SCShareableContent, token: Int) async {
     guard token == epoch, let stream else { return }
     browserCaptureLog.info("window id changed to \(window.windowID) app=\(target.owner, privacy: .public) title=\(target.title, privacy: .public)")
     let filter = SCContentFilter(desktopIndependentWindow: window)
     let updated = await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
       stream.updateContentFilter(filter) { error in
+        withExtendedLifetime(content) {}
+        withExtendedLifetime(filter) {}
+        withExtendedLifetime(window) {}
         if let error {
           browserCaptureLog.error("updateContentFilter failed: \(error.localizedDescription, privacy: .public)")
           continuation.resume(returning: false)
@@ -517,9 +553,6 @@ final class BrowserCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
     activeTarget = target
     currentID = window.windowID
     sourcePID = window.owningApplication?.processID
-    if BrowserCaptureSettings.shared.wantsMute {
-      applyMute()
-    }
     let size = Self.pixelSize(for: window)
     configuration?.width = size.width
     configuration?.height = size.height
@@ -532,6 +565,45 @@ final class BrowserCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
           continuation.resume()
         }
       }
+    }
+  }
+
+  /// Replaces any frame the draw queue has not started. One draw runs at a time; the next draw is the newest copy.
+  private func publishFrame(_ buffer: CVPixelBuffer, time: CMTime, received: CFTimeInterval) {
+    frameLock.lock()
+    latestOwned = buffer
+    latestTime = time
+    latestReceived = received
+    let start = !drawBusy
+    if start { drawBusy = true }
+    frameLock.unlock()
+    if start {
+      drawQueue.async { [weak self] in
+        self?.drainFrames()
+      }
+    }
+  }
+
+  private func drainFrames() {
+    while true {
+      frameLock.lock()
+      guard let buffer = latestOwned else {
+        drawBusy = false
+        frameLock.unlock()
+        return
+      }
+      let time = latestTime
+      let received = latestReceived
+      latestOwned = nil
+      frameLock.unlock()
+      onFrame?(buffer, time, received)
+    }
+  }
+
+  private func deliverIdle() {
+    drawQueue.async { [weak self] in
+      guard let self, self.accepting else { return }
+      self.onIdle?()
     }
   }
 
@@ -556,7 +628,7 @@ final class BrowserCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
     timer.setEventHandler { [weak self] in
       guard let self, self.accepting else { return }
       if CACurrentMediaTime() - self.lastComplete < 0.05 { return }
-      self.onIdle?()
+      self.deliverIdle()
     }
     redrawTimer = timer
     timer.resume()
@@ -574,38 +646,6 @@ final class BrowserCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
       framesInWindow = 0
       windowStarted = now
       browserCaptureLog.info("frames \(count)/s status=\(Self.statusName(status), privacy: .public)")
-    }
-  }
-
-  private func applyMute() {
-    let wants = BrowserCaptureSettings.shared.wantsMute && running
-    guard wants, let pid = sourcePID, pid > 0 else {
-      if #available(macOS 14.2, *) {
-        BrowserCaptureSourceMute.shared.stop()
-      }
-      audioPlayer.setSourceMuteActive(false)
-      return
-    }
-    if #available(macOS 14.2, *) {
-      if let message = BrowserCaptureSourceMute.shared.start(pid: pid) {
-        BrowserCaptureSettings.shared.setMuteSource(false)
-        audioPlayer.setSourceMuteActive(false)
-        DispatchQueue.main.async { [weak self] in
-          self?.onStatus?(message)
-          self?.onMuteChanged?()
-        }
-        return
-      }
-      audioPlayer.setSourceMuteActive(true)
-      DispatchQueue.main.async { [weak self] in
-        self?.onNote?("Source app is muted. IINA plays its audio with the picture.")
-      }
-    } else {
-      BrowserCaptureSettings.shared.setMuteSource(false)
-      DispatchQueue.main.async { [weak self] in
-        self?.onNote?(Self.muteNeedsNewerOS)
-        self?.onMuteChanged?()
-      }
     }
   }
 

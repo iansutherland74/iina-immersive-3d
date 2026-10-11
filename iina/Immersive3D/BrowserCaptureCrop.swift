@@ -58,7 +58,7 @@ final class BrowserCaptureSettings {
   var onDetected: ((BrowserCaptureInsets) -> Void)?
 
   private let lock = NSLock()
-  private var playAudio = true
+  private var playAudio = false
   private var muteSource = false
   private var mode: BrowserCaptureCropMode = .autoChrome
   private var manual = BrowserCaptureInsets.zero

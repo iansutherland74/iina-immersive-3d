@@ -10,9 +10,9 @@
 //  device, following mpv volume and mute. Video is late because of the depth
 //  pass, so samples wait until the picture on screen reaches their timestamp.
 //
-//  Mute uses the public macOS 14.2 process tap. It does not use a private API.
-//  If muting the app makes ScreenCaptureKit silent, the tap is where macOS put
-//  the sound, and that is what plays, on the same clock.
+//  This stays off unless a virtual output device is installed and the user opts
+//  in. Muting Chrome silences the samples ScreenCaptureKit can read, and macOS 13
+//  cannot capture another app's audio while also silencing that app's speakers.
 
 import AVFoundation
 import AudioToolbox
@@ -46,6 +46,57 @@ enum BrowserCaptureAudioRouteReader {
     guard name.hasPrefix(prefix) else { return nil }
     let uid = String(name.dropFirst(prefix.count))
     return uid.isEmpty ? nil : uid
+  }
+}
+
+enum VirtualAudioDevices {
+  static func anyInstalled() -> Bool {
+    outputDevices().contains { CaptureAudioPolicy.looksVirtual(name: $0.name, uid: $0.uid) }
+  }
+
+  private static func outputDevices() -> [(name: String, uid: String)] {
+    var address = AudioObjectPropertyAddress(
+      mSelector: kAudioHardwarePropertyDevices,
+      mScope: kAudioObjectPropertyScopeGlobal,
+      mElement: kAudioObjectPropertyElementMain
+    )
+    var dataSize: UInt32 = 0
+    let system = AudioObjectID(kAudioObjectSystemObject)
+    guard AudioObjectGetPropertyDataSize(system, &address, 0, nil, &dataSize) == noErr, dataSize > 0 else { return [] }
+    let count = Int(dataSize) / MemoryLayout<AudioDeviceID>.size
+    var devices = [AudioDeviceID](repeating: 0, count: count)
+    guard AudioObjectGetPropertyData(system, &address, 0, nil, &dataSize, &devices) == noErr else { return [] }
+    return devices.compactMap { device in
+      guard hasOutputStream(device),
+            let name = copyString(device, selector: kAudioDevicePropertyDeviceNameCFString),
+            let uid = copyString(device, selector: kAudioDevicePropertyDeviceUID) else { return nil }
+      return (name, uid)
+    }
+  }
+
+  private static func hasOutputStream(_ device: AudioDeviceID) -> Bool {
+    var address = AudioObjectPropertyAddress(
+      mSelector: kAudioDevicePropertyStreams,
+      mScope: kAudioDevicePropertyScopeOutput,
+      mElement: kAudioObjectPropertyElementMain
+    )
+    var size: UInt32 = 0
+    guard AudioObjectGetPropertyDataSize(device, &address, 0, nil, &size) == noErr else { return false }
+    return size >= UInt32(MemoryLayout<AudioStreamID>.size)
+  }
+
+  /// Device name and UID are +1 CFStrings. The buffer is one pointer, matching `uid(of:)`.
+  private static func copyString(_ device: AudioDeviceID, selector: AudioObjectPropertySelector) -> String? {
+    var address = AudioObjectPropertyAddress(
+      mSelector: selector,
+      mScope: kAudioObjectPropertyScopeGlobal,
+      mElement: kAudioObjectPropertyElementMain
+    )
+    var name: Unmanaged<CFString>?
+    var size = UInt32(MemoryLayout<UnsafeRawPointer?>.size)
+    let status = AudioObjectGetPropertyData(device, &address, 0, nil, &size, &name)
+    guard status == noErr, let name else { return nil }
+    return name.takeRetainedValue() as String
   }
 }
 

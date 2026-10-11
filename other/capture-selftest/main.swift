@@ -96,6 +96,16 @@ private func testSession() {
   check(menuExit.session.output == .off && menuExit.effects == [.unpinCapture], "play toggles capture off the glasses")
 }
 
+private func follow(
+  track: CaptureTrack,
+  windows: [CaptureWindowRecord],
+  displays: [UInt32] = [1, 2],
+  now: TimeInterval,
+  clock: CaptureFollowClock
+) -> CaptureFollowOutcome {
+  CaptureWindowMatch.decide(track: track, windows: windows, displayIDs: displays, now: now, clock: clock)
+}
+
 private func testWindowMatch() {
   let track = CaptureTrack(
     kind: .window,
@@ -106,37 +116,69 @@ private func testWindowMatch() {
     displayID: 2
   )
   let same = chrome(145, title: "Me at the zoo - YouTube", width: 1400, height: 900, onScreen: true)
-  check(CaptureWindowMatch.decide(track: track, windows: [same], displayIDs: [1, 2]) == .keep, "the same window id stays")
+  check(follow(track: track, windows: [same], now: 0, clock: .empty).decision == .keep, "the same window id stays")
 
-  let fullscreen = chrome(900, title: "YouTube", width: 1512, height: 982, onScreen: false)
-  let gone = CaptureWindowMatch.decide(track: track, windows: [fullscreen], displayIDs: [1, 2])
-  if case .window(let found, let reason) = gone {
-    check(found.id == 900 && reason.contains("largest"), "fullscreen title change follows the largest Chrome window")
-  } else {
-    check(false, "fullscreen title change follows the largest Chrome window")
+  let shadow = chrome(2003, title: "", width: 1512, height: 982, onScreen: true)
+  let offscreen = chrome(145, title: "Me at the zoo - YouTube", width: 1512, height: 982, onScreen: false)
+  var clock = CaptureFollowClock.empty
+  var flipped = false
+  for tick in stride(from: 0.0, through: 3.0, by: 0.5) {
+    let outcome = follow(track: track, windows: [offscreen, shadow], now: tick, clock: clock)
+    clock = outcome.clock
+    if outcome.decision != .keep { flipped = true }
   }
+  check(!flipped, "an off-screen YouTube window is not replaced by an untitled Chrome window")
+  check(CaptureWindowMatch.isPlaceholder(shadow), "an untitled window is a placeholder")
+  check(!CaptureWindowMatch.isPlaceholder(offscreen), "a titled full-screen window is not a placeholder")
 
-  let none = CaptureWindowMatch.decide(track: track, windows: [], displayIDs: [1, 2])
-  if case .display(let id, let reason) = none {
-    check(id == 2 && reason.contains("display 2"), "no Chrome window falls back to the screen it was on")
+  let tiny = chrome(2004, title: "YouTube", width: 80, height: 80, onScreen: true)
+  check(CaptureWindowMatch.isPlaceholder(tiny), "a tiny window is a placeholder")
+
+  clock = .empty
+  let missingSoon = follow(track: track, windows: [shadow], now: 10, clock: clock)
+  check(missingSoon.decision == .keep && missingSoon.clock.absentSince == 10, "a missing window waits before the filter changes")
+  let stillWaiting = follow(track: track, windows: [shadow], now: 11.5, clock: missingSoon.clock)
+  check(stillWaiting.decision == .keep, "1.5 seconds is not long enough to leave the window")
+  let titled = chrome(900, title: "YouTube", width: 1512, height: 982, onScreen: false)
+  let switched = follow(track: track, windows: [shadow, titled], now: 11.6, clock: stillWaiting.clock)
+  if case .window(let found, _) = switched.decision {
+    check(found.id == 900, "after 1.5 seconds the titled window is followed, not the untitled one")
   } else {
-    check(false, "no Chrome window falls back to the screen it was on")
+    check(false, "after 1.5 seconds the titled window is followed, not the untitled one")
+  }
+  var followed = track
+  followed.windowID = 900
+  followed.title = "YouTube"
+  let stayed = follow(track: followed, windows: [offscreen, shadow, titled], now: 12.1, clock: switched.clock)
+  check(stayed.decision == .keep, "the follow does not switch back to the previous window")
+
+  let onlyShadow = follow(track: track, windows: [shadow], now: 20, clock: CaptureFollowClock(absentSince: 10, departedID: 0, departedAt: 0))
+  if case .display(let id, let reason) = onlyShadow.decision {
+    check(id == 2 && reason.contains("display 2"), "no real Chrome window falls back to the screen it was on")
+  } else {
+    check(false, "no real Chrome window falls back to the screen it was on")
   }
 
   let small = chrome(10, title: "New Tab", width: 800, height: 600, onScreen: true)
   let big = chrome(11, title: "Other", width: 1400, height: 900, onScreen: true)
   let tracked = CaptureTrack(kind: .window, windowID: 10, title: "New Tab", owner: "Google Chrome", bundleID: "com.google.Chrome", displayID: 2)
   check(
-    CaptureWindowMatch.decide(track: tracked, windows: [small, big], displayIDs: [2]) == .keep,
+    follow(track: tracked, windows: [small, big], now: 0, clock: .empty).decision == .keep,
     "a larger Chrome window does not steal a window that is still there"
   )
+  let hidden = chrome(10, title: "New Tab", width: 800, height: 600, onScreen: false)
+  check(
+    follow(track: tracked, windows: [hidden, big], now: 0, clock: .empty).decision == .keep,
+    "leaving the current screen does not drop a window that still exists"
+  )
 
-  let offscreen = chrome(10, title: "New Tab", width: 800, height: 600, onScreen: false)
-  let moved = CaptureWindowMatch.decide(track: tracked, windows: [offscreen, big], displayIDs: [2])
-  if case .window(let found, _) = moved {
-    check(found.id == 11, "an off-screen window yields to the largest Chrome window")
+  let placeholder = chrome(2003, title: " ", width: 1400, height: 900, onScreen: true)
+  let stuck = CaptureTrack(kind: .window, windowID: 2003, title: "Me at the zoo - YouTube", owner: "Google Chrome", bundleID: "com.google.Chrome", displayID: 2)
+  let escaped = follow(track: stuck, windows: [placeholder, offscreen], now: 0, clock: .empty)
+  if case .window(let found, _) = escaped.decision {
+    check(found.id == 145, "an untitled window gives way to the titled YouTube window")
   } else {
-    check(false, "an off-screen window yields to the largest Chrome window")
+    check(false, "an untitled window gives way to the titled YouTube window")
   }
 
   let displays = [
@@ -151,12 +193,42 @@ private func testWindowMatch() {
   var displayTrack = track
   displayTrack.kind = .display
   displayTrack.windowID = 0
-  let back = CaptureWindowMatch.decide(track: displayTrack, windows: [fullscreen], displayIDs: [2])
-  if case .window(let found, _) = back {
-    check(found.id == 900, "whole-display fallback returns to a Chrome window when one exists")
+  let back = follow(track: displayTrack, windows: [titled, shadow], now: 0, clock: .empty)
+  if case .window(let found, _) = back.decision {
+    check(found.id == 900, "whole-display fallback returns to a titled Chrome window")
   } else {
-    check(false, "whole-display fallback returns to a Chrome window when one exists")
+    check(false, "whole-display fallback returns to a titled Chrome window")
   }
+  let shadowOnly = follow(track: displayTrack, windows: [shadow], now: 0, clock: .empty)
+  check(shadowOnly.decision == .keep, "an untitled window does not end whole-display capture")
+}
+
+private func testDrawableLock() {
+  let builtIn = GlassesDrawable.lockedPixels(lockedWidth: 3840, lockedHeight: 1080, interimWidth: 3024, interimHeight: 1964)
+  check(builtIn.width == 3840 && builtIn.height == 1080, "a Space change does not adopt the Mac screen")
+  let partial = GlassesDrawable.lockedPixels(lockedWidth: 3840, lockedHeight: 1080, interimWidth: 3840, interimHeight: 1027)
+  check(partial.width == 3840 && partial.height == 1080, "a half-moved frame does not shrink the glasses drawable")
+  check(GlassesDrawable.presentFit(textureWidth: 1920, textureHeight: 1080, drawableWidth: 3024, drawableHeight: 1964) == .scale, "a size mismatch is scaled")
+  check(GlassesDrawable.presentFit(textureWidth: 3840, textureHeight: 1080, drawableWidth: 3840, drawableHeight: 1080) == .blit, "a matching drawable is blitted")
+  check(GlassesDrawable.presentFit(textureWidth: 2, textureHeight: 2, drawableWidth: 3840, drawableHeight: 1080) == .drop, "a 2x2 texture is not presented")
+}
+
+private func testCoalescer() {
+  var gate = CaptureFrameCoalescer()
+  check(gate.arrive() == 1 && gate.arrive() == 2 && gate.arrive() == 3, "three frames arrived")
+  check(gate.takeForDraw() == 3, "the draw takes the newest frame")
+  check(gate.arrive() == 4 && gate.arrive() == 5, "later frames replace the one in flight")
+  check(gate.finishDraw() == 5, "the next draw is the newest frame that arrived")
+  check(gate.finishDraw() == nil && !gate.drawing, "an idle draw queue waits")
+  check(CaptureLatency.milliseconds(received: 10, presented: 10.042) == 42, "capture latency is the present time minus the copy time")
+}
+
+private func testAudioPolicy() {
+  check(!CaptureAudioPolicy.shouldCaptureAudio(userEnabled: false, virtualDevicePresent: true), "captured audio stays off unless the user asks")
+  check(!CaptureAudioPolicy.shouldCaptureAudio(userEnabled: true, virtualDevicePresent: false), "captured audio stays off without a virtual device")
+  check(CaptureAudioPolicy.shouldCaptureAudio(userEnabled: true, virtualDevicePresent: true), "a virtual device can play captured audio")
+  check(CaptureAudioPolicy.looksVirtual(name: "BlackHole 2ch", uid: "BlackHole2ch_UID"), "BlackHole is a virtual device")
+  check(!CaptureAudioPolicy.looksVirtual(name: "MacBook Pro Speakers", uid: "BuiltInSpeakerDevice"), "the built-in speakers are not a virtual device")
 }
 
 private func testContentRect() {
@@ -294,14 +366,127 @@ private func testStereoPipeline() {
   check(mean > 1000, "mean channel sum is not a black frame (\(mean))")
 }
 
+private func fill(_ pixelBuffer: CVPixelBuffer, width: Int, height: Int) {
+  guard CVPixelBufferLockBaseAddress(pixelBuffer, []) == kCVReturnSuccess, let base = CVPixelBufferGetBaseAddress(pixelBuffer) else { return }
+  let rowBytes = CVPixelBufferGetBytesPerRow(pixelBuffer)
+  let pixels = base.assumingMemoryBound(to: UInt8.self)
+  for y in 0..<height {
+    for x in 0..<width {
+      let offset = y * rowBytes + x * 4
+      let red = x < width / 2
+      pixels[offset] = red ? 0 : 255
+      pixels[offset + 1] = 0
+      pixels[offset + 2] = red ? 255 : 0
+      pixels[offset + 3] = 255
+    }
+  }
+  CVPixelBufferUnlockBaseAddress(pixelBuffer, [])
+}
+
+private func makeBuffer(width: Int, height: Int) -> CVPixelBuffer? {
+  var pixelBuffer: CVPixelBuffer?
+  let created = CVPixelBufferCreate(
+    kCFAllocatorDefault,
+    width,
+    height,
+    kCVPixelFormatType_32BGRA,
+    [kCVPixelBufferMetalCompatibilityKey as String: true, kCVPixelBufferIOSurfacePropertiesKey as String: [:]] as CFDictionary,
+    &pixelBuffer
+  )
+  guard created == kCVReturnSuccess else { return nil }
+  return pixelBuffer
+}
+
+private func testTextureLifetime() {
+  guard let device = MTLCreateSystemDefaultDevice() else {
+    check(false, "Metal device is available for the texture lifetime")
+    return
+  }
+  var cache: CVMetalTextureCache?
+  guard CVMetalTextureCacheCreate(kCFAllocatorDefault, nil, device, nil, &cache) == kCVReturnSuccess, let cache else {
+    check(false, "texture cache for the lifetime loop")
+    return
+  }
+  var survived = true
+  for _ in 0..<40 {
+    autoreleasepool {
+      guard let pixelBuffer = makeBuffer(width: 320, height: 180) else {
+        survived = false
+        return
+      }
+      fill(pixelBuffer, width: 320, height: 180)
+      guard let made = CaptureTextureLifetime.make(cache: cache, pixelBuffer: pixelBuffer, width: 320, height: 180) else {
+        survived = false
+        return
+      }
+      var holder: CVMetalTexture? = made.holder
+      var texture: MTLTexture? = made.texture
+      if texture?.width != 320 { survived = false }
+      CaptureTextureLifetime.recycle(holder: &holder, texture: &texture, cache: cache, flush: true)
+    }
+  }
+  check(survived, "texture create and flush survives an autorelease pool")
+}
+
+private func testScale() {
+  guard let device = MTLCreateSystemDefaultDevice(), let queue = device.makeCommandQueue() else {
+    check(false, "Metal device is available for scaling")
+    return
+  }
+  let libraryURL = URL(fileURLWithPath: ProcessInfo.processInfo.environment["CAPTURE_METALLIB"] ?? "")
+  guard let library = try? device.makeLibrary(URL: libraryURL),
+        let function = library.makeFunction(name: "immersiveScaleRGBA"),
+        let pipeline = try? device.makeComputePipelineState(function: function) else {
+    check(false, "immersiveScaleRGBA loaded")
+    return
+  }
+  guard let pixelBuffer = makeBuffer(width: 1920, height: 1080) else {
+    check(false, "1920x1080 source buffer")
+    return
+  }
+  fill(pixelBuffer, width: 1920, height: 1080)
+  var cache: CVMetalTextureCache?
+  guard CVMetalTextureCacheCreate(kCFAllocatorDefault, nil, device, nil, &cache) == kCVReturnSuccess, let cache,
+        let made = CaptureTextureLifetime.make(cache: cache, pixelBuffer: pixelBuffer, width: 1920, height: 1080) else {
+    check(false, "1920x1080 texture")
+    return
+  }
+  var holder: CVMetalTexture? = made.holder
+  var source: MTLTexture? = made.texture
+  defer { CaptureTextureLifetime.recycle(holder: &holder, texture: &source, cache: cache, flush: true) }
+  guard let source, let destination = texture(device, width: 3840, height: 1080, format: .bgra8Unorm, usage: [.shaderWrite], shared: true) else {
+    check(false, "3840x1080 scale destination")
+    return
+  }
+  check(StereoOffscreen.scale(commandQueue: queue, pipeline: pipeline, source: source, destination: destination), "scale 1920x1080 onto 3840x1080")
+  var pixel = [UInt8](repeating: 0, count: 4)
+  func read(_ x: Int) -> (b: Int, r: Int) {
+    pixel.withUnsafeMutableBytes { raw in
+      destination.getBytes(raw.baseAddress!, bytesPerRow: 4, from: MTLRegionMake2D(x, 540, 1, 1), mipmapLevel: 0)
+    }
+    return (Int(pixel[0]), Int(pixel[2]))
+  }
+  let left = read(480)
+  let right = read(3360)
+  check(left.r > 200 && left.b < 40 && right.b > 200 && right.r < 40, "scaled 3840x1080 keeps both halves of the picture")
+}
+
 @main
 enum CaptureSelfTest {
   static func main() {
     testDrawable()
+    testDrawableLock()
     testSession()
     testWindowMatch()
+    testCoalescer()
+    testAudioPolicy()
     testContentRect()
-    testStereoPipeline()
+    let zombies = ProcessInfo.processInfo.environment["CAPTURE_ZOMBIES"] == "1"
+    if !zombies {
+      testStereoPipeline()
+      testScale()
+    }
+    testTextureLifetime()
     if failures == 0 {
       print("browser capture self-test passed")
     } else {
@@ -310,3 +495,4 @@ enum CaptureSelfTest {
     }
   }
 }
+
