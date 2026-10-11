@@ -18,15 +18,24 @@
     ul { list-style: none; margin: 8px 0 0; padding: 0; }
     li { border-top: 1px solid var(--line); }
     .meta { color: var(--muted); float: right; }
-    .row { display: flex; gap: 8px; margin-top: 8px; }
+    .row { display: flex; gap: 8px; margin-top: 8px; align-items: center; }
     #editor { margin-top: 12px; }
+    .thumb { width: 42px; height: 42px; object-fit: cover; border-radius: 4px; margin-right: 8px; vertical-align: middle; background: rgba(127,127,127,.25); }
+    .bar { height: 3px; background: rgba(127,127,127,.35); margin-top: 4px; }
+    .bar > span { display: block; height: 100%; background: var(--accent); }
   </style>
 </head>
 <body>
   <div id="servers">
     <h1>Remote files</h1>
-    <p class="note">WebDAV, FTP, and FTPS. FebBox is https://webdav.febbox.com. Nextcloud is https://host/remote.php/dav/files/name/</p>
+    <p class="note">WebDAV, FTP, FTPS, SMB, SFTP, Jellyfin, Plex, Emby, and DLNA. FebBox is https://webdav.febbox.com. Nextcloud is https://host/remote.php/dav/files/name/</p>
+    <div class="row">
+      <button id="discover" class="plain" type="button">Discover</button>
+      <button id="history" class="plain" type="button">History</button>
+      <button id="favourites" class="plain" type="button">Favourites</button>
+    </div>
     <ul id="server-list"></ul>
+    <ul id="extra"></ul>
     <p id="server-warning" class="warn" hidden></p>
     <div id="editor">
       <label for="name">Name</label>
@@ -36,6 +45,12 @@
         <option value="webdav">WebDAV</option>
         <option value="ftp">FTP</option>
         <option value="ftps">FTPS</option>
+        <option value="smb">SMB</option>
+        <option value="sftp">SFTP</option>
+        <option value="jellyfin">Jellyfin</option>
+        <option value="plex">Plex</option>
+        <option value="emby">Emby</option>
+        <option value="dlna">DLNA</option>
       </select>
       <label for="url">Address</label>
       <input id="url" spellcheck="false" placeholder="https://webdav.febbox.com">
@@ -44,6 +59,9 @@
       <label for="password">Password</label>
       <input id="password" type="password" autocomplete="current-password" placeholder="Saved in the Keychain">
       <label id="tls-row"><input id="insecure" type="checkbox" style="width:auto"> Allow insecure TLS for FTP</label>
+      <label for="oskey">OpenSubtitles API key</label>
+      <input id="oskey" type="password" autocomplete="off" placeholder="Optional. Saved in the Keychain">
+      <button id="save-os" class="plain" type="button">Save OpenSubtitles key</button>
       <div class="row">
         <button id="save" type="button">Save</button>
         <button id="cancel" class="plain" type="button" hidden>Cancel edit</button>
@@ -55,6 +73,17 @@
       <button id="back" class="plain" type="button">Servers</button>
       <button id="up" class="plain" type="button" hidden>Up</button>
       <button id="refresh" class="plain" type="button">Refresh</button>
+      <button id="play-folder" class="plain" type="button">Play folder</button>
+    </div>
+    <label for="query">Search</label>
+    <input id="query" placeholder="Filter this folder">
+    <div class="row">
+      <select id="sort">
+        <option value="name">Name</option>
+        <option value="date">Date</option>
+        <option value="size">Size</option>
+      </select>
+      <label style="margin:0"><input id="autoplay" type="checkbox" style="width:auto" checked> Next episode</label>
     </div>
     <h1 id="title">Folder</h1>
     <div id="path" class="note"></div>
@@ -65,6 +94,7 @@
     var editing = "";
     var current = "";
     var stack = [];
+    var folderEntries = [];
 
     function post(name, data) { iina.postMessage(name, data || {}); }
     function show(id) {
@@ -84,7 +114,15 @@
       return (unit ? value.toFixed(1) : value) + " " + units[unit];
     }
     function syncTLS() {
-      document.getElementById("tls-row").hidden = document.getElementById("protocol").value === "webdav";
+      var protocol = document.getElementById("protocol").value;
+      document.getElementById("tls-row").hidden = protocol !== "ftp" && protocol !== "ftps";
+    }
+    function shownEntries() {
+      var query = document.getElementById("query").value.trim().toLowerCase();
+      if (!query) return folderEntries;
+      return folderEntries.filter(function (entry) {
+        return String(entry.name || "").toLowerCase().indexOf(query) !== -1;
+      });
     }
     function clearEditor() {
       editing = "";
@@ -140,6 +178,26 @@
         list.appendChild(item);
       });
     }
+    function renderExtra(rows, onClick) {
+      var list = document.getElementById("extra");
+      list.textContent = "";
+      (rows || []).forEach(function (row) {
+        var item = document.createElement("li");
+        var button = document.createElement("button");
+        button.type = "button";
+        button.className = "item";
+        button.textContent = row.name + (row.server ? "  " : "");
+        if (row.kind || row.server) {
+          var meta = document.createElement("span");
+          meta.className = "meta";
+          meta.textContent = row.server || String(row.kind || "").toUpperCase();
+          button.appendChild(meta);
+        }
+        button.addEventListener("click", function () { onClick(row); });
+        item.appendChild(button);
+        list.appendChild(item);
+      });
+    }
     function renderFiles(entries) {
       var list = document.getElementById("list");
       list.textContent = "";
@@ -148,22 +206,49 @@
         var button = document.createElement("button");
         button.type = "button";
         button.className = "item";
-        button.textContent = (entry.folder ? "Folder  " : "") + entry.name;
-        if (!entry.folder && entry.size) {
+        if (entry.image) {
+          var image = document.createElement("img");
+          image.className = "thumb";
+          image.alt = "";
+          image.src = entry.image;
+          button.appendChild(image);
+        }
+        button.appendChild(document.createTextNode((entry.folder ? "Folder  " : "") + entry.name));
+        var bits = [];
+        if (!entry.folder && entry.size) bits.push(sizeText(entry.size));
+        if (entry.date) bits.push(new Date(entry.date).toLocaleDateString());
+        if (bits.length) {
           var meta = document.createElement("span");
           meta.className = "meta";
-          meta.textContent = sizeText(entry.size);
+          meta.textContent = bits.join("  ");
           button.appendChild(meta);
+        }
+        if (entry.progress > 0) {
+          var bar = document.createElement("div");
+          bar.className = "bar";
+          var fill = document.createElement("span");
+          fill.style.width = Math.round(entry.progress * 100) + "%";
+          bar.appendChild(fill);
+          button.appendChild(bar);
         }
         button.addEventListener("click", function () {
           if (entry.folder) {
             stack.push(current);
+            document.getElementById("query").value = "";
             post("open", { href: entry.href });
           } else {
             post("play", { href: entry.href, name: entry.name });
           }
         });
+        var star = document.createElement("button");
+        star.type = "button";
+        star.className = "plain";
+        star.textContent = entry.favourite ? "Unfavourite" : "Favourite";
+        star.addEventListener("click", function () {
+          post("favourite", { href: entry.href, name: entry.name });
+        });
         item.appendChild(button);
+        item.appendChild(star);
         list.appendChild(item);
       });
     }
@@ -193,9 +278,25 @@
     document.getElementById("refresh").addEventListener("click", function () {
       post("open", { href: current });
     });
+    document.getElementById("play-folder").addEventListener("click", function () { post("play-folder"); });
+    document.getElementById("query").addEventListener("input", function () { renderFiles(shownEntries()); });
+    document.getElementById("sort").addEventListener("change", function () {
+      post("sort", { mode: document.getElementById("sort").value });
+    });
+    document.getElementById("autoplay").addEventListener("change", function () {
+      post("autoplay", { on: document.getElementById("autoplay").checked });
+    });
+    document.getElementById("discover").addEventListener("click", function () { post("discover"); });
+    document.getElementById("history").addEventListener("click", function () { post("history"); });
+    document.getElementById("favourites").addEventListener("click", function () { post("favourites"); });
+    document.getElementById("save-os").addEventListener("click", function () {
+      post("save-os-key", { key: document.getElementById("oskey").value });
+      document.getElementById("oskey").value = "";
+    });
 
     iina.onMessage("servers", function (data) {
       show("servers");
+      document.getElementById("extra").textContent = "";
       renderServers(data && data.servers);
       setWarn(data && data.warning);
       if (data && data.saved) clearEditor();
@@ -206,12 +307,35 @@
     iina.onMessage("listing", function (data) {
       if (!data) return;
       show("browser");
-      current = data.url || current;
+      if (data.url != null) current = data.url;
       document.getElementById("title").textContent = data.title || "Folder";
       document.getElementById("path").textContent = data.display || current;
       document.getElementById("up").hidden = stack.length === 0;
+      if (data.sort) document.getElementById("sort").value = data.sort;
+      document.getElementById("autoplay").checked = data.autoplay !== false;
       document.getElementById("status").textContent = data.loading ? "Loading…" : (data.error || "");
-      if (!data.loading) renderFiles(data.entries || []);
+      if (!data.loading) {
+        folderEntries = data.entries || [];
+        renderFiles(shownEntries());
+      }
+    });
+    iina.onMessage("discovered", function (data) {
+      show("servers");
+      renderExtra(data && data.rows, function (row) {
+        document.getElementById("name").value = row.name || "";
+        document.getElementById("protocol").value = row.kind || "webdav";
+        document.getElementById("url").value = row.url || "";
+        syncTLS();
+      });
+    });
+    iina.onMessage("saved-items", function (data) {
+      show("servers");
+      renderExtra(data && data.rows, function (row) {
+        if (!row.serverId) return;
+        stack = [];
+        show("browser");
+        post("play-saved", { serverId: row.serverId, href: row.href, parent: row.parent, name: row.name });
+      });
     });
     iina.onMessage("status", function (data) {
       document.getElementById("status").textContent = data && data.text || "";

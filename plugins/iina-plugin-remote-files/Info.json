@@ -1,12 +1,12 @@
 {
   "name": "Remote Files",
   "identifier": "io.iina.remote-files",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": {
     "name": "IINA Immersive 3D contributors",
     "url": "https://github.com/iansutherland74/iina-immersive-3d"
   },
-  "description": "Browse saved WebDAV, FTP, and FTPS servers, play videos, and load subtitles that sit next to them.",
+  "description": "Browse WebDAV, FTP, FTPS, SMB, SFTP, Jellyfin, Plex, Emby, and DLNA. Resume, favourites, subtitles, and folder playlists stay in this plugin.",
   "entry": "main.js",
   "permissions": ["network-request", "file-system"],
   "allowedDomains": ["*"],
@@ -14,6 +14,11 @@
     "name": "Remote"
   },
   "preferenceDefaults": {
-    "servers": "[]"
+    "servers": "[]",
+    "sort": "name",
+    "autoplay": "1",
+    "resume": "{}",
+    "history": "[]",
+    "favourites": "[]"
   }
 }
