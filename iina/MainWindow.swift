@@ -62,10 +62,21 @@ class MainWindow: CommonWindow {
   /// non-zero origin (the measured SmartGlasses 3D frame is (1512, -98, 3840, 1080)) and the
   /// menu-bar / camera-housing area. The default implementation pulls the window into `visibleFrame`.
   override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect {
-    if Immersive3DController.shared.glassesActive {
+    // AppKit's fullscreen-exit transition calls setFrame while quitting. A NaN, infinite,
+    // or empty rect raises in `_reallySetFrame`. Never return one, and don't pass one to super.
+    if Immersive3DController.shared.glassesActive, Immersive3DController.isUsableWindowFrame(frameRect) {
       return frameRect
     }
-    return super.constrainFrameRect(frameRect, to: screen)
+    if Immersive3DController.isUsableWindowFrame(frameRect) {
+      let constrained = super.constrainFrameRect(frameRect, to: screen)
+      if Immersive3DController.isUsableWindowFrame(constrained) {
+        return constrained
+      }
+    }
+    if Immersive3DController.isUsableWindowFrame(frame) {
+      return frame
+    }
+    return Immersive3DController.fallbackWindowFrame()
   }
 }
 

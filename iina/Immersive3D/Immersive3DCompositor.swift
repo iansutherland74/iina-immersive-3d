@@ -57,6 +57,7 @@ final class Immersive3DCompositor {
   /// Already-SBS sources are not passed in here. Returns without drawing if the pass cannot run,
   /// which leaves mpv's frame untouched.
   func process(cglContext: CGLContextObj, layerFBO: GLuint, width: Int, height: Int, whenDepthReady: @escaping () -> Void) {
+    guard !DepthEstimator.shared.isStopped else { return }
     guard width >= 16, height >= 16, !glFailed, !pipelineFailed else { return }
     guard let device, let commandQueue else { return }
     let snapshot = Immersive3DController.shared.currentSnapshot()
