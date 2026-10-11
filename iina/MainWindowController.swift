@@ -859,6 +859,7 @@ class MainWindowController: PlayerWindowController {
       .bottom: videoViewContainer.bottomAnchor.constraint(equalTo: videoView.bottomAnchor)
     ]
     layoutSides.forEach { videoViewConstraints[$0]?.isActive = true }
+    IPTVLiveOverlayController.shared.attachIfNeeded()
   }
 
   func updateVideoViewConstraints(_ constraints: [NSLayoutConstraint.Attribute: CGFloat]) {
@@ -1077,6 +1078,7 @@ class MainWindowController: PlayerWindowController {
   // MARK: - Mouse / Trackpad events
 
   override func keyDown(with event: NSEvent) {
+    if IPTVLiveOverlayController.shared.handleKeyDown(event) { return }
     if isShowingPersistentOSD {
       let keyCode = KeyCodeHelper.mpvKeyCode(from: event)
       let normalizedKeyCode = KeyCodeHelper.normalizeMpv(keyCode)
@@ -1147,6 +1149,9 @@ class MainWindowController: PlayerWindowController {
   }
 
   override func mouseDragged(with event: NSEvent) {
+    if !interactiveMode.isActive {
+      _ = GlassesEyeControls.shared.handlePointer(event)
+    }
     if sidebars.handleMouseDragged(event) {
       return
     }
@@ -1244,6 +1249,12 @@ class MainWindowController: PlayerWindowController {
   }
 
   override func scrollWheel(with event: NSEvent) {
+    if !interactiveMode.isActive, GlassesEyeControls.shared.handleScroll(event) { return }
+    if let container = videoViewContainer,
+       container.bounds.contains(container.convert(event.locationInWindow, from: nil)),
+       IPTVLiveOverlayController.shared.handleScroll(event) {
+      return
+    }
     guard !interactiveMode.isActive else { return }
     if !isMomentumScrollingAllowed && !event.momentumPhase.isEmpty {
       // ignore delta caused by abrupt momentum phases
@@ -1291,6 +1302,7 @@ class MainWindowController: PlayerWindowController {
     if obj == 0 {
       // main window
       isMouseInWindow = true
+      if GlassesEyeControls.shared.handlePointer(event) { return }
       showUI()
       updateTimer()
     } else if obj == 1 {
@@ -1311,6 +1323,10 @@ class MainWindowController: PlayerWindowController {
       // main window
       isMouseInWindow = false
       if oscFloatingView.isDragging { return }
+      if GlassesEyeControls.shared.handlePointerExit() {
+        isMomentumScrollingAllowed = false
+        return
+      }
       destroyTimer()
       hideUI()
       // reset after moved out of window
@@ -1322,6 +1338,7 @@ class MainWindowController: PlayerWindowController {
   }
 
   override func mouseMoved(with event: NSEvent) {
+    if !interactiveMode.isActive, GlassesEyeControls.shared.handlePointer(event) { return }
     guard !interactiveMode.isActive else { return }
 
     refreshSeekTimeAndThumbnail(from: event)

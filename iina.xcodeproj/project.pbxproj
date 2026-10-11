@@ -158,6 +158,7 @@
 		8403CEA72007CBD400645516 /* MediaPlayer.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 8403CEA62007CBD300645516 /* MediaPlayer.framework */; };
 		8407D1401E3A684C0043895D /* ViewLayer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8407D13F1E3A684C0043895D /* ViewLayer.swift */; };
 		A3D1A0012F00000100BEEF01 /* Immersive3DController.swift in Sources */ = {isa = PBXBuildFile; fileRef = A3D1A0022F00000100BEEF02 /* Immersive3DController.swift */; };
+		A3D1A0112F00000100BEEF11 /* GlassesEyeControls.swift in Sources */ = {isa = PBXBuildFile; fileRef = A3D1A0102F00000100BEEF10 /* GlassesEyeControls.swift */; };
 		A3D1A0032F00000100BEEF03 /* DepthEstimator.swift in Sources */ = {isa = PBXBuildFile; fileRef = A3D1A0042F00000100BEEF04 /* DepthEstimator.swift */; };
 		A3D1A0052F00000100BEEF05 /* Immersive3DCompositor.swift in Sources */ = {isa = PBXBuildFile; fileRef = A3D1A0062F00000100BEEF06 /* Immersive3DCompositor.swift */; };
 		A3D1A0072F00000100BEEF07 /* Immersive3D.metal in Sources */ = {isa = PBXBuildFile; fileRef = A3D1A0082F00000100BEEF08 /* Immersive3D.metal */; };
@@ -168,6 +169,7 @@
 		B1E7000A2F00000100BEEF0A /* IPTVGuideView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1E7000B2F00000100BEEF0B /* IPTVGuideView.swift */; };
 		B1E7000C2F00000100BEEF0C /* IPTVTitles.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1E7000D2F00000100BEEF0D /* IPTVTitles.swift */; };
 		B1E7000E2F00000100BEEF0E /* IPTVPosterView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1E7000F2F00000100BEEF0F /* IPTVPosterView.swift */; };
+		B1E700112F00000100BEEF11 /* IPTVLiveOverlay.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1E700102F00000100BEEF10 /* IPTVLiveOverlay.swift */; };
 		840820111ECF6C1800361416 /* FileGroup.swift in Sources */ = {isa = PBXBuildFile; fileRef = 840820101ECF6C1800361416 /* FileGroup.swift */; };
 		840AF5821E732C8F00F4AF92 /* JustXMLRPC.swift in Sources */ = {isa = PBXBuildFile; fileRef = 840AF5811E732C8F00F4AF92 /* JustXMLRPC.swift */; };
 		840AF5841E73CE3900F4AF92 /* OpenSubSubtitle.swift in Sources */ = {isa = PBXBuildFile; fileRef = 840AF5831E73CE3900F4AF92 /* OpenSubSubtitle.swift */; };
@@ -1205,6 +1207,7 @@
 		8403CEA62007CBD300645516 /* MediaPlayer.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = MediaPlayer.framework; path = System/Library/Frameworks/MediaPlayer.framework; sourceTree = SDKROOT; };
 		8407D13F1E3A684C0043895D /* ViewLayer.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = ViewLayer.swift; sourceTree = "<group>"; };
 		A3D1A0022F00000100BEEF02 /* Immersive3DController.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = Immersive3DController.swift; sourceTree = "<group>"; };
+		A3D1A0102F00000100BEEF10 /* GlassesEyeControls.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = GlassesEyeControls.swift; sourceTree = "<group>"; };
 		A3D1A0042F00000100BEEF04 /* DepthEstimator.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = DepthEstimator.swift; sourceTree = "<group>"; };
 		A3D1A0062F00000100BEEF06 /* Immersive3DCompositor.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = Immersive3DCompositor.swift; sourceTree = "<group>"; };
 		A3D1A0082F00000100BEEF08 /* Immersive3D.metal */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.metal; path = Immersive3D.metal; sourceTree = "<group>"; };
@@ -1215,6 +1218,7 @@
 		B1E7000B2F00000100BEEF0B /* IPTVGuideView.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = IPTVGuideView.swift; sourceTree = "<group>"; };
 		B1E7000D2F00000100BEEF0D /* IPTVTitles.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = IPTVTitles.swift; sourceTree = "<group>"; };
 		B1E7000F2F00000100BEEF0F /* IPTVPosterView.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = IPTVPosterView.swift; sourceTree = "<group>"; };
+		B1E700102F00000100BEEF10 /* IPTVLiveOverlay.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = IPTVLiveOverlay.swift; sourceTree = "<group>"; };
 		840820101ECF6C1800361416 /* FileGroup.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = FileGroup.swift; sourceTree = "<group>"; };
 		840AF5811E732C8F00F4AF92 /* JustXMLRPC.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = JustXMLRPC.swift; sourceTree = "<group>"; };
 		840AF5831E73CE3900F4AF92 /* OpenSubSubtitle.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = OpenSubSubtitle.swift; sourceTree = "<group>"; };
@@ -2389,6 +2393,7 @@
 				B1E7000B2F00000100BEEF0B /* IPTVGuideView.swift */,
 				B1E7000D2F00000100BEEF0D /* IPTVTitles.swift */,
 				B1E7000F2F00000100BEEF0F /* IPTVPosterView.swift */,
+				B1E700102F00000100BEEF10 /* IPTVLiveOverlay.swift */,
 			);
 			path = IPTV;
 			sourceTree = "<group>";
@@ -2397,6 +2402,7 @@
 			isa = PBXGroup;
 			children = (
 				A3D1A0022F00000100BEEF02 /* Immersive3DController.swift */,
+				A3D1A0102F00000100BEEF10 /* GlassesEyeControls.swift */,
 				A3D1A0042F00000100BEEF04 /* DepthEstimator.swift */,
 				A3D1A0062F00000100BEEF06 /* Immersive3DCompositor.swift */,
 				A3D1A0082F00000100BEEF08 /* Immersive3D.metal */,
@@ -3121,6 +3127,7 @@
 				E3FEC1332A30400F00CFD845 /* PluginInputManager.swift in Sources */,
 				8407D1401E3A684C0043895D /* ViewLayer.swift in Sources */,
 				A3D1A0012F00000100BEEF01 /* Immersive3DController.swift in Sources */,
+				A3D1A0112F00000100BEEF11 /* GlassesEyeControls.swift in Sources */,
 				A3D1A0032F00000100BEEF03 /* DepthEstimator.swift in Sources */,
 				A3D1A0052F00000100BEEF05 /* Immersive3DCompositor.swift in Sources */,
 				A3D1A0072F00000100BEEF07 /* Immersive3D.metal in Sources */,
@@ -3131,6 +3138,7 @@
 				B1E7000A2F00000100BEEF0A /* IPTVGuideView.swift in Sources */,
 				B1E7000C2F00000100BEEF0C /* IPTVTitles.swift in Sources */,
 				B1E7000E2F00000100BEEF0E /* IPTVPosterView.swift in Sources */,
+				B1E700112F00000100BEEF11 /* IPTVLiveOverlay.swift in Sources */,
 				E3B93C872FE9F77600803513 /* InteractiveMode.swift in Sources */,
 				E3D94E822FD0649A00B08618 /* UIHelper.swift in Sources */,
 				E3A239B12FCB4D0900CE6ACC /* SidebarPane.swift in Sources */,
