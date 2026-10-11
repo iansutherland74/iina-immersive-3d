@@ -138,3 +138,25 @@ kernel void immersiveScaleRGBA(
   float4 color = source.sample(linear, float2(u, v));
   dest.write(color, gid);
 }
+
+// Copies a top-down sub-rectangle into its own texture. Depth and the stereo
+// kernel then see only that rectangle. rect is normalized (x, y, w, h).
+struct CaptureCropRect {
+  float x;
+  float y;
+  float w;
+  float h;
+};
+
+kernel void immersiveCropBGRA(
+  texture2d<float, access::sample> source [[texture(0)]],
+  texture2d<float, access::write> dest [[texture(1)]],
+  constant CaptureCropRect &rect [[buffer(0)]],
+  uint2 gid [[thread_position_in_grid]]
+) {
+  if (gid.x >= dest.get_width() || gid.y >= dest.get_height()) return;
+  constexpr sampler linear(coord::normalized, address::clamp_to_edge, filter::linear);
+  const float u = rect.x + (float(gid.x) + 0.5) / float(dest.get_width()) * rect.w;
+  const float v = rect.y + (float(gid.y) + 0.5) / float(dest.get_height()) * rect.h;
+  dest.write(source.sample(linear, float2(u, v)), gid);
+}

@@ -6,8 +6,9 @@
 //  Based on IINA, Copyright (C) 2017-2026 Collider LI and contributors.
 //  Licensed under the GNU General Public License, version 3.
 //
-//  One window, captured with the public ScreenCaptureKit API. Audio is not
-//  captured. Protected video that macOS returns black is reported and left black.
+//  One window, captured with the public ScreenCaptureKit API. On macOS 13 and
+//  later the same stream can include that window's audio. Protected video that
+//  macOS returns black is reported and left black.
 
 import Cocoa
 import CoreMedia
@@ -31,18 +32,31 @@ final class BrowserCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
   static let shared = BrowserCaptureManager()
 
   static let protectedMessage = "This window is black because macOS is not sharing its picture. Protected video (DRM) stays black. IINA uses only the normal screen capture and does not try to bypass that. Choose a window whose picture is visible, or open the file in IINA."
+  static let muteNeedsNewerOS = "Muting another app needs macOS 14.2. Until then the other app keeps playing, and IINA plays the capture too."
 
   private let queue = DispatchQueue(label: "com.colliderli.iina.browser-capture", qos: .userInteractive)
+  private let audioQueue = DispatchQueue(label: "com.colliderli.iina.browser-capture-audio-in", qos: .userInteractive)
+  private let audioPlayer = BrowserCaptureAudioPlayer()
   private var stream: SCStream?
   private var running = false
   private var accepting = false
   private(set) var currentID: CGWindowID?
+  private(set) var sourcePID: pid_t?
+  private(set) var audioActive = false
 
-  var onFrame: ((CVPixelBuffer) -> Void)?
+  var onFrame: ((CVPixelBuffer, CMTime) -> Void)?
   var onStatus: ((String?) -> Void)?
+  var onNote: ((String) -> Void)?
+  var onMuteChanged: (() -> Void)?
 
   private override init() {
     super.init()
+    audioPlayer.onNote = { [weak self] text in
+      self?.onNote?(text)
+    }
+    audioPlayer.onStatus = { [weak self] text in
+      self?.onStatus?(text)
+    }
   }
 
   func permissionGranted() -> Bool {
@@ -93,15 +107,32 @@ final class BrowserCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
     configuration.pixelFormat = kCVPixelFormatType_32BGRA
     configuration.showsCursor = false
     configuration.queueDepth = 3
+    var captureAudio = false
     if #available(macOS 13.0, *) {
-      configuration.capturesAudio = false
+      captureAudio = BrowserCaptureSettings.shared.wantsAudio
+      configuration.capturesAudio = captureAudio
       configuration.minimumFrameInterval = CMTime(value: 1, timescale: 30)
+      if captureAudio {
+        configuration.sampleRate = 48000
+        configuration.channelCount = 2
+        configuration.excludesCurrentProcessAudio = true
+      }
     }
     let filter = SCContentFilter(desktopIndependentWindow: window)
     let stream = SCStream(filter: filter, configuration: configuration, delegate: self)
     try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: queue)
+    var audioProblem: String?
+    if #available(macOS 13.0, *), captureAudio {
+      do {
+        try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: audioQueue)
+      } catch {
+        captureAudio = false
+        audioProblem = "Window audio did not start (\(error.localizedDescription)). The picture still captures, and sound stays in the other app."
+      }
+    }
     self.stream = stream
     currentID = windowID
+    sourcePID = window.owningApplication?.processID
     accepting = true
     do {
       try await start(stream)
@@ -109,16 +140,36 @@ final class BrowserCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
       accepting = false
       self.stream = nil
       currentID = nil
+      sourcePID = nil
       throw error
     }
     running = true
-    log3D("Browser capture started for window \(windowID) at \(size.width)x\(size.height)", level: .debug)
+    audioActive = captureAudio
+    if captureAudio {
+      audioPlayer.start()
+    }
+    if BrowserCaptureSettings.shared.wantsMute {
+      applyMute()
+    }
+    if let audioProblem {
+      DispatchQueue.main.async { [weak self] in
+        self?.onNote?(audioProblem)
+      }
+    }
+    log3D("Browser capture started for window \(windowID) at \(size.width)x\(size.height) audio=\(captureAudio)", level: .debug)
   }
 
   func stop() async {
     accepting = false
     running = false
+    audioActive = false
     currentID = nil
+    sourcePID = nil
+    audioPlayer.setSourceMuteActive(false)
+    audioPlayer.stop()
+    if #available(macOS 14.2, *) {
+      BrowserCaptureSourceMute.shared.stop()
+    }
     guard let stream else { return }
     self.stream = nil
     await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
@@ -130,11 +181,26 @@ final class BrowserCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
 
   var isRunning: Bool { running }
 
+  func setSourceMuted(_ on: Bool) {
+    BrowserCaptureSettings.shared.setMuteSource(on)
+    applyMute()
+  }
+
+  func notePresentedVideo(_ time: CMTime) {
+    guard audioActive else { return }
+    audioPlayer.notePresentedVideo(time)
+  }
+
   func perform(_ block: @escaping () -> Void) {
     queue.async(execute: block)
   }
 
   func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
+    if #available(macOS 13.0, *), type == .audio {
+      guard accepting else { return }
+      audioPlayer.consumeCapture(sampleBuffer)
+      return
+    }
     guard accepting, type == .screen else { return }
     if frameStatus(of: sampleBuffer) == .blank {
       DispatchQueue.main.async { [weak self] in
@@ -143,18 +209,58 @@ final class BrowserCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
       return
     }
     guard let buffer = sampleBuffer.imageBuffer else { return }
-    onFrame?(buffer)
+    onFrame?(buffer, CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
   }
 
   func stream(_ stream: SCStream, didStopWithError error: Error) {
     guard accepting else { return }
     accepting = false
     running = false
+    audioActive = false
     let text = error.localizedDescription
+    DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+      self?.audioPlayer.setSourceMuteActive(false)
+      self?.audioPlayer.stop()
+      if #available(macOS 14.2, *) {
+        BrowserCaptureSourceMute.shared.stop()
+      }
+    }
     DispatchQueue.main.async { [weak self] in
       self?.onStatus?(text)
     }
     log3D("Browser capture stopped: \(text)", level: .error)
+  }
+
+  private func applyMute() {
+    let wants = BrowserCaptureSettings.shared.wantsMute && running
+    guard wants, let pid = sourcePID, pid > 0 else {
+      if #available(macOS 14.2, *) {
+        BrowserCaptureSourceMute.shared.stop()
+      }
+      audioPlayer.setSourceMuteActive(false)
+      return
+    }
+    if #available(macOS 14.2, *) {
+      if let message = BrowserCaptureSourceMute.shared.start(pid: pid) {
+        BrowserCaptureSettings.shared.setMuteSource(false)
+        audioPlayer.setSourceMuteActive(false)
+        DispatchQueue.main.async { [weak self] in
+          self?.onStatus?(message)
+          self?.onMuteChanged?()
+        }
+        return
+      }
+      audioPlayer.setSourceMuteActive(true)
+      DispatchQueue.main.async { [weak self] in
+        self?.onNote?("Source app is muted. IINA plays its audio with the picture.")
+      }
+    } else {
+      BrowserCaptureSettings.shared.setMuteSource(false)
+      DispatchQueue.main.async { [weak self] in
+        self?.onNote?(Self.muteNeedsNewerOS)
+        self?.onMuteChanged?()
+      }
+    }
   }
 
   private func loadContent() async throws -> SCShareableContent {
