@@ -237,7 +237,8 @@ class MainWindowController: PlayerWindowController {
   var fsState: FullScreenState = .windowed {
     didSet {
       // Must not access mpv while it is asynchronously processing stop and quit commands.
-      guard player.info.state.active else { return }
+      // Replacing the saved frame during quit must not tell mpv to enter fullscreen again.
+      guard player.info.state.active, !Immersive3DController.shared.isShuttingDown else { return }
       switch fsState {
       case .fullscreen: player.mpv.setFlag(MPVOption.Window.fullscreen, true)
       case .animating:  break
@@ -1496,11 +1497,15 @@ class MainWindowController: PlayerWindowController {
     if NSMenu.menuBarVisible() {
       NSMenu.setMenuBarVisible(false)
     }
-    let priorWindowedFrame = fsState.priorWindowedFrame!
+    let proposed = fsState.priorWindowedFrame ?? .zero
+    guard let frame = Immersive3DController.windowedFrameRestoring(proposed) else {
+      log("Skipped full screen exit animation; no screen can hold the window", level: .error)
+      return
+    }
 
     NSAnimationContext.runAnimationGroup({ context in
       context.duration = duration
-      window.animator().setFrame(priorWindowedFrame, display: true, animate: !Preference.bool(for: PK.disableAnimations))
+      window.animator().setFrame(frame, display: true, animate: !Preference.bool(for: PK.disableAnimations))
     }, completionHandler: nil)
 
     NSMenu.setMenuBarVisible(true)
@@ -1703,8 +1708,13 @@ class MainWindowController: PlayerWindowController {
 
     if Preference.bool(for: PK.disableAnimations) {
       // When animation is not used exiting full screen does not restore the previous size of the
-      // window. Restore it now.
-      window!.setFrame(fsState.priorWindowedFrame!, display: true, animate: false)
+      // window. Restore it now, unless that rect is not a real window frame.
+      let proposed = fsState.priorWindowedFrame ?? .zero
+      if let frame = Immersive3DController.windowedFrameRestoring(proposed) {
+        window!.setFrame(frame, display: true, animate: false)
+      } else {
+        log("Skipped restoring the pre-fullscreen frame; no screen can hold the window", level: .error)
+      }
     }
 
     window?.titlebarAppearsTransparent = true
@@ -1942,16 +1952,26 @@ class MainWindowController: PlayerWindowController {
   // MARK: - Window delegate: Size
 
   func windowWillResize(_ sender: NSWindow, to frameSize: NSSize) -> NSSize {
-    guard loaded, let window else { return frameSize }
+    func finite(_ size: NSSize) -> NSSize {
+      Immersive3DController.isUsableSize(size) ? size : Immersive3DController.safeAspect(.zero)
+    }
+    guard loaded, let window else { return finite(frameSize) }
+    // A NaN size here becomes the rect `_reallySetFrame` rejects while quitting.
+    guard Immersive3DController.isUsableSize(frameSize) else {
+      return finite(window.frame.size)
+    }
+    if Immersive3DController.shared.glassesActive {
+      return frameSize
+    }
     // disable resizing in interactive mode, little benefit but complicates the layout logic
     if interactiveMode.isActive {
-      return window.frame.size
+      return finite(window.frame.size)
     }
     if !window.inLiveResize {
       liveText.clearAnalysis()
     }
     if frameSize.height <= AppData.mainWindowMinSize.height || frameSize.width <= AppData.mainWindowMinSize.width {
-      return currentWindowAspectRatio.grow(toSize: AppData.mainWindowMinSize)
+      return finite(currentWindowAspectRatio.grow(toSize: AppData.mainWindowMinSize))
     }
     return frameSize
   }
@@ -2374,8 +2394,7 @@ class MainWindowController: PlayerWindowController {
   private func setWindowAspectRatio(_ aspectRatio: NSSize) {
     guard let window else { return }
     if Immersive3DController.shared.glassesActive {
-      window.aspectRatio = .zero
-      window.contentAspectRatio = .zero
+      Immersive3DController.shared.lockGlassesAspectToScreen()
       return
     }
     if Preference.unlockWindowAspectRatio {
@@ -2491,6 +2510,19 @@ class MainWindowController: PlayerWindowController {
     return lastScreen
   }
 
+  /// Fullscreen exit restores this rect. Replace it when it is not a finite windowed frame.
+  func replacePriorFullScreenFrame(with frame: NSRect) {
+    let validatedFrame = Immersive3DController.shared.isShuttingDown
+      ? Immersive3DController.terminationWindowFrame(frame)
+      : Immersive3DController.windowedFrameRestoring(frame)
+    guard fsState.priorWindowedFrame != nil, let validated = validatedFrame else { return }
+    if let current = fsState.priorWindowedFrame, Immersive3DController.isUsableWindowFrame(current),
+       Immersive3DController.framesMatch(current, validated) {
+      return
+    }
+    fsState.priorWindowedFrame = validated
+  }
+
   override func handleVideoSizeChange() {
     handleVideoSizeChange(keepWindowSize: false)
   }
@@ -2499,8 +2531,7 @@ class MainWindowController: PlayerWindowController {
   func handleVideoSizeChange(keepWindowSize: Bool) {
     guard loaded, let window else { return }
     if Immersive3DController.shared.glassesActive {
-      window.aspectRatio = .zero
-      window.contentAspectRatio = .zero
+      Immersive3DController.shared.lockGlassesAspectToScreen()
       return
     }
 

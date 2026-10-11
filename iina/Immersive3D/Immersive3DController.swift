@@ -108,9 +108,13 @@ final class Immersive3DController: NSObject, NSWindowDelegate {
   private var isPinningGlasses = false
   private var applyingDisplayConfig = false
   private var lastMirrorConfigure = Date.distantPast
+  private var shuttingDown = false
+  private var didPrepareForTermination = false
   private var savedMirrorLinks: [SavedMirrorLink]?
   private var screenParameterObserver: NSObjectProtocol?
   private(set) var glassesActive = false
+  /// True after quit teardown starts. Fullscreen-state changes must not talk to mpv.
+  var isShuttingDown: Bool { shuttingDown }
 
   private static let mirrorPromptDefaultsKey = "immersive3DDidExplainMirroring"
 
@@ -383,9 +387,11 @@ final class Immersive3DController: NSObject, NSWindowDelegate {
   }
 
   func mainWindowWillClose() {
-    if glassesActive {
-      exitGlasses()
-    }
+    // Leave Play on Glasses before AppKit tears the window down, then drop any depth
+    // map that exit may have requested. In-flight Core ML still finishes, but it will
+    // not publish. A later file can submit again; quit uses `shutdown` instead.
+    exitGlasses(restoreUI: false)
+    DepthEstimator.shared.cancelPending()
   }
 
   private func beginGlasses(on screen: NSScreen) {
@@ -404,6 +410,7 @@ final class Immersive3DController: NSObject, NSWindowDelegate {
   }
 
   private func enterGlasses(on screen: NSScreen) {
+    guard !shuttingDown else { return }
     let player = PlayerCore.active
     guard let window = player.mainWindow.window else { return }
     if savedWindow == nil {
@@ -459,7 +466,7 @@ final class Immersive3DController: NSObject, NSWindowDelegate {
 
   /// Borderless, above other windows, frame exactly `screen.frame`, drawable at the screen's pixel size.
   private func pinGlassesWindow(to screen: NSScreen) {
-    guard !isPinningGlasses else { return }
+    guard !shuttingDown, !isPinningGlasses else { return }
     let player = PlayerCore.active
     guard let window = player.mainWindow.window else { return }
     isPinningGlasses = true
@@ -480,8 +487,11 @@ final class Immersive3DController: NSObject, NSWindowDelegate {
     window.minSize = NSSize(width: 1, height: 1)
     window.contentMinSize = NSSize(width: 1, height: 1)
     window.resizeIncrements = NSSize(width: 1, height: 1)
-    window.aspectRatio = .zero
-    window.contentAspectRatio = .zero
+    // A zero aspect makes AppKit's fullscreen-exit setFrame produce NaN. Use the
+    // screen size, which is non-zero and matches the frame we are about to apply.
+    let aspect = Self.safeAspect(screen.frame.size)
+    window.aspectRatio = aspect
+    window.contentAspectRatio = aspect
     // `screen.frame` is in the global desktop. Extended SmartGlasses sit beside the
     // built-in display, for example (1512, -98, 3840, 1080), not at (0, 0).
     applyGlassesFrame(screen.frame, to: window)
@@ -507,6 +517,10 @@ final class Immersive3DController: NSObject, NSWindowDelegate {
   /// Puts the window on `target` exactly. Origin is applied last because `setContentSize`
   /// keeps the top-left corner fixed.
   private func applyGlassesFrame(_ target: NSRect, to window: NSWindow) {
+    guard Self.isUsableWindowFrame(target) else {
+      log3D("Skipped glasses setFrame; unusable \(Self.frameDescription(target))", level: .error)
+      return
+    }
     window.setFrame(target, display: true, animate: false)
     window.setFrameOrigin(target.origin)
     let sizeDrift = abs(window.frame.width - target.width) > 0.5 || abs(window.frame.height - target.height) > 0.5
@@ -516,13 +530,106 @@ final class Immersive3DController: NSObject, NSWindowDelegate {
     }
   }
 
+  /// Keeps a non-zero aspect equal to the glasses screen so a later setFrame cannot divide by zero.
+  func lockGlassesAspectToScreen() {
+    guard glassesActive, !PlayerCore.playerCores.isEmpty, let window = PlayerCore.active.mainWindow.window else { return }
+    let size = (resolvedGlassesScreen() ?? window.screen)?.frame.size ?? window.frame.size
+    let aspect = Self.safeAspect(size)
+    window.aspectRatio = aspect
+    window.contentAspectRatio = aspect
+  }
+
+  /// Stop glasses mode, restore a real window frame, then put mirroring back. Idempotent.
+  /// Called from quit before AppKit's fullscreen-exit transition, and from window close.
+  func prepareForApplicationTermination() {
+    guard !didPrepareForTermination else { return }
+    didPrepareForTermination = true
+    shuttingDown = true
+    pendingDisplayID = nil
+    stopObservingScreenParameters()
+    DepthEstimator.shared.shutdown()
+    exitGlasses(closePanel: true)
+    guard !PlayerCore.playerCores.isEmpty else { return }
+    let main = PlayerCore.active.mainWindow
+    if let prior = main.fsState.priorWindowedFrame {
+      main.replacePriorFullScreenFrame(with: prior)
+    }
+    if let window = main.window {
+      if !Self.isUsableAspect(window.aspectRatio) {
+        window.aspectRatio = Self.safeAspect(.zero)
+      }
+      if !Self.isUsableAspect(window.contentAspectRatio) {
+        window.contentAspectRatio = Self.safeAspect(.zero)
+      }
+    }
+  }
+
   private static func frameDescription(_ frame: NSRect) -> String {
-    "(\(Int(frame.origin.x.rounded())), \(Int(frame.origin.y.rounded())), \(Int(frame.width.rounded())), \(Int(frame.height.rounded())))"
+    func text(_ value: CGFloat) -> String {
+      value.isFinite ? String(Int(value.rounded())) : "nan"
+    }
+    return "(\(text(frame.origin.x)), \(text(frame.origin.y)), \(text(frame.width)), \(text(frame.height)))"
+  }
+
+  static func isUsableSize(_ size: NSSize) -> Bool {
+    size.width.isFinite && size.height.isFinite && size.width >= 1 && size.height >= 1
+      && size.width <= 16_000 && size.height <= 16_000
+  }
+
+  static func isUsableAspect(_ size: NSSize) -> Bool {
+    isUsableSize(size)
+  }
+
+  static func safeAspect(_ size: NSSize) -> NSSize {
+    isUsableAspect(size) ? size : NSSize(width: 16, height: 9)
+  }
+
+  /// Finite, non-zero, not huge, and overlapping a connected screen.
+  static func isUsableWindowFrame(_ frame: NSRect) -> Bool {
+    guard frame.origin.x.isFinite, frame.origin.y.isFinite, isUsableSize(frame.size) else { return false }
+    return NSScreen.screens.contains { $0.frame.intersects(frame) }
+  }
+
+  static func fallbackWindowFrame() -> NSRect {
+    let screen = NSScreen.screens.first { isBuiltIn($0) } ?? NSScreen.main ?? NSScreen.screens.first
+    let visible = screen?.visibleFrame ?? NSRect(x: 80, y: 80, width: 960, height: 540)
+    let width = min(max(visible.width * 0.7, 50), 960)
+    let height = min(max(visible.height * 0.7, 50), 540)
+    return NSRect(x: visible.midX - width / 2, y: visible.midY - height / 2, width: width, height: height)
+  }
+
+  /// Finite, non-zero, and overlapping a connected screen. Used when leaving fullscreen
+  /// or Play on Glasses while that screen is still there.
+  static func windowedFrameRestoring(_ proposed: NSRect) -> NSRect? {
+    if isUsableWindowFrame(proposed) {
+      return proposed
+    }
+    guard !NSScreen.screens.isEmpty else { return nil }
+    let fallback = fallbackWindowFrame()
+    return isUsableWindowFrame(fallback) ? fallback : nil
+  }
+
+  /// Quit path. Prefer a rect on the built-in display so a later mirror restore cannot
+  /// leave AppKit setFrame'ing the glasses rect `(1512, -98, 3840, 1080)`.
+  static func terminationWindowFrame(_ proposed: NSRect) -> NSRect? {
+    if isUsableWindowFrame(proposed), intersectsStableScreen(proposed) {
+      return proposed
+    }
+    guard !NSScreen.screens.isEmpty else { return nil }
+    let fallback = fallbackWindowFrame()
+    return isUsableWindowFrame(fallback) ? fallback : nil
+  }
+
+  private static func intersectsStableScreen(_ frame: NSRect) -> Bool {
+    if let builtIn = NSScreen.screens.first(where: { isBuiltIn($0) }) {
+      return builtIn.frame.intersects(frame)
+    }
+    return NSScreen.screens.contains { $0.frame.intersects(frame) }
   }
 
   /// Called after a resize that was not started by `pinGlassesWindow`. Resolution changes use the screen observer.
   func repinGlassesWindowIfNeeded() {
-    guard glassesActive, !isPinningGlasses, let screen = resolvedGlassesScreen() else { return }
+    guard !shuttingDown, glassesActive, !isPinningGlasses, let screen = resolvedGlassesScreen() else { return }
     guard let window = PlayerCore.active.mainWindow.window else { return }
     let scale = screen.backingScaleFactor
     let layerScale = PlayerCore.active.mainWindow.videoView.videoLayer.contentsScale
@@ -554,7 +661,7 @@ final class Immersive3DController: NSObject, NSWindowDelegate {
   }
 
   private func glassesScreenParametersChanged() {
-    guard glassesActive, !isPinningGlasses, !applyingDisplayConfig else { return }
+    guard !shuttingDown, glassesActive, !isPinningGlasses, !applyingDisplayConfig else { return }
     // A 2D/3D mode switch can put the glasses back into a mirror set.
     if ensureGlassesExtended() {
       playerOSD("Glasses set to an extended display")
@@ -622,22 +729,26 @@ final class Immersive3DController: NSObject, NSWindowDelegate {
     }
   }
 
-  func exitGlasses(closePanel: Bool = true) {
-    guard let saved = savedWindow else {
+  func exitGlasses(closePanel: Bool = true, restoreUI: Bool = true) {
+    let saved = savedWindow
+    if !glassesActive && saved == nil {
       hidePanel(close: closePanel)
-      glassesActive = false
-      glassesFullSizeEyes = false
-      glassesUUID = nil
       stopObservingScreenParameters()
       restoreMirroringIfNeeded()
       return
     }
-    let player = PlayerCore.active
     glassesActive = false
     glassesFullSizeEyes = false
+    pendingDisplayID = nil
+    // Drop the screen observer before setFrame or display reconfiguration, so a
+    // parameter change cannot pin the window again mid-quit.
     stopObservingScreenParameters()
-    if let window = player.mainWindow.window {
-      window.styleMask = saved.styleMask
+    let player = PlayerCore.playerCores.isEmpty ? nil : PlayerCore.active
+    if let saved, let window = player?.mainWindow.window {
+      let aspect = Self.safeAspect(saved.aspectRatio)
+      let contentAspect = Self.safeAspect(saved.contentAspectRatio)
+      window.aspectRatio = aspect
+      window.contentAspectRatio = contentAspect
       window.level = saved.level
       window.collectionBehavior = saved.collectionBehavior
       window.isMovable = saved.isMovable
@@ -650,24 +761,42 @@ final class Immersive3DController: NSObject, NSWindowDelegate {
       window.minSize = saved.minSize
       window.contentMinSize = saved.contentMinSize
       window.resizeIncrements = saved.resizeIncrements
-      window.aspectRatio = saved.aspectRatio
-      window.contentAspectRatio = saved.contentAspectRatio
-      window.setFrame(saved.frame, display: true, animate: false)
-      player.mainWindow.setGlassesVideoFill(false)
-      player.mainWindow.setWindowToolbar()
-      player.mainWindow.videoView.videoLayer.contentsScale = window.backingScaleFactor
+      let nativeFullScreen = window.styleMask.contains(.fullScreen)
+      let restored = shuttingDown ? Self.terminationWindowFrame(saved.frame) : Self.windowedFrameRestoring(saved.frame)
+      if nativeFullScreen {
+        // AppKit exits native fullscreen itself on quit. Give it a windowed rect that
+        // still intersects a screen, instead of calling setFrame while `.fullScreen` is set.
+        if let restored {
+          player?.mainWindow.replacePriorFullScreenFrame(with: restored)
+        }
+      } else {
+        var style = saved.styleMask
+        style.remove(.fullScreen)
+        window.styleMask = style
+        if let restored {
+          window.setFrame(restored, display: true, animate: false)
+        } else {
+          log3D("Skipped restoring the pre-glasses frame; no screen is available", level: .error)
+        }
+        player?.mainWindow.setGlassesVideoFill(false)
+        player?.mainWindow.setWindowToolbar()
+        player?.mainWindow.videoView.videoLayer.contentsScale = window.backingScaleFactor
+      }
     }
-    player.disableUI = saved.disableUI
+    if let saved, let player {
+      player.disableUI = saved.disableUI
+      Preference.set(saved.immersiveWasEnabled, for: .immersive3DEnabled)
+    }
     savedWindow = nil
     glassesScreen = nil
     glassesDisplayID = nil
     glassesUUID = nil
-    pendingDisplayID = nil
     hidePanel(close: closePanel)
-    Preference.set(saved.immersiveWasEnabled, for: .immersive3DEnabled)
-    publishAndRedraw()
-    if !saved.disableUI {
-      player.mainWindow.showUI()
+    if restoreUI, !shuttingDown, let saved, let player {
+      publishAndRedraw()
+      if !saved.disableUI {
+        player.mainWindow.showUI()
+      }
     }
     restoreMirroringIfNeeded()
   }

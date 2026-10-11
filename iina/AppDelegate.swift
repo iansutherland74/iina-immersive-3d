@@ -494,6 +494,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
   func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
     Logger.log("App should terminate")
     isTerminating = true
+    // Leave Play on Glasses and stop depth before AppKit exits fullscreen. That transition
+    // setFrames the pre-fullscreen rect on the main queue, and a zero aspect or the glasses
+    // screen rect crashes `_reallySetFrame`.
+    Immersive3DController.shared.prepareForApplicationTermination()
     MemoryUsage.shared.logUsage("before terminating")
 
     // Normally termination happens fast enough that the user does not have time to initiate
@@ -746,6 +750,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
 
   func applicationWillTerminate(_ notification: Notification) {
     Logger.log("App will terminate")
+    Immersive3DController.shared.prepareForApplicationTermination()
     Logger.closeLogFile()
   }
 

@@ -204,6 +204,7 @@ final class DepthEstimator {
   private var loadState: LoadState = .idle
   private var loadGeneration: UInt64 = 0
   private var generation: UInt64 = 0
+  private var stopped = false
   private var inFlight = Set<ObjectIdentifier>()
   private var filters: [ObjectIdentifier: DepthTemporalFilter] = [:]
   private var results: [ObjectIdentifier: DepthImage] = [:]
@@ -220,6 +221,10 @@ final class DepthEstimator {
 
   func ensureLoaded() {
     lock.lock()
+    if stopped {
+      lock.unlock()
+      return
+    }
     if loadState == .failed {
       loadState = .idle
       didAlert = false
@@ -238,6 +243,10 @@ final class DepthEstimator {
   /// Drop the loaded network and load whatever the settings picker currently names.
   func reload() {
     lock.lock()
+    if stopped {
+      lock.unlock()
+      return
+    }
     loadGeneration &+= 1
     generation &+= 1
     filters.removeAll()
@@ -276,10 +285,42 @@ final class DepthEstimator {
     lock.unlock()
   }
 
+  /// Drop queued results. An in-flight `MLModel.prediction` still runs, then its callback is ignored.
+  /// Later `submit` calls are allowed; use `shutdown` when the process is quitting.
+  func cancelPending() {
+    lock.lock()
+    generation &+= 1
+    filters.removeAll()
+    results.removeAll()
+    lock.unlock()
+  }
+
+  /// Quit. In-flight Core ML work cannot be cancelled, but it will not publish a map or start another one.
+  func shutdown() {
+    lock.lock()
+    stopped = true
+    loadGeneration &+= 1
+    generation &+= 1
+    model = nil
+    inputBuffer = nil
+    inputWidth = 0
+    inputHeight = 0
+    loadState = .failed
+    filters.removeAll()
+    results.removeAll()
+    lock.unlock()
+  }
+
+  var isStopped: Bool {
+    lock.lock()
+    defer { lock.unlock() }
+    return stopped
+  }
+
   /// Drop the job when one is already running for `token`. Completion runs on the depth queue.
   func submit(topDownRGBA: [UInt8], width: Int, height: Int, token: ObjectIdentifier, whenReady: @escaping () -> Void) {
     lock.lock()
-    guard loadState == .ready, model != nil else {
+    guard !stopped, loadState == .ready, model != nil else {
       lock.unlock()
       return
     }
@@ -300,12 +341,12 @@ final class DepthEstimator {
         self.lock.unlock()
       }
       self.lock.lock()
-      let stillCurrent = generation == self.generation
+      let stillCurrent = !self.stopped && generation == self.generation
       self.lock.unlock()
       guard stillCurrent else { return }
       guard let depth = self.predict(topDownRGBA: pixels, width: width, height: height, token: token) else { return }
       self.lock.lock()
-      guard generation == self.generation else {
+      guard !self.stopped, generation == self.generation else {
         self.lock.unlock()
         return
       }
