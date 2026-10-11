@@ -10,6 +10,9 @@
 //  The layer framebuffer already holds the decoded frame (subtitles included).
 //  This copies it to an IOSurface, estimates depth asynchronously, and replaces
 //  the framebuffer with a full-frame side-by-side image from the Metal kernel.
+//  Live captions do not feed this pass a second clock. Depth is whatever frame
+//  mpv has drawn. When sync mode holds a live stream in the demuxer cache, that
+//  frame is the delayed one, so the stereo picture stays with the delayed audio.
 
 import Cocoa
 import CoreVideo

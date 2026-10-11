@@ -171,6 +171,8 @@
 		B1E7000E2F00000100BEEF0E /* IPTVPosterView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1E7000F2F00000100BEEF0F /* IPTVPosterView.swift */; };
 		B1E700112F00000100BEEF11 /* IPTVLiveOverlay.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1E700102F00000100BEEF10 /* IPTVLiveOverlay.swift */; };
 		B1E700132F00000100BEEF13 /* IPTVBrowseOverlay.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1E700122F00000100BEEF12 /* IPTVBrowseOverlay.swift */; };
+		C1E800112F00000100BEEF11 /* LiveCaptionEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = C1E800102F00000100BEEF10 /* LiveCaptionEngine.swift */; };
+		C1E800132F00000100BEEF13 /* LiveCaptionOverlay.swift in Sources */ = {isa = PBXBuildFile; fileRef = C1E800122F00000100BEEF12 /* LiveCaptionOverlay.swift */; };
 		840820111ECF6C1800361416 /* FileGroup.swift in Sources */ = {isa = PBXBuildFile; fileRef = 840820101ECF6C1800361416 /* FileGroup.swift */; };
 		840AF5821E732C8F00F4AF92 /* JustXMLRPC.swift in Sources */ = {isa = PBXBuildFile; fileRef = 840AF5811E732C8F00F4AF92 /* JustXMLRPC.swift */; };
 		840AF5841E73CE3900F4AF92 /* OpenSubSubtitle.swift in Sources */ = {isa = PBXBuildFile; fileRef = 840AF5831E73CE3900F4AF92 /* OpenSubSubtitle.swift */; };
@@ -1221,6 +1223,8 @@
 		B1E7000F2F00000100BEEF0F /* IPTVPosterView.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = IPTVPosterView.swift; sourceTree = "<group>"; };
 		B1E700102F00000100BEEF10 /* IPTVLiveOverlay.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = IPTVLiveOverlay.swift; sourceTree = "<group>"; };
 		B1E700122F00000100BEEF12 /* IPTVBrowseOverlay.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = IPTVBrowseOverlay.swift; sourceTree = "<group>"; };
+		C1E800102F00000100BEEF10 /* LiveCaptionEngine.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = LiveCaptionEngine.swift; sourceTree = "<group>"; };
+		C1E800122F00000100BEEF12 /* LiveCaptionOverlay.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = LiveCaptionOverlay.swift; sourceTree = "<group>"; };
 		840820101ECF6C1800361416 /* FileGroup.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = FileGroup.swift; sourceTree = "<group>"; };
 		840AF5811E732C8F00F4AF92 /* JustXMLRPC.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = JustXMLRPC.swift; sourceTree = "<group>"; };
 		840AF5831E73CE3900F4AF92 /* OpenSubSubtitle.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = OpenSubSubtitle.swift; sourceTree = "<group>"; };
@@ -2401,6 +2405,15 @@
 			path = IPTV;
 			sourceTree = "<group>";
 		};
+		C1E800092F00000100BEEF09 /* LiveCaptions */ = {
+			isa = PBXGroup;
+			children = (
+				C1E800102F00000100BEEF10 /* LiveCaptionEngine.swift */,
+				C1E800122F00000100BEEF12 /* LiveCaptionOverlay.swift */,
+			);
+			path = LiveCaptions;
+			sourceTree = "<group>";
+		};
 		A3D1A0092F00000100BEEF09 /* Immersive3D */ = {
 			isa = PBXGroup;
 			children = (
@@ -2474,6 +2487,7 @@
 				518DB7002FA6A1480024F0B0 /* Scripts */,
 				A3D1A0092F00000100BEEF09 /* Immersive3D */,
 				B1E700092F00000100BEEF09 /* IPTV */,
+				C1E800092F00000100BEEF09 /* LiveCaptions */,
 			);
 			indentWidth = 2;
 			path = iina;
@@ -2928,7 +2942,7 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/bash;
-			shellScript = "echo \"Copy symlinks:\"\n\nfor file in \"${SRCROOT}/deps/lib/\"*.dylib; do\n    if [[ -h \"$file\" ]]; then\n        cp -R $file \"${TARGET_BUILD_DIR}/${FRAMEWORKS_FOLDER_PATH}/$(basename $file)\"\n    fi\ndone\n";
+			shellScript = "echo \"Copy symlinks:\"\n\nfor file in \"${SRCROOT}/deps/lib/\"*.dylib; do\n    if [[ -h \"$file\" ]]; then\n        cp -R $file \"${TARGET_BUILD_DIR}/${FRAMEWORKS_FOLDER_PATH}/$(basename $file)\"\n    fi\ndone\n\nWHISPER_LIB=\"${SRCROOT}/deps/lib/libiina_whisper.dylib\"\nif [[ -f \"$WHISPER_LIB\" ]]; then\n  mkdir -p \"${TARGET_BUILD_DIR}/${FRAMEWORKS_FOLDER_PATH}\"\n  cp -f \"$WHISPER_LIB\" \"${TARGET_BUILD_DIR}/${FRAMEWORKS_FOLDER_PATH}/libiina_whisper.dylib\"\n  codesign --force --sign \"${EXPANDED_CODE_SIGN_IDENTITY:--}\" --timestamp=none \"${TARGET_BUILD_DIR}/${FRAMEWORKS_FOLDER_PATH}/libiina_whisper.dylib\" || true\nfi\n";
 		};
 		E3E720A12CD7073D003470BF /* Copy Default Plugins */ = {
 			isa = PBXShellScriptBuildPhase;
@@ -3143,6 +3157,8 @@
 				B1E7000E2F00000100BEEF0E /* IPTVPosterView.swift in Sources */,
 				B1E700112F00000100BEEF11 /* IPTVLiveOverlay.swift in Sources */,
 				B1E700132F00000100BEEF13 /* IPTVBrowseOverlay.swift in Sources */,
+				C1E800112F00000100BEEF11 /* LiveCaptionEngine.swift in Sources */,
+				C1E800132F00000100BEEF13 /* LiveCaptionOverlay.swift in Sources */,
 				E3B93C872FE9F77600803513 /* InteractiveMode.swift in Sources */,
 				E3D94E822FD0649A00B08618 /* UIHelper.swift in Sources */,
 				E3A239B12FCB4D0900CE6ACC /* SidebarPane.swift in Sources */,

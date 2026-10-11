@@ -1017,12 +1017,29 @@ final class IPTVLiveOverlayPane: NSView {
     dirtyRect.fill()
     let controller = IPTVLiveOverlayController.shared
     guard let session = controller.session else { return }
-    if controller.mode == .hidden && controller.digits.isEmpty { return }
+    if controller.mode == .hidden && controller.digits.isEmpty {
+      drawSyncChip(in: bounds)
+      return
+    }
     let chrome = IPTVLiveChrome.layout(in: bounds, mode: controller.mode)
     if controller.mode == .list { drawList(session, in: chrome.list, controller: controller) }
-    if controller.mode == .guide { drawGuide(session, in: chrome.guide, controller: controller) }
+    if controller.mode == .guide {
+      drawGuide(session, in: chrome.guide, controller: controller)
+      drawSyncChip(in: bounds)
+    }
     if controller.mode != .guide { drawBanner(session, chrome: chrome, controller: controller) }
     if !controller.digits.isEmpty { drawDigits(controller.digits) }
+  }
+
+  private func drawSyncChip(in bounds: NSRect) {
+    guard let sync = LiveCaptionController.shared.bannerText else { return }
+    let height: CGFloat = 28
+    let width = min(420, max(220, bounds.width * 0.34))
+    let reserve: CGFloat = GlassesEyeControls.shared.shown ? 80 : 0
+    let y = max(16, bounds.height - height - 18 - reserve)
+    let rect = NSRect(x: (bounds.width - width) / 2, y: y, width: width, height: height)
+    IPTVLiveDraw.panel(rect, radius: 8)
+    IPTVLiveDraw.text(sync, in: rect.insetBy(dx: 10, dy: 4), font: .systemFont(ofSize: 13, weight: .semibold), color: .white, align: .center)
   }
 
   private func drawBanner(_ session: IPTVLiveSession, chrome: IPTVLiveChrome, controller: IPTVLiveOverlayController) {
@@ -1054,7 +1071,9 @@ final class IPTVLiveOverlayPane: NSView {
       IPTVLiveDraw.progress(controller.progress(for: programme, catchup: session.catchup != nil), in: bar)
     }
     IPTVLiveDraw.text(secondary, in: NSRect(x: textX, y: rect.minY + 76, width: textWidth, height: 18), font: .systemFont(ofSize: 12, weight: .regular), color: NSColor(calibratedWhite: 1, alpha: 0.72))
-    if rect.height > 108 {
+    if rect.height > 108, let sync = LiveCaptionController.shared.bannerText {
+      IPTVLiveDraw.text(sync, in: NSRect(x: textX, y: rect.maxY - 22, width: textWidth, height: 16), font: .systemFont(ofSize: 12, weight: .semibold), color: NSColor(calibratedRed: 0.55, green: 0.88, blue: 1, alpha: 1))
+    } else if rect.height > 108 {
       let footer = controller.notice ?? "↑↓ channel    0–9    ⌫ last    ⏎ list    G guide"
       let footerColor = controller.notice == nil ? NSColor(calibratedWhite: 1, alpha: 0.55) : NSColor(calibratedRed: 1, green: 0.75, blue: 0.4, alpha: 1)
       IPTVLiveDraw.text(footer, in: NSRect(x: textX, y: rect.maxY - 26, width: max(40, rect.maxX - textX - 16), height: 16), font: .systemFont(ofSize: 11, weight: .medium), color: footerColor)

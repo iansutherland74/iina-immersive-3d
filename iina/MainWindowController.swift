@@ -859,6 +859,7 @@ class MainWindowController: PlayerWindowController {
       .bottom: videoViewContainer.bottomAnchor.constraint(equalTo: videoView.bottomAnchor)
     ]
     layoutSides.forEach { videoViewConstraints[$0]?.isActive = true }
+    LiveCaptionController.shared.attachIfNeeded()
     IPTVLiveOverlayController.shared.attachIfNeeded()
     IPTVBrowseOverlayController.shared.attachIfNeeded()
   }

@@ -101,7 +101,7 @@ jobs:
           sudo xcode-select -s "${app}/Contents/Developer"
           xcodebuild -version
 
-      - name: Download mpv libraries and yt-dlp
+      - name: Download mpv libraries, yt-dlp, and build whisper.cpp
         working-directory: iina
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -38,12 +38,39 @@ class SettingsPageSubtitles: SettingsPage {
 
   override func content() -> [SettingsSection] {
     return sections {
+      sectionLiveCaptions()
       sectionAutoLoad()
       sectionASS()
       sectionText()
       sectionPosition()
       sectionOnlineSubtitles()
       sectionOther()
+    }
+  }
+
+  private func sectionLiveCaptions() -> SettingsSection {
+    LiveCaptionController.shared.startObserving()
+    return section {
+      SettingsList(title: .init("liveCaption.section")) {
+        SettingsItem.Switch()
+          .image(name: "captions.bubble")
+          .bindTo(.liveCaptionEnabled)
+          .hasDescription()
+        SettingsItem.PopupButton()
+          .image(name: "waveform")
+          .bindTo(.liveCaptionModel, ofType: Preference.LiveCaptionModel.self)
+          .hasDescription()
+        SettingsItem.PopupButton()
+          .image(name: "timer")
+          .bindTo(.liveCaptionLatency, ofType: Preference.LiveCaptionLatency.self)
+          .hasDescription()
+        SettingsItem.Switch()
+          .image(name: ["clock.arrow.circlepath", "clock"])
+          .bindTo(.liveCaptionSync)
+          .hasDescription()
+        SettingsItem.Custom()
+          .view(LiveCaptionSettingsView())
+      }
     }
   }
 

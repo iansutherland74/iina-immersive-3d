@@ -43,6 +43,21 @@
 "settings.iptvTMDBAPIKey.label" = "TMDB API Key";
 "settings.iptvTMDBAPIKey.desc" = "Optional. A v3 key from themoviedb.org fills missing posters and plots for Movies and Series. A key that starts with ey is sent as a v4 bearer token. The key is stored in preferences, not the Keychain. Leave this blank to use only what the provider sends.";
 
+"settings.liveCaption.section" = "Live captions";
+"settings.liveCaptionEnabled.label" = "Live auto subtitles";
+"settings.liveCaptionEnabled.desc" = "On-device speech to text for files, live TV, and movies. The line lags the picture by a few seconds. Base is lighter; Small uses more CPU and GPU. This does not use the microphone.";
+"settings.liveCaptionModel.label" = "Model";
+"settings.liveCaptionModel.desc" = "Multilingual Whisper models downloaded from Settings into Application Support. Base is about 150 MB. Small is about 500 MB and slower. A build does not download them.";
+"settings.liveCaptionModel.items.0" = "Base (faster)";
+"settings.liveCaptionModel.items.1" = "Small (more accurate)";
+"settings.liveCaptionLatency.label" = "Latency";
+"settings.liveCaptionLatency.desc" = "Low latency uses a 3 second window and one beam. Balanced uses 5 seconds and beam 3. Accuracy uses 8 seconds and beam 5. The line cannot appear before that audio has been heard, and the model adds more time.";
+"settings.liveCaptionLatency.items.0" = "Low latency";
+"settings.liveCaptionLatency.items.1" = "Balanced";
+"settings.liveCaptionLatency.items.2" = "Accuracy";
+"settings.liveCaptionSync.label" = "Delay live TV";
+"settings.liveCaptionSync.desc" = "On by default. A live channel or other unseekable stream holds the picture and sound a few seconds so the words match, and the banner shows the delay. Files, movies, and catch-up are read ahead instead, and are not delayed. Turn this off to leave a live channel at the live edge. Changing channel picks the mode again. Turning captions off jumps a delayed channel back to live.";
+
 "settings.transportRTSPThrough.items.1" = "TCP";
 "settings.transportRTSPThrough.items.2" = "UDP";
 "settings.transportRTSPThrough.items.3" = "HTTP";
