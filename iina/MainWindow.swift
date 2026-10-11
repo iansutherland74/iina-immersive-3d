@@ -57,6 +57,16 @@ class MainWindow: CommonWindow {
   override var canBecomeMain: Bool {
     forceKeyAndMain ? true : super.canBecomeMain
   }
+
+  /// Play on Glasses must use `NSScreen.frame` in global desktop coordinates, including a
+  /// non-zero origin (the measured SmartGlasses 3D frame is (1512, -98, 3840, 1080)) and the
+  /// menu-bar / camera-housing area. The default implementation pulls the window into `visibleFrame`.
+  override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect {
+    if Immersive3DController.shared.glassesActive {
+      return frameRect
+    }
+    return super.constrainFrameRect(frameRect, to: screen)
+  }
 }
 
 class MainWindowContentView: NSView {

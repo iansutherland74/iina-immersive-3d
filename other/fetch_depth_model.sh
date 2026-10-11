@@ -6,8 +6,9 @@
 # This does not download anything from VITURE / SpaceWalk.
 #
 # The F16 package is a fixed 518x392 RGB model with a float16 grayscale depth
-# output. It needs macOS 13 or later. For a 364x280 build, use
-# other/convert_depth_anything_v2.py instead.
+# image. It is an ios17 Core ML specialization and needs macOS 14 or later.
+# On macOS 13, convert a 364x280 package with other/convert_depth_anything_v2.py
+# (ct.target.macOS13). That package's depth output is a float16 multiarray.
 
 set -euo pipefail
 

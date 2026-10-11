@@ -43,6 +43,10 @@ class SettingsPageVideo: SettingsPage {
           .image(name: "cube.transparent")
           .bindTo(.immersive3DDepthModel, ofType: Preference.DepthModelOption.self)
           .hasDescription()
+        SettingsItem.Switch()
+          .image(name: "display.2")
+          .bindTo(.immersive3DAutoGlassesDisplay)
+          .hasDescription()
       }
     }
   }

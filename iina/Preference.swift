@@ -82,6 +82,8 @@ struct Preference {
     static let immersive3DVerticalFlip = Key("immersive3DVerticalFlip")
     /** 0 Depth Anything V2 Small, 1 Depth Anything 3 Small (int). */
     static let immersive3DDepthModel = Key("immersive3DDepthModel")
+    /** When Play on Glasses starts, leave a mirrored NXTWEAR S as an extended display for this login session (bool, default true). */
+    static let immersive3DAutoGlassesDisplay = Key("immersive3DAutoGlassesDisplay")
 
     /** Quit when no open window (bool) */
     static let quitWhenNoOpenedWindow = Key("quitWhenNoOpenedWindow")
@@ -1144,6 +1146,7 @@ struct Preference {
     .immersive3DInvertDepth: false,
     .immersive3DVerticalFlip: false,
     .immersive3DDepthModel: DepthModelOption.defaultValue.rawValue,
+    .immersive3DAutoGlassesDisplay: true,
     .pauseWhenMinimized: false,
     .pauseWhenInactive: false,
     .pauseWhenLeavingFullScreen: false,

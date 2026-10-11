@@ -36,6 +36,8 @@
 "settings.immersive3DDepthModel.desc" = "Depth Anything V2 Small is the default (Apple Core ML). Depth Anything 3 Small needs a package from other/convert_depth_anything_3.py. Changing this reloads the model.";
 "settings.immersive3DDepthModel.items.0" = "Depth Anything V2 Small";
 "settings.immersive3DDepthModel.items.1" = "Depth Anything 3 Small";
+"settings.immersive3DAutoGlassesDisplay.label" = "Automatically set up glasses display";
+"settings.immersive3DAutoGlassesDisplay.desc" = "When Play on Glasses starts, a mirrored NXTWEAR S is switched to an extended display for this login session. Mirroring is restored when Play on Glasses stops. The check runs again after the glasses change between 2D and 3D, because mirroring can return with that mode switch.";
 
 "settings.iptv.section" = "IPTV";
 "settings.iptvTMDBAPIKey.label" = "TMDB API Key";

@@ -180,13 +180,18 @@ final class Immersive3DCompositor {
     guard let pipeline, let depthTexture,
           let commandBuffer = commandQueue.makeCommandBuffer(),
           let encoder = commandBuffer.makeComputeCommandEncoder() else { return false }
+    let content = contentRect(fullSizeEyes: snapshot.fullSizeEyes, width: width, height: height)
     var params = StereoParams(
       maxShift: snapshot.maxShift,
       convergence: snapshot.convergence,
       holeThreshold: 0.08,
       invertDepth: snapshot.invertDepth ? 1 : 0,
       glOriented: snapshot.verticalFlip ? 0 : 1,
-      searchPixels: 18
+      searchPixels: 18,
+      contentX: content.x,
+      contentY: content.y,
+      contentW: content.w,
+      contentH: content.h
     )
     encoder.setComputePipelineState(pipeline)
     encoder.setTexture(surfaces.colorMetal, index: 0)
@@ -204,6 +209,28 @@ final class Immersive3DCompositor {
       return false
     }
     return true
+  }
+
+  /// Normalized top-down rect of the aspect-fitted picture inside the framebuffer.
+  /// Half-SBS (1920×1080 glasses) uses the full frame. A double-wide 3840×1080
+  /// framebuffer pillarboxes a 16:9 picture into the center half; each eye then
+  /// samples that half at full size.
+  private func contentRect(fullSizeEyes: Bool, width: Int, height: Int) -> (x: Float, y: Float, w: Float, h: Float) {
+    guard fullSizeEyes, width > 1, height > 1 else { return (0, 0, 1, 1) }
+    var videoW = 0
+    var videoH = 0
+    if !PlayerCore.playerCores.isEmpty {
+      videoW = PlayerCore.active.info.displayWidth ?? 0
+      videoH = PlayerCore.active.info.displayHeight ?? 0
+    }
+    let frameAspect = Float(width) / Float(height)
+    let videoAspect = (videoW > 0 && videoH > 0) ? Float(videoW) / Float(videoH) : (16.0 / 9.0)
+    if videoAspect >= frameAspect {
+      let contentH = min(max(frameAspect / videoAspect, 0.01), 1)
+      return (0, (1 - contentH) * 0.5, 1, contentH)
+    }
+    let contentW = min(max(videoAspect / frameAspect, 0.01), 1)
+    return ((1 - contentW) * 0.5, 0, contentW, 1)
   }
 
   // MARK: - OpenGL
@@ -437,6 +464,10 @@ private struct StereoParams {
   var invertDepth: Float
   var glOriented: Float
   var searchPixels: Float
+  var contentX: Float
+  var contentY: Float
+  var contentW: Float
+  var contentH: Float
 }
 
 private struct SmallTarget {
