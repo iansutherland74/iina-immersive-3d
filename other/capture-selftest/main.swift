@@ -247,7 +247,7 @@ private func testStereoPipeline() {
     check(false, "depth and 3840x1080 output textures")
     return
   }
-  var flat = [Float](repeating: 0.5, count: 4)
+  let flat = [Float](repeating: 0.5, count: 4)
   flat.withUnsafeBytes { raw in
     depth.replace(region: MTLRegionMake2D(0, 0, 2, 2), mipmapLevel: 0, withBytes: raw.baseAddress!, bytesPerRow: 8)
   }
@@ -276,14 +276,14 @@ private func testStereoPipeline() {
     let offset = (y * 3840 + x) * 4
     return (Int(bytes[offset]), Int(bytes[offset + 1]), Int(bytes[offset + 2]))
   }
-  func luma(_ pixel: (b: Int, g: Int, r: Int)) -> Double {
-    0.2126 * Double(pixel.r) + 0.7152 * Double(pixel.g) + 0.0722 * Double(pixel.b)
+  func bright(_ pixel: (b: Int, g: Int, r: Int)) -> Bool {
+    max(pixel.r, pixel.g, pixel.b) > 40
   }
   let leftRed = sample(480, 540)
   let leftBlue = sample(1440, 540)
   let rightRed = sample(1920 + 480, 540)
   let rightBlue = sample(1920 + 1440, 540)
-  check(luma(leftRed) > 20 && luma(leftBlue) > 20 && luma(rightRed) > 20 && luma(rightBlue) > 20, "3840x1080 SBS is non-black in both eyes")
+  check(bright(leftRed) && bright(leftBlue) && bright(rightRed) && bright(rightBlue), "3840x1080 SBS is non-black in both eyes")
   check(leftRed.r > 200 && leftRed.b < 40, "left eye shows the red half of the picture")
   check(leftBlue.b > 200 && leftBlue.r < 40, "left eye shows the blue half of the picture")
   check(rightRed.r > 200 && rightRed.b < 40, "right eye shows the red half of the picture")
