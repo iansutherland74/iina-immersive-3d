@@ -64,6 +64,10 @@ class SettingsPageSubtitles: SettingsPage {
           .image(name: "timer")
           .bindTo(.liveCaptionLatency, ofType: Preference.LiveCaptionLatency.self)
           .hasDescription()
+        SettingsItem.Switch()
+          .image(name: ["clock.arrow.circlepath", "clock"])
+          .bindTo(.liveCaptionSync)
+          .hasDescription()
         SettingsItem.Custom()
           .view(LiveCaptionSettingsView())
       }

@@ -9,10 +9,13 @@
 //  Live auto subtitles. libmpv does not export decoded PCM. A lavfi asplit
 //  graph inside mpv cannot hand samples to the host, and replacing the audio
 //  output would mute playback. This engine decodes the same URL again with
-//  AVFoundation, keeps that audio aligned to mpv's time-pos when the asset can
-//  be seeked, and runs whisper.cpp in-process. Live IPTV is a second read of
-//  that URL and can sit a few seconds off the picture. Only caption text leaves
-//  the Mac, and only when a translation API key is set.
+//  AVFoundation and runs whisper.cpp in-process. Each line is stamped with the
+//  audio PTS, not the time the text arrived. Sync mode reads that audio ahead
+//  of the playhead for files, movies, and catch-up. A live stream cannot be
+//  read from the future, so sync mode holds mpv's demuxer cache and the
+//  picture waits with the sound. Depth is estimated from the frame mpv has
+//  already drawn, so it stays on that same delayed picture. Only caption text
+//  leaves the Mac, and only when a translation API key is set.
 
 import AVFoundation
 import AudioToolbox
@@ -89,6 +92,17 @@ enum LiveCaptionStore {
   }
 }
 
+struct CaptionCue {
+  var start: Double
+  var end: Double
+  var text: String
+}
+
+struct CaptionChunk {
+  var samples: [Float]
+  var start: Double
+}
+
 struct CaptionPace {
   var window: Double
   var hop: Double
@@ -131,9 +145,32 @@ final class LiveCaptionController {
   private var lastRaw = ""
   private var lastTranslated = ""
   private var observing = false
+  private var cues: [CaptionCue] = []
+  private var assSignature = ""
+  private var shownCueSignature = ""
+  private var measuredWork = 5.0
+  private var measuredInference = 1.5
+  private var timingSamples = 0
+  private var appliedLiveDelay = 5.0
+  private var reportedLookahead = 0.0
+  private var savedCache: SavedCache?
+  private var holdingPlayback = false
+  private var holdStarted = Date.distantPast
+  private var gaveUpHold = false
   private let subtitleURL = FileManager.default.temporaryDirectory.appendingPathComponent("iina-live-caption.ass")
 
   private(set) var statusText = "Live captions are off."
+  private(set) var syncText = "Sync is off."
+
+  private struct SavedCache {
+    var cache: String?
+    var cacheSecs: Double?
+    var readahead: Double?
+    var cachePause: Bool?
+    var cachePauseInitial: Bool?
+    var cachePauseWait: Double?
+    var wePaused: Bool
+  }
 
   private init() {}
 
@@ -145,6 +182,15 @@ final class LiveCaptionController {
         self?.applyEnabled()
       }
     }
+    let refresh = { [weak self] in
+      DispatchQueue.main.async {
+        self?.maintainLiveDelay()
+        self?.refreshSyncText()
+      }
+    }
+    preferences.add(.liveCaptionSync) { _ in refresh() }
+    preferences.add(.liveCaptionLiveDelay) { _ in refresh() }
+    preferences.add(.liveCaptionLiveDelayAuto) { _ in refresh() }
   }
 
   func noteFileStarted(core: PlayerCore) {
@@ -201,6 +247,10 @@ final class LiveCaptionController {
     lastRaw = ""
     lastTranslated = ""
     lastText = ""
+    cues.removeAll()
+    assSignature = ""
+    shownCueSignature = ""
+    gaveUpHold = false
     let agent = core.mpv.getString("user-agent")
     let time = core.mpv.getDouble(MPVProperty.timePos)
     source.open(url: url, userAgent: agent, at: time.isFinite ? time : 0)
@@ -215,8 +265,12 @@ final class LiveCaptionController {
     generation += 1
     running = false
     activeURL = nil
+    restorePlaybackDelay()
     whisper.setAbort(1)
     source.close()
+    cues.removeAll()
+    assSignature = ""
+    shownCueSignature = ""
     displayTimer?.invalidate()
     displayTimer = nil
     lastText = ""
@@ -232,8 +286,8 @@ final class LiveCaptionController {
 
   private func installTimer() {
     displayTimer?.invalidate()
-    let timer = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
-      self?.redisplay()
+    let timer = Timer(timeInterval: 0.25, repeats: true) { [weak self] _ in
+      self?.tick()
     }
     displayTimer = timer
     RunLoop.main.add(timer, forMode: .common)
@@ -248,34 +302,45 @@ final class LiveCaptionController {
     }
   }
 
+  private func tick() {
+    guard running else { return }
+    maintainLiveDelay()
+    refreshSyncText()
+    redisplay()
+  }
+
   private func step(generation token: Int) {
     guard token == generation else { return }
     let pace = CaptionPace.current()
     let model: Preference.LiveCaptionModel = Preference.enum(for: .liveCaptionModel)
     guard LiveCaptionStore.isInstalled(model) else {
       let name = model == .small ? "Small" : "Base"
-      publish("Live captions: download the \(name) model in Settings → Subtitles.", token: token)
+      publish(notice: "Live captions: download the \(name) model in Settings → Subtitles.", token: token)
       setStatus("\(name) model is not downloaded. It stays on this Mac, under Application Support.")
       return
     }
     guard whisper.ensureLoaded(model: model) else {
-      publish("Live captions could not load whisper.cpp.", token: token)
+      publish(notice: "Live captions could not load whisper.cpp.", token: token)
       return
     }
     guard let time = mediaTime(), time.isFinite else { return }
-    source.follow(time: time, window: pace.window)
-    let samples = source.samples(endingAt: time, window: pace.window)
-    guard let samples, samples.count >= 8000 else { return }
-    if rms(samples) < 0.008 {
-      publish("", token: token)
+    let syncing = Preference.bool(for: .liveCaptionSync)
+    let waiting = playbackShouldWait()
+    let lead = (syncing && !waiting && !source.isLiveEdge) ? lookaheadLead() : 0
+    reportedLookahead = lead
+    let coverEnd = time + lead + pace.window
+    source.follow(coveringEnd: coverEnd, window: pace.window)
+    guard let audio = source.samples(coveringEnd: coverEnd, window: pace.window) else { return }
+    if rms(audio.samples) < 0.008 {
       return
     }
     whisper.setAbort(0)
     let sourceLanguage = Preference.string(for: .liveCaptionSourceLanguage) ?? "auto"
     let target = Preference.string(for: .liveCaptionTargetLanguage) ?? "original"
     let translateToEnglish = target == "en" && sourceLanguage != "en"
+    let started = Date()
     guard let raw = whisper.transcribe(
-      samples,
+      audio.samples,
       language: sourceLanguage,
       translate: translateToEnglish,
       beam: pace.beam,
@@ -283,55 +348,105 @@ final class LiveCaptionController {
     ) else {
       return
     }
+    let inference = Date().timeIntervalSince(started)
     guard token == generation else { return }
-    let cleaned = clean(raw)
-    if cleaned == lastRaw {
-      publish(lastTranslated, token: token)
+    let duration = Double(audio.samples.count) / 16000
+    var parsed = cues(from: raw, audioStart: audio.start, audioDuration: duration)
+    guard !parsed.isEmpty else { return }
+    parsed = parsed.map { cue in
+      var next = cue
+      let translated = translate(cue.text, sourceLanguage: sourceLanguage, target: target, alreadyEnglish: translateToEnglish)
+      next.text = translated
+      return next
+    }
+    let earliest = parsed.map(\.start).min() ?? audio.start
+    noteTiming(inference: inference, span: max(0, audio.start + duration - earliest))
+    let signature = parsed.map(\.text).joined(separator: "\n")
+    if signature == lastRaw && syncing {
       return
     }
-    lastRaw = cleaned
-    let translated = translate(cleaned, sourceLanguage: sourceLanguage, target: target, alreadyEnglish: translateToEnglish)
-    lastTranslated = translated
-    publish(translated, token: token)
+    lastRaw = signature
+    lastTranslated = parsed.last?.text ?? ""
+    publish(cues: parsed, token: token)
   }
 
-  private func publish(_ text: String, token: Int) {
+  private func publish(cues incoming: [CaptionCue], token: Int) {
     guard token == generation else { return }
     DispatchQueue.main.async { [weak self] in
       guard let self, self.generation == token else { return }
-      self.lastText = text
+      self.ingest(incoming)
       self.redisplay()
+    }
+  }
+
+  private func publish(notice: String, token: Int) {
+    guard token == generation else { return }
+    DispatchQueue.main.async { [weak self] in
+      guard let self, self.generation == token else { return }
+      self.lastText = notice
+      self.cues = [CaptionCue(start: 0, end: 36000, text: notice)]
+      self.redisplay()
+    }
+  }
+
+  private func ingest(_ incoming: [CaptionCue]) {
+    for cue in incoming where !cue.text.isEmpty {
+      let duplicate = cues.contains { existing in
+        existing.text == cue.text && abs(existing.start - cue.start) < 1.2
+      }
+      if !duplicate {
+        cues.append(cue)
+      }
+    }
+    cues.sort { $0.start < $1.start }
+    if cues.count > 24 {
+      cues.removeFirst(cues.count - 24)
     }
   }
 
   private func redisplay() {
     guard running else { return }
+    let syncing = Preference.bool(for: .liveCaptionSync)
+    if let now = mediaTime() {
+      cues.removeAll { $0.end < now - 6 && $0.end < 30000 }
+    }
+    let now = mediaTime() ?? 0
+    let text = visibleText(at: now, syncing: syncing)
+    let signature = cues.map { "\(Int($0.start * 100))-\(Int($0.end * 100))-\($0.text)" }.joined(separator: "|")
     let sbs = IPTVLiveOverlayController.duplicatesEyes
     let chrome = GlassesEyeControls.shared.shown
-    let textChanged = lastText != displayedText
+    let textChanged = text != displayedText
     let modeChanged = sbs != lastSBS
     let chromeChanged = chrome != lastChrome
-    if !textChanged && !modeChanged && !chromeChanged { return }
+    let cuesChanged = signature != shownCueSignature
+    if !textChanged && !modeChanged && !chromeChanged && !cuesChanged { return }
     let wasSBS = lastSBS
     lastSBS = sbs
     lastChrome = chrome
-    displayedText = lastText
+    lastText = text
+    displayedText = text
+    shownCueSignature = signature
     if sbs {
       if !wasSBS {
         suppressMPVCaption()
         hideShiftedSubtitles()
       }
-      overlay.setText(lastText)
+      overlay.setText(text)
       overlay.attachIfNeeded()
     } else {
       if wasSBS {
         restoreShiftedSubtitles()
       }
       overlay.setText("")
-      if textChanged || modeChanged {
-        showFlatCaption(lastText)
+      if textChanged || modeChanged || cuesChanged {
+        showFlatCaption(syncing: syncing)
       }
     }
+  }
+
+  private func visibleText(at time: Double, syncing: Bool) -> String {
+    guard syncing else { return cues.last?.text ?? "" }
+    return cues.last { $0.start - 0.12 <= time && time < $0.end + 0.2 }?.text ?? ""
   }
 
   private var displayedText = ""
@@ -357,9 +472,21 @@ final class LiveCaptionController {
     return true
   }
 
-  private func showFlatCaption(_ text: String) {
+  private func showFlatCaption(syncing: Bool) {
     guard mpvIsUsable(), let core else { return }
-    writeASS(text)
+    let signature = cues.map { "\(Int($0.start * 100))-\(Int($0.end * 100))-\($0.text)" }.joined(separator: "|")
+    let changed = signature != assSignature
+    if changed {
+      if syncing {
+        writeASS(cues)
+      } else if let text = cues.last?.text, !text.isEmpty {
+        writeASS([CaptionCue(start: 0, end: 36000, text: text)])
+      } else {
+        writeASS([])
+      }
+      assSignature = signature
+    }
+    let hadTrack = mpvTrackID != nil && !usingOSD
     if mpvTrackID == nil && !usingOSD {
       if previousSID == nil {
         previousSID = core.mpv.getInt("sid")
@@ -374,10 +501,11 @@ final class LiveCaptionController {
         usingOSD = true
       }
     }
-    if let track = mpvTrackID, !usingOSD {
+    if hadTrack, changed, let track = mpvTrackID, !usingOSD {
       core.mpv.command(.subReload, args: [String(track)], checkError: false)
     }
     if usingOSD || mpvTrackID == nil {
+      let text = displayedText
       if text.isEmpty {
         core.mpv.command(.osdOverlay, args: ["7", "none", "", "0", "0", "0"], checkError: false)
       } else {
@@ -434,7 +562,10 @@ final class LiveCaptionController {
     try? FileManager.default.removeItem(at: subtitleURL)
   }
 
-  private func writeASS(_ text: String) {
+  private func writeASS(_ lines: [CaptionCue]) {
+    let events = lines.map { cue in
+      "Dialogue: 0,\(assTime(cue.start)),\(assTime(cue.end)),Default,,0,0,0,,\(escapeASS(cue.text))"
+    }.joined(separator: "\n")
     let body = """
     [Script Info]
     ScriptType: v4.00+
@@ -449,9 +580,20 @@ final class LiveCaptionController {
 
     [Events]
     Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
-    Dialogue: 0,0:00:00.00,9:59:59.99,Default,,0,0,0,,\(escapeASS(text))
+    \(events)
     """
     try? body.data(using: .utf8)?.write(to: subtitleURL, options: .atomic)
+  }
+
+  private func assTime(_ seconds: Double) -> String {
+    let clamped = max(0, seconds)
+    let totalCs = Int((clamped * 100).rounded())
+    let cs = totalCs % 100
+    let total = totalCs / 100
+    let s = total % 60
+    let m = (total / 60) % 60
+    let h = total / 3600
+    return String(format: "%d:%02d:%02d.%02d", h, m, s, cs)
   }
 
   private func escapeASS(_ text: String) -> String {
@@ -478,6 +620,206 @@ final class LiveCaptionController {
       text = String(text.prefix(400))
     }
     return text
+  }
+
+  private func cues(from raw: String, audioStart: Double, audioDuration: Double) -> [CaptionCue] {
+    var parsed: [CaptionCue] = []
+    for line in raw.split(separator: "\n", omittingEmptySubsequences: true) {
+      let parts = line.split(separator: "\t", maxSplits: 2, omittingEmptySubsequences: false)
+      guard parts.count == 3, let t0 = Double(parts[0]), let t1 = Double(parts[1]) else { continue }
+      let text = clean(String(parts[2]))
+      guard !text.isEmpty else { continue }
+      let start = audioStart + t0 / 100
+      var end = audioStart + max(t0, t1) / 100
+      if end < start + 0.8 { end = start + 1.6 }
+      parsed.append(CaptionCue(start: start, end: end, text: text))
+    }
+    if parsed.isEmpty {
+      let text = clean(raw.replacingOccurrences(of: "\t", with: " "))
+      if !text.isEmpty {
+        parsed.append(CaptionCue(start: audioStart, end: audioStart + max(1.6, audioDuration), text: text))
+      }
+    }
+    return parsed
+  }
+
+  private func lookaheadLead() -> Double {
+    min(8, max(0.8, measuredInference + 0.35))
+  }
+
+  private func noteTiming(inference: Double, span: Double) {
+    let sample = max(0.2, inference + span)
+    if timingSamples == 0 {
+      measuredWork = sample
+      measuredInference = inference
+    } else {
+      measuredWork = measuredWork * 0.7 + sample * 0.3
+      measuredInference = measuredInference * 0.7 + inference * 0.3
+    }
+    timingSamples += 1
+  }
+
+  /// Live IPTV cannot be decoded from the future. Files, movies, and catch-up can.
+  private func playbackShouldWait() -> Bool {
+    guard Preference.bool(for: .liveCaptionSync), source.isLiveEdge else { return false }
+    let decision = { () -> Bool? in
+      guard let session = IPTVLiveOverlayController.shared.session else { return nil }
+      if session.catchup != nil { return false }
+      return session.item.kind == .live
+    }
+    let known: Bool?
+    if Thread.isMainThread {
+      known = decision()
+    } else {
+      var value: Bool?
+      DispatchQueue.main.sync { value = decision() }
+      known = value
+    }
+    if let known { return known }
+    return source.isOpenEnded
+  }
+
+  private func desiredLiveDelay() -> Double {
+    let configured = min(12, max(2, Preference.double(for: .liveCaptionLiveDelay)))
+    guard Preference.bool(for: .liveCaptionLiveDelayAuto), timingSamples > 0 else { return configured }
+    return min(12, max(configured, measuredWork + 0.35))
+  }
+
+  private func maintainLiveDelay() {
+    guard running, mpvIsUsable(), let core else { return }
+    guard playbackShouldWait() else {
+      if savedCache != nil || holdingPlayback {
+        restorePlaybackDelay()
+      }
+      return
+    }
+    let delay = desiredLiveDelay()
+    appliedLiveDelay = delay
+    let hold = delay + 1.5
+    if savedCache == nil {
+      savedCache = SavedCache(
+        cache: core.mpv.getString(MPVOption.Cache.cache),
+        cacheSecs: mpvDouble(MPVOption.Cache.cacheSecs, core),
+        readahead: mpvDouble(MPVOption.Demuxer.demuxerReadaheadSecs, core),
+        cachePause: mpvFlag(MPVOption.Cache.cachePause, core),
+        cachePauseInitial: mpvFlag(MPVOption.Cache.cachePauseInitial, core),
+        cachePauseWait: mpvDouble(MPVOption.Cache.cachePauseWait, core),
+        wePaused: false
+      )
+    }
+    core.mpv.setString(MPVOption.Cache.cache, "yes")
+    core.mpv.setDouble(MPVOption.Cache.cacheSecs, hold)
+    core.mpv.setDouble(MPVOption.Demuxer.demuxerReadaheadSecs, hold)
+    core.mpv.setFlag(MPVOption.Cache.cachePause, true)
+    core.mpv.setDouble(MPVOption.Cache.cachePauseWait, min(delay, 8))
+    let cached = core.mpv.getDouble(MPVProperty.demuxerCacheDuration)
+    let filled = cached.isFinite && cached >= delay * 0.85
+    if !filled && !gaveUpHold {
+      if !holdingPlayback {
+        let alreadyPaused = core.mpv.getFlag(MPVOption.PlaybackControl.pause)
+        if !alreadyPaused {
+          core.mpv.setFlag(MPVOption.PlaybackControl.pause, true)
+          if var saved = savedCache {
+            saved.wePaused = true
+            savedCache = saved
+          }
+          holdingPlayback = true
+          holdStarted = Date()
+        } else {
+          gaveUpHold = true
+        }
+      } else if Date().timeIntervalSince(holdStarted) >= delay + 2 {
+        releaseHold(core)
+        gaveUpHold = true
+      }
+    } else if holdingPlayback {
+      releaseHold(core)
+    }
+  }
+
+  private func releaseHold(_ core: PlayerCore) {
+    guard holdingPlayback else { return }
+    holdingPlayback = false
+    if var saved = savedCache, saved.wePaused {
+      core.mpv.setFlag(MPVOption.PlaybackControl.pause, false)
+      saved.wePaused = false
+      savedCache = saved
+    }
+  }
+
+  private func restorePlaybackDelay() {
+    holdingPlayback = false
+    gaveUpHold = false
+    guard !Immersive3DController.shared.isShuttingDown, let saved = savedCache, let core, core.mpv != nil else {
+      savedCache = nil
+      return
+    }
+    if saved.wePaused, core.info.state.active {
+      core.mpv.setFlag(MPVOption.PlaybackControl.pause, false)
+    }
+    if let cache = saved.cache {
+      core.mpv.setString(MPVOption.Cache.cache, cache)
+    }
+    if let cacheSecs = saved.cacheSecs {
+      core.mpv.setDouble(MPVOption.Cache.cacheSecs, cacheSecs)
+    }
+    if let readahead = saved.readahead {
+      core.mpv.setDouble(MPVOption.Demuxer.demuxerReadaheadSecs, readahead)
+    }
+    if let cachePause = saved.cachePause {
+      core.mpv.setFlag(MPVOption.Cache.cachePause, cachePause)
+    }
+    if let cachePauseInitial = saved.cachePauseInitial {
+      core.mpv.setFlag(MPVOption.Cache.cachePauseInitial, cachePauseInitial)
+    }
+    if let cachePauseWait = saved.cachePauseWait {
+      core.mpv.setDouble(MPVOption.Cache.cachePauseWait, cachePauseWait)
+    }
+    savedCache = nil
+  }
+
+  private func mpvDouble(_ name: String, _ core: PlayerCore) -> Double? {
+    guard let text = core.mpv.getString(name) else { return nil }
+    return Double(text)
+  }
+
+  private func mpvFlag(_ name: String, _ core: PlayerCore) -> Bool? {
+    switch core.mpv.getString(name) {
+    case "yes": return true
+    case "no": return false
+    default: return nil
+    }
+  }
+
+  private func refreshSyncText() {
+    let text = describeSync()
+    guard text != syncText else { return }
+    syncText = text
+    NotificationCenter.default.post(name: .liveCaptionStatusChanged, object: nil)
+  }
+
+  private func describeSync() -> String {
+    guard Preference.bool(for: .liveCaptionSync) else {
+      return "Sync is off. A line shows when recognition finishes, which is a few seconds after the words."
+    }
+    if playbackShouldWait() {
+      let cached: Double
+      if mpvIsUsable(), let core {
+        cached = core.mpv.getDouble(MPVProperty.demuxerCacheDuration)
+      } else {
+        cached = .nan
+      }
+      let shown = cached.isFinite && cached > 0.2 ? cached : appliedLiveDelay
+      let auto = Preference.bool(for: .liveCaptionLiveDelayAuto) ? ", auto" : ""
+      if holdingPlayback {
+        return String(format: "Holding live playback. Buffer %.1f s%@. Transcription needs about %.1f s. Depth waits on this same frame.", shown, auto, measuredWork)
+      }
+      return String(format: "Live delay %.1f s%@. Picture, sound, and depth stay this far behind the broadcast. Transcription needs about %.1f s.", shown, auto, measuredWork)
+    }
+    if source.isLiveEdge {
+      return "Sync is on, but this item could not be read ahead and it is not a live channel, so the line can still arrive late."
+    }
+    return String(format: "Lookahead %.1f s. Playback is not delayed. Whisper is taking about %.1f s, and the line is stamped with the audio time.", reportedLookahead, measuredInference)
   }
 
   private func rms(_ samples: [Float]) -> Float {
@@ -865,25 +1207,27 @@ final class CaptionPCM {
     return origin + Double(samples.count) / rate
   }
 
-  func slice(from start: Double, to end: Double) -> [Float]? {
+  func slice(from start: Double, to end: Double) -> CaptionChunk? {
     lock.lock()
     defer { lock.unlock() }
     guard aligned, end > start else { return nil }
     let have = origin + Double(samples.count) / rate
-    if end > have + 0.08 || start + 0.05 < origin { return nil }
+    if end > have + 0.35 || start + 0.05 < origin { return nil }
     let a = max(0, Int((start - origin) * rate))
     let b = min(samples.count, Int((end - origin) * rate))
     guard b - a >= 8000 else { return nil }
-    return Array(samples[a..<b])
+    let actual = origin + Double(a) / rate
+    return CaptionChunk(samples: Array(samples[a..<b]), start: actual)
   }
 
-  func latest(seconds: Double) -> [Float]? {
+  func latest(seconds: Double) -> CaptionChunk? {
     lock.lock()
     defer { lock.unlock() }
     let need = Int(rate * seconds)
     guard samples.count >= max(8000, need / 2) else { return nil }
     let count = min(samples.count, need)
-    return Array(samples.suffix(count))
+    let actual = origin + Double(samples.count - count) / rate
+    return CaptionChunk(samples: Array(samples.suffix(count)), start: actual)
   }
 }
 
@@ -898,6 +1242,30 @@ final class CaptionSource {
   private var mode: Mode = .closed
   private var closed = true
   private var retargeting = false
+  private var openEnded = false
+  private var liveEdge = false
+  private var mediaDuration = Double.infinity
+  private let stateLock = NSLock()
+
+  var isLiveEdge: Bool {
+    stateLock.lock()
+    defer { stateLock.unlock() }
+    return liveEdge
+  }
+
+  var isOpenEnded: Bool {
+    stateLock.lock()
+    defer { stateLock.unlock() }
+    return openEnded
+  }
+
+  private func setCapture(live: Bool, openEnded: Bool, duration: Double) {
+    stateLock.lock()
+    liveEdge = live
+    self.openEnded = openEnded
+    mediaDuration = duration
+    stateLock.unlock()
+  }
 
   private enum Mode {
     case closed
@@ -930,29 +1298,37 @@ final class CaptionSource {
     }
   }
 
-  func follow(time: Double, window: Double) {
+  func follow(coveringEnd end: Double, window: Double) {
     queue.async {
       guard !self.closed else { return }
       if self.mode == .reader {
+        let limited = self.limit(end)
+        let start = max(0, limited - window)
         let covered = self.pcm.coveredUntil()
-        if time + 1 < self.pcm.startTime || time > covered + max(6, window) {
-          self.restartReader(at: max(0, time - 0.4))
+        if start + 0.25 < self.pcm.startTime || limited > covered + 0.25 {
+          self.restartReader(at: start)
         }
-        self.pump(target: time)
+        self.pump(target: limited)
       }
     }
   }
 
-  func samples(endingAt time: Double, window: Double) -> [Float]? {
-    var result: [Float]?
+  func samples(coveringEnd end: Double, window: Double) -> CaptionChunk? {
+    var result: CaptionChunk?
     queue.sync {
       if self.mode == .tap || !self.pcm.aligned {
         result = self.pcm.latest(seconds: window)
       } else {
-        result = self.pcm.slice(from: max(0, time - window), to: time)
+        let limited = self.limit(end)
+        result = self.pcm.slice(from: max(0, limited - window), to: limited)
       }
     }
     return result
+  }
+
+  private func limit(_ end: Double) -> Double {
+    guard mediaDuration.isFinite else { return end }
+    return min(end, mediaDuration)
   }
 
   private func finishOpen(asset: AVURLAsset, url: URL, userAgent: String?, at time: Double) {
@@ -969,13 +1345,16 @@ final class CaptionSource {
     }
     self.track = track
     let duration = asset.duration.seconds
-    let seekable = url.isFileURL || (duration.isFinite && duration > 1)
+    let finite = duration.isFinite && duration > 1
+    let seekable = url.isFileURL || finite
     if seekable && startReader(asset: asset, track: track, at: max(0, time - 0.4)) {
       mode = .reader
-      Logger.log("Live captions are decoding the same media again, aligned to the player clock.", level: .warning)
+      setCapture(live: false, openEnded: false, duration: finite ? duration : .infinity)
+      Logger.log("Live captions are decoding the same media again, ahead of the playhead when sync is on.", level: .warning)
       return
     }
     mode = .tap
+    setCapture(live: true, openEnded: !seekable, duration: finite ? duration : .infinity)
     pcm.reset(at: 0, aligned: false)
     DispatchQueue.main.async {
       guard !self.closed else { return }
@@ -1062,6 +1441,7 @@ final class CaptionSource {
   private func closeOnQueue() {
     closed = true
     mode = .closed
+    setCapture(live: false, openEnded: false, duration: .infinity)
     reader?.cancelReading()
     reader = nil
     output = nil
@@ -1086,7 +1466,8 @@ final class MutedAudioTap: NSObject {
   private var stopped = false
   private var format = AudioStreamBasicDescription()
   private var mpvAtStart = 0.0
-  private var skewSet = false
+  private var audioAnchor = 0.0
+  private var anchorReady = false
   private var runningPTS = 0.0
 
   init(pcm: CaptionPCM) {
@@ -1182,14 +1563,25 @@ final class MutedAudioTap: NSObject {
     if !pts.isFinite {
       pts = runningPTS
       runningPTS += Double(mono.count) / rate
+    } else {
+      runningPTS = pts
     }
-    if !skewSet {
-      skewSet = true
+    let mapped = mappedPlayhead(pts)
+    pcm.append(resampled, at: mapped)
+  }
+
+  /// The tap's clock and mpv's clock both start at whatever packet each reader
+  /// joined on. Keep one mapping so a cue's PTS is a playhead time, including
+  /// while sync mode is holding mpv paused and this tap keeps reading.
+  private func mappedPlayhead(_ pts: Double) -> Double {
+    let sample = pts.isFinite ? pts : audioAnchor
+    if !anchorReady {
+      anchorReady = true
+      audioAnchor = sample
       pcm.reset(at: mpvAtStart, aligned: false)
-      pcm.append(resampled, at: mpvAtStart)
-      return
+      return mpvAtStart
     }
-    pcm.append(resampled, at: pts)
+    return mpvAtStart + (sample - audioAnchor)
   }
 
   private func monoSamples(frames: Int, list: UnsafeMutablePointer<AudioBufferList>) -> [Float] {
@@ -1317,10 +1709,12 @@ private func captionTapProcess(
 
 final class LiveCaptionSettingsView: NSView {
   private let status = NSTextField(wrappingLabelWithString: "")
+  private let syncLabel = NSTextField(wrappingLabelWithString: "")
   private var sourcePopup: NSPopUpButton!
   private var targetPopup: NSPopUpButton!
   private let keyField = NSSecureTextField()
   private var keyDirty = false
+  private var delaySlider: NSSlider!
 
   override init(frame frameRect: NSRect) {
     super.init(frame: frameRect)
@@ -1365,15 +1759,31 @@ final class LiveCaptionSettingsView: NSView {
     status.preferredMaxLayoutWidth = 400
     status.textColor = .secondaryLabelColor
     status.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+
+    delaySlider = NSSlider(value: Preference.double(for: .liveCaptionLiveDelay), minValue: 2, maxValue: 12, target: self, action: #selector(delayChanged(_:)))
+    delaySlider.isContinuous = true
+    delaySlider.translatesAutoresizingMaskIntoConstraints = false
+    delaySlider.widthAnchor.constraint(equalToConstant: 400).isActive = true
+
+    let auto = NSButton(checkboxWithTitle: "Auto-tune the live buffer to the measured transcription time", target: self, action: #selector(autoChanged(_:)))
+    auto.state = Preference.bool(for: .liveCaptionLiveDelayAuto) ? .on : .off
+
+    syncLabel.translatesAutoresizingMaskIntoConstraints = false
+    syncLabel.preferredMaxLayoutWidth = 400
+    syncLabel.textColor = .secondaryLabelColor
+    syncLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
     refreshStatus()
 
-    let note = NSTextField(wrappingLabelWithString: "The player decodes the same URL a second time. libmpv does not provide its PCM, and a lavfi graph cannot export it without replacing playback. Expect a few seconds of delay. Base is lighter; Small uses more CPU and GPU on an M2. Whisper translates into English only. Other languages use the macOS 15 system translator when that language is installed, or the API key (caption text only). On macOS 13 without a key, the line stays in the recognized language. Place ggml-base-encoder.mlmodelc or ggml-small-encoder.mlmodelc next to the ggml file to use the Core ML encoder; otherwise Metal or the CPU runs the model. This was not timed on a Mac.")
+    let note = NSTextField(wrappingLabelWithString: "The player decodes the same URL a second time. libmpv does not provide its PCM, and a lavfi graph cannot export it without replacing playback. Sync mode reads ahead on a file, a movie, or catch-up, so the line is ready before it is spoken and playback is not delayed. Live TV cannot be read from the future: the picture and sound wait in mpv's cache (about 4–6 seconds unless transcription takes longer). Depth is computed from the frame already on screen, so it waits with that picture. Each line uses the audio time, not the time the text arrived. Base is lighter; Small uses more CPU and GPU on an M2. Whisper translates into English only. Other languages use the macOS 15 system translator when that language is installed, or the API key (caption text only). On macOS 13 without a key, the line stays in the recognized language. Place ggml-base-encoder.mlmodelc or ggml-small-encoder.mlmodelc next to the ggml file to use the Core ML encoder; otherwise Metal or the CPU runs the model. This was not timed on a Mac.")
     note.preferredMaxLayoutWidth = 400
     note.textColor = .secondaryLabelColor
     note.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
 
     stack.addArrangedSubview(labeled("Source language", sourcePopup))
     stack.addArrangedSubview(labeled("Target language", targetPopup))
+    stack.addArrangedSubview(labeled("Live buffer (seconds)", delaySlider))
+    stack.addArrangedSubview(auto)
+    stack.addArrangedSubview(syncLabel)
     stack.addArrangedSubview(download)
     stack.addArrangedSubview(status)
     stack.addArrangedSubview(labeled("Translation URL", endpoint))
@@ -1437,6 +1847,14 @@ final class LiveCaptionSettingsView: NSView {
     Preference.set(code, for: .liveCaptionTargetLanguage)
   }
 
+  @objc private func delayChanged(_ sender: NSSlider) {
+    Preference.set(sender.doubleValue, for: .liveCaptionLiveDelay)
+  }
+
+  @objc private func autoChanged(_ sender: NSButton) {
+    Preference.set(sender.state == .on, for: .liveCaptionLiveDelayAuto)
+  }
+
   @objc private func downloadModel() {
     LiveCaptionDownloads.shared.downloadSelected()
   }
@@ -1465,5 +1883,6 @@ final class LiveCaptionSettingsView: NSView {
 
   @objc private func refreshStatus() {
     status.stringValue = LiveCaptionController.shared.statusText
+    syncLabel.stringValue = LiveCaptionController.shared.syncText
   }
 }

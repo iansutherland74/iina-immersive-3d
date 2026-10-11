@@ -105,7 +105,7 @@ int iina_whisper_transcribe(
   params.translate = translate ? true : false;
   params.no_context = true;
   params.single_segment = false;
-  params.no_timestamps = true;
+  params.no_timestamps = false;
   params.print_special = false;
   params.print_progress = false;
   params.print_realtime = false;
@@ -147,14 +147,34 @@ int iina_whisper_transcribe(
     if (!seg || !seg[0]) {
       continue;
     }
+    long long t0 = (long long)whisper_full_get_segment_t0(g_ctx, i);
+    long long t1 = (long long)whisper_full_get_segment_t1(g_ctx, i);
+    if (t1 < t0) {
+      t1 = t0;
+    }
+    char line[1400];
+    size_t used = 0;
+    int head = snprintf(line, sizeof(line), "%lld\t%lld\t", t0, t1);
+    if (head < 0 || (size_t)head >= sizeof(line) - 2) {
+      continue;
+    }
+    used = (size_t)head;
+    for (const char * p = seg; *p && used + 2 < sizeof(line); p++) {
+      char ch = *p;
+      if (ch == '\n' || ch == '\r' || ch == '\t') {
+        ch = ' ';
+      }
+      line[used++] = ch;
+    }
+    line[used++] = '\n';
+    line[used] = 0;
     size_t have = strlen(buf);
-    size_t add = strlen(seg);
-    if (have + add + 1 > 8192) {
+    if (have + used + 1 > 8192) {
       break;
     }
-    if (have + add + 1 > cap) {
+    if (have + used + 1 > cap) {
       size_t next = cap * 2;
-      while (next < have + add + 1) {
+      while (next < have + used + 1) {
         next *= 2;
       }
       char * grown = (char *)realloc(buf, next);
@@ -166,7 +186,7 @@ int iina_whisper_transcribe(
       buf = grown;
       cap = next;
     }
-    memcpy(buf + have, seg, add + 1);
+    memcpy(buf + have, line, used + 1);
   }
   *out_text = buf;
   g_error[0] = 0;

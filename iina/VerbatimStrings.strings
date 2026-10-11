@@ -55,6 +55,8 @@
 "settings.liveCaptionLatency.items.0" = "Low latency";
 "settings.liveCaptionLatency.items.1" = "Balanced";
 "settings.liveCaptionLatency.items.2" = "Accuracy";
+"settings.liveCaptionSync.label" = "Sync mode";
+"settings.liveCaptionSync.desc" = "Lines the words up with the voice. Files, movies, and catch-up are recognized ahead of the playhead, so playback is not delayed. Live TV holds the picture and the sound by a few seconds. Depth is estimated from the frame on screen, so it stays on that same delayed picture.";
 
 "settings.transportRTSPThrough.items.1" = "TCP";
 "settings.transportRTSPThrough.items.2" = "UDP";

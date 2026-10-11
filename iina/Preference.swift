@@ -95,6 +95,12 @@ struct Preference {
     static let liveCaptionModel = Key("liveCaptionModel")
     /** 0 low latency, 1 balanced, 2 accuracy. */
     static let liveCaptionLatency = Key("liveCaptionLatency")
+    /** Line captions up with speech. Files look ahead; live TV delays playback. */
+    static let liveCaptionSync = Key("liveCaptionSync")
+    /** Seconds to hold a live picture and its sound. Auto may raise this. */
+    static let liveCaptionLiveDelay = Key("liveCaptionLiveDelay")
+    /** Raise the live buffer when measured transcription takes longer. */
+    static let liveCaptionLiveDelayAuto = Key("liveCaptionLiveDelayAuto")
     /** HTTPS translation endpoint used when an API key is saved. */
     static let liveCaptionTranslateEndpoint = Key("liveCaptionTranslateEndpoint")
 
@@ -1203,6 +1209,9 @@ struct Preference {
     .liveCaptionTargetLanguage: "original",
     .liveCaptionModel: LiveCaptionModel.base.rawValue,
     .liveCaptionLatency: LiveCaptionLatency.balanced.rawValue,
+    .liveCaptionSync: true,
+    .liveCaptionLiveDelay: 5.0,
+    .liveCaptionLiveDelayAuto: true,
     .liveCaptionTranslateEndpoint: "https://api-free.deepl.com/v2/translate",
     .pauseWhenMinimized: false,
     .pauseWhenInactive: false,
