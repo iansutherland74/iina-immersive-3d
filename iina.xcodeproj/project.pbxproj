@@ -179,6 +179,9 @@
 		C1E800112F00000100BEEF11 /* LiveCaptionEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = C1E800102F00000100BEEF10 /* LiveCaptionEngine.swift */; };
 		C1E800132F00000100BEEF13 /* LiveCaptionOverlay.swift in Sources */ = {isa = PBXBuildFile; fileRef = C1E800122F00000100BEEF12 /* LiveCaptionOverlay.swift */; };
 		C1E800172F00000100BEEF17 /* LiveCaptionDecode.c in Sources */ = {isa = PBXBuildFile; fileRef = C1E800162F00000100BEEF16 /* LiveCaptionDecode.c */; };
+		C1E8001D2F00000100BEEF1D /* AudioToolbox.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = C1E8001C2F00000100BEEF1C /* AudioToolbox.framework */; };
+		C1E800202F00000100BEEF20 /* LiveCaptionTap.c in Sources */ = {isa = PBXBuildFile; fileRef = C1E8001F2F00000100BEEF1F /* LiveCaptionTap.c */; };
+		C1E800222F00000100BEEF22 /* CoreAudio.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = C1E800212F00000100BEEF21 /* CoreAudio.framework */; };
 		840820111ECF6C1800361416 /* FileGroup.swift in Sources */ = {isa = PBXBuildFile; fileRef = 840820101ECF6C1800361416 /* FileGroup.swift */; };
 		840AF5821E732C8F00F4AF92 /* JustXMLRPC.swift in Sources */ = {isa = PBXBuildFile; fileRef = 840AF5811E732C8F00F4AF92 /* JustXMLRPC.swift */; };
 		840AF5841E73CE3900F4AF92 /* OpenSubSubtitle.swift in Sources */ = {isa = PBXBuildFile; fileRef = 840AF5831E73CE3900F4AF92 /* OpenSubSubtitle.swift */; };
@@ -1238,6 +1241,10 @@
 		C1E800122F00000100BEEF12 /* LiveCaptionOverlay.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = LiveCaptionOverlay.swift; sourceTree = "<group>"; };
 		C1E800142F00000100BEEF14 /* LiveCaptionDecode.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = LiveCaptionDecode.h; sourceTree = "<group>"; };
 		C1E800162F00000100BEEF16 /* LiveCaptionDecode.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; path = LiveCaptionDecode.c; sourceTree = "<group>"; };
+		C1E8001C2F00000100BEEF1C /* AudioToolbox.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = AudioToolbox.framework; path = System/Library/Frameworks/AudioToolbox.framework; sourceTree = SDKROOT; };
+		C1E8001E2F00000100BEEF1E /* LiveCaptionTap.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = LiveCaptionTap.h; sourceTree = "<group>"; };
+		C1E8001F2F00000100BEEF1F /* LiveCaptionTap.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; path = LiveCaptionTap.c; sourceTree = "<group>"; };
+		C1E800212F00000100BEEF21 /* CoreAudio.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreAudio.framework; path = System/Library/Frameworks/CoreAudio.framework; sourceTree = SDKROOT; };
 		840820101ECF6C1800361416 /* FileGroup.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = FileGroup.swift; sourceTree = "<group>"; };
 		840AF5811E732C8F00F4AF92 /* JustXMLRPC.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = JustXMLRPC.swift; sourceTree = "<group>"; };
 		840AF5831E73CE3900F4AF92 /* OpenSubSubtitle.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = OpenSubSubtitle.swift; sourceTree = "<group>"; };
@@ -1880,6 +1887,8 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				C1E8001D2F00000100BEEF1D /* AudioToolbox.framework in Frameworks */,
+				C1E800222F00000100BEEF22 /* CoreAudio.framework in Frameworks */,
 				496B19921E2968530035AF10 /* PIP.framework in Frameworks */,
 				8403CEA72007CBD400645516 /* MediaPlayer.framework in Frameworks */,
 				B4E4470125CE3F930069F06E /* Sparkle in Frameworks */,
@@ -2137,6 +2146,8 @@
 				34AAF7CD302EAF6500E9835C /* libzstd.1.dylib */,
 				845E2F491E76CFC2002C6588 /* libz.tbd */,
 				49542974216C34950058F680 /* Cocoa.framework */,
+				C1E8001C2F00000100BEEF1C /* AudioToolbox.framework */,
+				C1E800212F00000100BEEF21 /* CoreAudio.framework */,
 				5196819929EC963F00B05D55 /* CoreDisplay.framework */,
 				8403CEA62007CBD300645516 /* MediaPlayer.framework */,
 				496B19911E2968530035AF10 /* PIP.framework */,
@@ -2425,6 +2436,8 @@
 				C1E800122F00000100BEEF12 /* LiveCaptionOverlay.swift */,
 				C1E800142F00000100BEEF14 /* LiveCaptionDecode.h */,
 				C1E800162F00000100BEEF16 /* LiveCaptionDecode.c */,
+				C1E8001E2F00000100BEEF1E /* LiveCaptionTap.h */,
+				C1E8001F2F00000100BEEF1F /* LiveCaptionTap.c */,
 			);
 			path = LiveCaptions;
 			sourceTree = "<group>";
@@ -3185,6 +3198,7 @@
 				C1E800112F00000100BEEF11 /* LiveCaptionEngine.swift in Sources */,
 				C1E800132F00000100BEEF13 /* LiveCaptionOverlay.swift in Sources */,
 				C1E800172F00000100BEEF17 /* LiveCaptionDecode.c in Sources */,
+				C1E800202F00000100BEEF20 /* LiveCaptionTap.c in Sources */,
 				E3B93C872FE9F77600803513 /* InteractiveMode.swift in Sources */,
 				E3D94E822FD0649A00B08618 /* UIHelper.swift in Sources */,
 				E3A239B12FCB4D0900CE6ACC /* SidebarPane.swift in Sources */,

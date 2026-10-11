@@ -18,6 +18,7 @@
 #import "ObjcUtils.h"
 #import "FFmpegController.h"
 #import "LiveCaptions/LiveCaptionDecode.h"
+#import "LiveCaptions/LiveCaptionTap.h"
 
 #import <CommonCrypto/CommonCrypto.h>
 

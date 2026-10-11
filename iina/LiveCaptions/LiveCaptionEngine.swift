@@ -6,9 +6,11 @@
 //  Based on IINA, Copyright (C) 2017-2026 Collider LI and contributors.
 //  Licensed under the GNU General Public License, version 3.
 //
-//  Live auto subtitles. libmpv does not export decoded PCM. A local file is
-//  decoded with the FFmpeg already linked into IINA. A network or live stream
-//  is taken from mpv's demuxer cache, so the provider is not opened again.
+//  Live auto subtitles. Captions copy the PCM mpv has already decoded for
+//  playback, so MKV, AVI, TS, HLS, live IPTV, VOD, WebDAV, FTP, and yt-dlp
+//  use the same connection as the picture. A file or cache decode is only a
+//  fallback when that callback never arrives, and AVFoundation is only used
+//  for a local file after that.
 //  whisper.cpp runs in-process. Each line is stamped with the audio PTS, not
 //  the time the text arrived. A file or movie is read ahead of the playhead
 //  and playback is not held back. A live channel cannot be read from the
@@ -18,6 +20,7 @@
 //  picture. Only caption text leaves the Mac, and only when a translation API
 //  key is set.
 
+import AVFoundation
 import Cocoa
 import Darwin
 import os
@@ -405,6 +408,25 @@ final class LiveCaptionController {
     let time = core.mpv.getDouble(MPVProperty.timePos)
     let kind = url.isFileURL ? "file" : "network"
     liveCaptionInfo("engine start \(kind)")
+    iina_caption_tap_set_enabled(1)
+    iina_caption_tap_mark()
+    // The playback callback is installed when the audio output is created.
+    // Arm first, then reload that output so the next callback is the one
+    // mpv uses for the speakers. A still-attached callback is the same
+    // output, so a later file does not need another reload.
+    if iina_caption_tap_attached() == 0 {
+      iina_caption_tap_arm()
+      let ao = core.mpv.getString("current-ao") ?? "pending"
+      let reload = core.mpv.command(rawString: "ao-reload")
+      liveCaptionInfo("caption tap armed ao=\(ao) ao-reload \(reload)")
+      if reload < 0 {
+        var audioReload: Int32 = 0
+        core.mpv.command(.audioReload, checkError: false) { audioReload = $0 }
+        liveCaptionInfo("ao-reload unavailable (\(reload)); audio-reload \(audioReload)")
+      }
+    } else {
+      liveCaptionInfo("caption tap already attached at \(iina_caption_tap_rate()) Hz")
+    }
     source.open(url: url, userAgent: agent, at: time.isFinite ? time : 0)
     installTimer()
     overlay.attachIfNeeded()
@@ -422,6 +444,7 @@ final class LiveCaptionController {
     if wasRunning {
       whisper.requestAbort(reason)
     }
+    iina_caption_tap_set_enabled(0)
     source.close()
     cues.removeAll()
     assSignature = ""
@@ -530,6 +553,16 @@ final class LiveCaptionController {
     guard token == generation else { return }
     let duration = Double(audio.samples.count) / 16000
     var parsed = cues(from: raw, audioStart: audio.start, audioDuration: duration)
+    if let now = mediaTime() {
+      let audioEnd = audio.start + duration
+      if audioEnd <= now + 0.5 {
+        parsed = parsed.map { cue in
+          var next = cue
+          if next.end < now + 1.5 { next.end = now + 2.5 }
+          return next
+        }
+      }
+    }
     guard !parsed.isEmpty else {
       if !loggedEmpty {
         loggedEmpty = true
@@ -1642,10 +1675,21 @@ final class CaptionSource {
 
   private enum Mode: String {
     case closed
+    case mpv
     case file
     case cache
+    case reader
     case failed
   }
+
+  private var mediaURL: URL?
+  private var tapMisses = 0
+  private var forcedReload = false
+  private var loggedTapFormat = false
+  private var nativeScratch: [Float] = []
+  private var reader: AVAssetReader?
+  private var readerOutput: AVAssetReaderTrackOutput?
+  private var readerAsset: AVURLAsset?
 
   func diagnostic() -> String {
     var text = ""
@@ -1693,15 +1737,16 @@ final class CaptionSource {
       self.closeOnQueue()
       self.closed = false
       self.playhead = time.isFinite ? time : 0
-      if url.isFileURL {
-        self.openLocal(url)
-      } else {
-        if let userAgent, !userAgent.isEmpty {
-          liveCaptionInfo("network captions use the open player connection")
-        }
-        liveCaptionInfo("network audio comes from the player cache")
-        self.beginCache(localFile: false)
+      self.mediaURL = url
+      self.mode = .mpv
+      self.tapMisses = 0
+      self.forcedReload = false
+      self.loggedTapFormat = false
+      self.setCapture(live: false, openEnded: false, localFile: url.isFileURL, duration: .infinity)
+      if let userAgent, !userAgent.isEmpty, !url.isFileURL {
+        liveCaptionInfo("captions use the audio mpv is already playing")
       }
+      liveCaptionInfo("caption audio source is mpv")
     }
   }
 
@@ -1718,10 +1763,44 @@ final class CaptionSource {
       guard !self.closed, self.mode != .failed else { return }
       let position = playhead.isFinite ? max(0, playhead) : 0
       self.playhead = position
+      if self.pullTap(playhead: position, window: window) {
+        self.mode = .mpv
+        self.tapMisses = 0
+        return
+      }
+      if self.mode == .mpv {
+        let attached = iina_caption_tap_attached() != 0
+        let rateOK = iina_caption_tap_rate() >= 8000
+        self.tapMisses += 1
+        // START_FILE can arm before the output exists, and ao-reload is then
+        // a no-op. One later reload covers the callback that was installed
+        // in between, or an output that was recreated without the wrapper.
+        if !self.forcedReload && self.tapMisses == 3 && !attached {
+          self.forcedReload = true
+          iina_caption_tap_arm()
+          DispatchQueue.main.async {
+            guard !PlayerCore.playerCores.isEmpty else { return }
+            let core = PlayerCore.active
+            guard core.mpv != nil, core.info.state.active else { return }
+            let code = core.mpv.command(rawString: "ao-reload")
+            liveCaptionInfo("caption tap retry ao-reload \(code)")
+          }
+          return
+        }
+        if attached && rateOK && self.tapMisses < 6 {
+          return
+        }
+        let limit = self.forcedReload ? 6 : 4
+        guard self.tapMisses >= limit, let url = self.mediaURL else { return }
+        liveCaptionInfo("mpv audio callback has no samples attached=\(attached ? 1 : 0) rate=\(iina_caption_tap_rate()); using a fallback decoder")
+        self.startFallback(url)
+      }
       if self.mode == .file {
         self.followFile(playhead: position, window: window, ahead: ahead)
       } else if self.mode == .cache {
         self.followCache(playhead: position, window: window, ahead: ahead)
+      } else if self.mode == .reader {
+        self.pumpReader(playhead: position, window: window)
       }
     }
   }
@@ -1735,15 +1814,18 @@ final class CaptionSource {
       self.playhead = position
       let origin = self.pcm.startTime
       let have = self.pcm.coveredUntil()
-      let requestedStart = position
-      let requestedEnd = position + window
+      // mpv's callback is audio that has just played, so the window ends at
+      // the playhead. A fallback decoder may instead hold audio ahead of it.
+      let played = have <= position + 0.35 && have + 0.05 >= position
+      let requestedStart = played ? max(0, position - window) : position
+      let requestedEnd = played ? position : position + window
       self.requestedStart = requestedStart
       self.requestedEnd = requestedEnd
       let overlapStart = max(requestedStart, origin)
       let overlapEnd = min(requestedEnd, have)
       let overlap = overlapEnd - overlapStart
       let inside = position >= origin - 0.3 && position <= have + 0.15
-      liveCaptionInfo("window requested \(self.seconds(requestedStart))-\(self.seconds(requestedEnd)) covered \(self.seconds(origin))-\(self.seconds(have)) playhead \(self.seconds(position)) overlap \(self.seconds(max(0, overlap)))")
+      liveCaptionInfo("window requested \(self.seconds(requestedStart))-\(self.seconds(requestedEnd)) covered \(self.seconds(origin))-\(self.seconds(have)) playhead \(self.seconds(position)) overlap \(self.seconds(max(0, overlap))) source=\(self.mode.rawValue)")
       guard self.mode != .failed, self.mode != .closed, self.pcm.aligned, inside, overlap >= 0.5 else { return }
       result = self.pcm.slice(from: overlapStart, to: overlapEnd)
       if result == nil {
@@ -1751,6 +1833,141 @@ final class CaptionSource {
       }
     }
     return result
+  }
+
+  private func pullTap(playhead: Double, window: Double) -> Bool {
+    guard iina_caption_tap_attached() != 0 else { return false }
+    let rate = Int(iina_caption_tap_rate())
+    guard rate >= 8000 else { return false }
+    let frames = min(rate * 12, max(rate, rate * Int(window + 1)))
+    if nativeScratch.count < frames {
+      nativeScratch = [Float](repeating: 0, count: frames)
+    }
+    let got = nativeScratch.withUnsafeMutableBufferPointer { buffer -> Int32 in
+      guard let base = buffer.baseAddress else { return 0 }
+      return iina_caption_tap_copy(base, Int32(frames))
+    }
+    guard got >= Int32(rate / 2) else { return false }
+    let native = Array(nativeScratch.prefix(Int(got)))
+    let mono = resample(native, from: rate, to: 16000)
+    guard mono.count >= 8000 else { return false }
+    let duration = Double(mono.count) / 16000
+    let origin = max(0, playhead - duration)
+    pcm.reset(at: origin, aligned: true)
+    pcm.append(mono, at: origin)
+    if !loggedTapFormat {
+      loggedTapFormat = true
+      liveCaptionInfo("mpv audio \(rate) Hz \(iina_caption_tap_channels()) ch")
+    }
+    clearFailure()
+    return true
+  }
+
+  private func resample(_ input: [Float], from inputRate: Int, to outputRate: Int) -> [Float] {
+    guard inputRate > 0, !input.isEmpty else { return [] }
+    if abs(inputRate - outputRate) < 2 { return input }
+    let ratio = Double(inputRate) / Double(outputRate)
+    let count = Int(Double(input.count) / ratio)
+    guard count > 1 else { return input }
+    var output = [Float](repeating: 0, count: count)
+    let last = input.count - 1
+    for index in 0..<count {
+      let position = Double(index) * ratio
+      let left = min(last, Int(position))
+      let right = min(last, left + 1)
+      let fraction = Float(position - Double(left))
+      output[index] = input[left] * (1 - fraction) + input[right] * fraction
+    }
+    return output
+  }
+
+  /// Used only when mpv's playback callback never arrives. A local file can
+  /// be decoded again. A network item stays on the packets mpv has cached.
+  private func startFallback(_ url: URL) {
+    if iina_caption_tap_attached() == 0 {
+      iina_caption_tap_disarm()
+    }
+    if url.isFileURL {
+      openLocal(url)
+      if mode == .failed && startAVReader(url) {
+        clearFailure()
+        mode = .reader
+      }
+      return
+    }
+    liveCaptionInfo("mpv callback missing; reading the player cache without a second connection")
+    beginCache(localFile: false)
+  }
+
+  private func startAVReader(_ url: URL) -> Bool {
+    reader?.cancelReading()
+    reader = nil
+    readerOutput = nil
+    let asset = AVURLAsset(url: url, options: [AVURLAssetPreferPreciseDurationAndTimingKey: false])
+    readerAsset = asset
+    let tracks = asset.tracks(withMediaType: .audio)
+    guard let track = tracks.first else {
+      liveCaptionError("AVAssetReader fallback found no audio track")
+      return false
+    }
+    guard let reader = try? AVAssetReader(asset: asset) else {
+      liveCaptionError("AVAssetReader fallback could not open this file")
+      return false
+    }
+    let settings: [String: Any] = [
+      AVFormatIDKey: kAudioFormatLinearPCM,
+      AVLinearPCMBitDepthKey: 32,
+      AVLinearPCMIsFloatKey: true,
+      AVLinearPCMIsBigEndianKey: false,
+      AVLinearPCMIsNonInterleaved: false,
+      AVSampleRateKey: 16000,
+      AVNumberOfChannelsKey: 1
+    ]
+    let output = AVAssetReaderTrackOutput(track: track, outputSettings: settings)
+    output.alwaysCopiesSampleData = true
+    guard reader.canAdd(output) else { return false }
+    reader.add(output)
+    let start = CMTime(seconds: max(0, playhead - 0.2), preferredTimescale: 16000)
+    reader.timeRange = CMTimeRange(start: start, duration: CMTime.positiveInfinity)
+    guard reader.startReading() else {
+      liveCaptionError("AVAssetReader fallback did not start")
+      return false
+    }
+    self.reader = reader
+    self.readerOutput = output
+    pcm.reset(at: max(0, playhead - 0.2), aligned: true)
+    liveCaptionInfo("AVAssetReader fallback for a local file")
+    return true
+  }
+
+  private func pumpReader(playhead: Double, window: Double) {
+    guard let output = readerOutput, let reader, reader.status == .reading else { return }
+    let target = playhead + window
+    var pulls = 0
+    while pulls < 32 && pcm.coveredUntil() < target + 0.15 {
+      guard let sample = output.copyNextSampleBuffer() else { break }
+      pulls += 1
+      guard let floats = readerFloats(sample) else { continue }
+      var pts = CMSampleBufferGetPresentationTimeStamp(sample).seconds
+      if !pts.isFinite { pts = pcm.coveredUntil() }
+      pcm.append(floats, at: pts)
+    }
+  }
+
+  private func readerFloats(_ sample: CMSampleBuffer) -> [Float]? {
+    let count = CMSampleBufferGetNumSamples(sample)
+    guard count > 0, let block = CMSampleBufferGetDataBuffer(sample) else { return nil }
+    var length = 0
+    var pointer: UnsafeMutablePointer<Int8>?
+    let status = CMBlockBufferGetDataPointer(block, atOffset: 0, lengthAtOffsetOut: nil, totalLengthOut: &length, dataPointerOut: &pointer)
+    guard status == noErr, let pointer, length >= count * MemoryLayout<Float>.size else { return nil }
+    var mono = [Float](repeating: 0, count: count)
+    pointer.withMemoryRebound(to: Float.self, capacity: count) { raw in
+      for index in 0..<count {
+        mono[index] = raw[index]
+      }
+    }
+    return mono
   }
 
   private func seconds(_ value: Double) -> String {
@@ -1985,6 +2202,13 @@ final class CaptionSource {
       iina_caption_close(decoder)
     }
     decoder = nil
+    reader?.cancelReading()
+    reader = nil
+    readerOutput = nil
+    readerAsset = nil
+    mediaURL = nil
+    tapMisses = 0
+    forcedReload = false
     cacheThin = false
     failureStatus = nil
     failureOSD = nil
@@ -2108,7 +2332,7 @@ final class LiveCaptionSettingsView: NSView {
     syncLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
     refreshStatus()
 
-    let note = NSTextField(wrappingLabelWithString: "A local file is decoded ahead of the playhead, and playback is not held back. A network or live stream uses audio the player has already buffered, so the provider is not opened a second time. A live channel holds the picture in mpv's cache (about 4–6 seconds unless transcription takes longer). A file never takes that hold. Changing channel detects again. Turning captions off jumps that channel back to live. Delay live TV, above, turns the hold off and leaves the channel at the live edge. The banner shows Subtitles synced, live +Ns while the hold is on. Depth is computed from the frame already on screen, so it waits with that picture. Each line uses the audio time, not the time the text arrived. Base is lighter; Small uses more CPU and GPU on an M2. Whisper translates into English only. Other languages use the macOS 26 system translator when that language is installed, or the API key (caption text only). On earlier macOS, without a key, the line stays in the recognized language. Place ggml-base-encoder.mlmodelc or ggml-small-encoder.mlmodelc next to the ggml file to use the Core ML encoder; otherwise Metal or the CPU runs the model. This was not timed on a Mac.")
+    let note = NSTextField(wrappingLabelWithString: "Captions use the audio mpv is already playing, for any format the player can open, without a second connection. A local file can fall back to its own decode, then AVFoundation, only if that playback audio never arrives. A network or live stream is not opened again. A live channel holds the picture in mpv's cache (about 4–6 seconds unless transcription takes longer). A file never takes that hold. Changing channel detects again. Turning captions off jumps that channel back to live. Delay live TV, above, turns the hold off and leaves the channel at the live edge. The banner shows Subtitles synced, live +Ns while the hold is on. Depth is computed from the frame already on screen, so it waits with that picture. Each line uses the audio time, not the time the text arrived. Base is lighter; Small uses more CPU and GPU on an M2. Whisper translates into English only. Other languages use the macOS 26 system translator when that language is installed, or the API key (caption text only). On earlier macOS, without a key, the line stays in the recognized language. Place ggml-base-encoder.mlmodelc or ggml-small-encoder.mlmodelc next to the ggml file to use the Core ML encoder; otherwise Metal or the CPU runs the model. This was not timed on a Mac.")
     note.preferredMaxLayoutWidth = 400
     note.textColor = .secondaryLabelColor
     note.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
