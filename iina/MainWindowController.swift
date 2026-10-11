@@ -1078,7 +1078,9 @@ class MainWindowController: PlayerWindowController {
   // MARK: - Mouse / Trackpad events
 
   override func keyDown(with event: NSEvent) {
-    if IPTVLiveOverlayController.shared.handleKeyDown(event) { return }
+    let consumed = IPTVLiveOverlayController.shared.handleKeyDown(event)
+    IPTVLiveOverlayController.shared.logKey(event, source: "player-window", consumed: consumed)
+    if consumed { return }
     if isShowingPersistentOSD {
       let keyCode = KeyCodeHelper.mpvKeyCode(from: event)
       let normalizedKeyCode = KeyCodeHelper.normalizeMpv(keyCode)
