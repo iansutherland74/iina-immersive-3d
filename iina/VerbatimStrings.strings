@@ -1,0 +1,46 @@
+/* 
+  VerbatimStrings.strings
+  iina
+
+  Created by Hechen Li on 2026-07-01.
+  Copyright © 2026 lhc. All rights reserved.
+*/
+
+"settings.screenShotFormat.items.0" = "PNG (.png)";
+"settings.screenShotFormat.items.1" = "JPEG (.jpg)";
+"settings.screenShotFormat.items.2" = "JPEG (.jpeg)";
+"settings.screenShotFormat.items.3" = "WebP (.webp)";
+"settings.screenShotFormat.items.4" = "JPEG XL (.jxl)";
+"settings.screenShotFormat.items.5" = "AVIF (.avif)";
+
+"settings.toneMappingAlgorithm.items.0" = "auto";
+"settings.toneMappingAlgorithm.items.1" = "clip";
+"settings.toneMappingAlgorithm.items.2" = "mobius";
+"settings.toneMappingAlgorithm.items.3" = "reinhard";
+"settings.toneMappingAlgorithm.items.4" = "hable";
+"settings.toneMappingAlgorithm.items.5" = "bt.2390";
+"settings.toneMappingAlgorithm.items.6" = "gamma";
+"settings.toneMappingAlgorithm.items.7" = "linear";
+
+"settings.spdifAC3.label" = "AC3";
+"settings.spdifDTS.label" = "DTS";
+"settings.spdifDTSHD.label" = "DTS-HD";
+"settings.spdifEAC3.label" = "EAC3";
+"settings.spdifTRUEHD.label" = "TRUEHD";
+
+"settings.audioDriverEnableAVFoundation.items.0" = "Core Audio";
+"settings.audioDriverEnableAVFoundation.items.1" = "AVFoundation";
+
+"settings.immersive3D.section" = "Immersive 3D";
+"settings.immersive3DDepthModel.label" = "Depth Model";
+"settings.immersive3DDepthModel.desc" = "Depth Anything V2 Small is the default (Apple Core ML). Depth Anything 3 Small needs a package from other/convert_depth_anything_3.py. Changing this reloads the model.";
+"settings.immersive3DDepthModel.items.0" = "Depth Anything V2 Small";
+"settings.immersive3DDepthModel.items.1" = "Depth Anything 3 Small";
+
+"settings.iptv.section" = "IPTV";
+"settings.iptvTMDBAPIKey.label" = "TMDB API Key";
+"settings.iptvTMDBAPIKey.desc" = "Optional. A v3 key from themoviedb.org fills missing posters and plots for Movies and Series. A key that starts with ey is sent as a v4 bearer token. The key is stored in preferences, not the Keychain. Leave this blank to use only what the provider sends.";
+
+"settings.transportRTSPThrough.items.1" = "TCP";
+"settings.transportRTSPThrough.items.2" = "UDP";
+"settings.transportRTSPThrough.items.3" = "HTTP";
