@@ -549,8 +549,7 @@ final class Immersive3DController: NSObject, NSWindowDelegate {
     stopObservingScreenParameters()
     DepthEstimator.shared.shutdown()
     exitGlasses(closePanel: true)
-    guard !PlayerCore.playerCores.isEmpty else { return }
-    let main = PlayerCore.active.mainWindow
+    guard !PlayerCore.playerCores.isEmpty, let main = PlayerCore.active.mainWindow else { return }
     if let prior = main.fsState.priorWindowedFrame {
       main.replacePriorFullScreenFrame(with: prior)
     }
