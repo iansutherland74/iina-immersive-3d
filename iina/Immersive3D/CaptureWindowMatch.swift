@@ -62,27 +62,27 @@ enum CaptureWindowMatch {
   }
 
   static func decide(track: CaptureTrack, windows: [CaptureWindowRecord], displayIDs: [UInt32]) -> CaptureFollowDecision {
-    let sameApp = windows.filter { sameApp($0, track) }
+    let appWindows = windows.filter { matchesApp($0, track) }
     if track.kind == .display {
-      guard !track.bundleID.isEmpty || !track.owner.isEmpty, let best = largest(sameApp) else {
+      guard !track.bundleID.isEmpty || !track.owner.isEmpty, let best = largest(appWindows) else {
         return .keep
       }
       let app = appName(track)
-      return .window(best, "\(app) window \(best.id) is back; leaving whole-display capture")
+      return .window(best, reason: "\(app) window \(best.id) is back; leaving whole-display capture")
     }
     if let current = windows.first(where: { $0.id == track.windowID }) {
       if let replacement = titleReplacement(track: track, current: current, windows: windows) {
-        return .window(replacement, "window \(track.windowID) replaced by \(replacement.id) (same title)")
+        return .window(replacement, reason: "window \(track.windowID) replaced by \(replacement.id) (same title)")
       }
-      if !current.onScreen, let best = largest(sameApp.filter { $0.id != current.id }) {
+      if !current.onScreen, let best = largest(appWindows.filter { $0.id != current.id }) {
         let app = appName(track)
-        return .window(best, "window \(track.windowID) left the screen; using largest \(app) window \(best.id)")
+        return .window(best, reason: "window \(track.windowID) left the screen; using largest \(app) window \(best.id)")
       }
       return .keep
     }
-    if let best = largest(sameApp) {
+    if let best = largest(appWindows) {
       let app = appName(track)
-      return .window(best, "window \(track.windowID) is gone; largest \(app) window \(best.id) \(best.width)x\(best.height)")
+      return .window(best, reason: "window \(track.windowID) is gone; largest \(app) window \(best.id) \(best.width)x\(best.height)")
     }
     let display = track.displayID != 0 ? track.displayID : (displayIDs.first ?? 0)
     if display != 0 {
@@ -94,7 +94,7 @@ enum CaptureWindowMatch {
 
   private static func titleReplacement(track: CaptureTrack, current: CaptureWindowRecord, windows: [CaptureWindowRecord]) -> CaptureWindowRecord? {
     let titled = windows.filter { window in
-      window.id != track.windowID && sameApp(window, track) && titlesMatch(window.title, track.title)
+      window.id != track.windowID && matchesApp(window, track) && titlesMatch(window.title, track.title)
     }
     guard let match = preferred(titled) else { return nil }
     if !current.onScreen && match.onScreen { return match }
@@ -102,7 +102,7 @@ enum CaptureWindowMatch {
     return nil
   }
 
-  private static func sameApp(_ window: CaptureWindowRecord, _ track: CaptureTrack) -> Bool {
+  private static func matchesApp(_ window: CaptureWindowRecord, _ track: CaptureTrack) -> Bool {
     if !track.bundleID.isEmpty, window.bundleID == track.bundleID { return true }
     if !track.owner.isEmpty, window.owner.caseInsensitiveCompare(track.owner) == .orderedSame { return true }
     return false
