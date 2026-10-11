@@ -121,3 +121,42 @@ kernel void immersiveStereo(
   const uint yWrite = params.glOriented > 0.5 ? (height - 1 - gid.y) : gid.y;
   outTex.write(color, uint2(gid.x, yWrite));
 }
+
+// Top-down RGBA for the depth model. glOriented > 0.5 means the source's v=0
+// is the bottom row (the OpenGL IOSurface). A ScreenCaptureKit texture is not.
+kernel void immersiveScaleRGBA(
+  texture2d<float, access::sample> source [[texture(0)]],
+  texture2d<float, access::write> dest [[texture(1)]],
+  constant float &glOriented [[buffer(0)]],
+  uint2 gid [[thread_position_in_grid]]
+) {
+  if (gid.x >= dest.get_width() || gid.y >= dest.get_height()) return;
+  constexpr sampler linear(coord::normalized, address::clamp_to_edge, filter::linear);
+  const float u = (float(gid.x) + 0.5) / float(dest.get_width());
+  const float vTop = (float(gid.y) + 0.5) / float(dest.get_height());
+  const float v = glOriented > 0.5 ? (1.0 - vTop) : vTop;
+  float4 color = source.sample(linear, float2(u, v));
+  dest.write(color, gid);
+}
+
+// Copies a top-down sub-rectangle into its own texture. Depth and the stereo
+// kernel then see only that rectangle. rect is normalized (x, y, w, h).
+struct CaptureCropRect {
+  float x;
+  float y;
+  float w;
+  float h;
+};
+
+kernel void immersiveCropBGRA(
+  texture2d<float, access::sample> source [[texture(0)]],
+  texture2d<float, access::write> dest [[texture(1)]],
+  constant CaptureCropRect &rect [[buffer(0)]],
+  uint2 gid [[thread_position_in_grid]]
+) {
+  if (gid.x >= dest.get_width() || gid.y >= dest.get_height()) return;
+  constexpr sampler linear(coord::normalized, address::clamp_to_edge, filter::linear);
+  const float u = rect.x + (float(gid.x) + 0.5) / float(dest.get_width()) * rect.w;
+  const float v = rect.y + (float(gid.y) + 0.5) / float(dest.get_height()) * rect.h;
+  dest.write(source.sample(linear, float2(u, v)), gid);
+}

@@ -62,7 +62,7 @@ final class Immersive3DCompositor {
   func process(cglContext: CGLContextObj, layerFBO: GLuint, width: Int, height: Int, whenDepthReady: @escaping () -> Void) {
     guard !DepthEstimator.shared.isStopped else { return }
     guard width >= 16, height >= 16, !glFailed, !pipelineFailed else { return }
-    guard let device, let commandQueue else { return }
+    guard let device else { return }
     let snapshot = Immersive3DController.shared.currentSnapshot()
     guard snapshot.shouldProcess else { return }
 
@@ -93,12 +93,73 @@ final class Immersive3DCompositor {
     glBindFramebuffer(GLenum(GL_FRAMEBUFFER), 0)
     glFinish()
 
-    guard encode(commandQueue: commandQueue, surfaces: surfaces, snapshot: snapshot, width: width, height: height) else {
+    guard Immersive3DController.shared.submitFrame(
+      color: surfaces.colorMetal,
+      output: surfaces.outputMetal,
+      contentAspect: 0,
+      colorIsBottomUp: true,
+      depthRGBA: nil,
+      modelWidth: 0,
+      modelHeight: 0,
+      fullSizeEyes: nil,
+      compositor: self,
+      whenDepthReady: whenDepthReady
+    ) else {
       noteFailure("Metal encode")
       return
     }
     present(surfaces: surfaces, layerFBO: layerFBO, width: width, height: height)
     failureCount = 0
+  }
+
+  /// Shared stereo pass. The player framebuffer and Browser Capture both call this
+  /// through `Immersive3DController.submitFrame`. `color` is the source picture.
+  /// `output` receives the side-by-side image. A non-nil `depthRGBA` is a top-down
+  /// model-sized sample; nil means the caller already queued depth itself.
+  @discardableResult
+  func submitFrame(
+    color: MTLTexture,
+    output: MTLTexture,
+    contentAspect: Float,
+    colorIsBottomUp: Bool,
+    depthRGBA: [UInt8]?,
+    modelWidth: Int,
+    modelHeight: Int,
+    fullSizeEyes: Bool?,
+    whenDepthReady: @escaping () -> Void
+  ) -> Bool {
+    guard !DepthEstimator.shared.isStopped, !pipelineFailed else { return false }
+    guard let device, let commandQueue else { return false }
+    guard ensurePipeline(device: device) else { return false }
+    if let depthRGBA, modelWidth > 1, modelHeight > 1 {
+      if DepthEstimator.shared.inputSize() == nil {
+        DepthEstimator.shared.ensureLoaded()
+      }
+      considerDepthPixels(depthRGBA, width: modelWidth, height: modelHeight, whenDepthReady: whenDepthReady)
+    }
+    guard uploadDepthIfNeeded(device: device) != nil else { return false }
+    var snapshot = Immersive3DController.shared.currentSnapshot()
+    if let fullSizeEyes {
+      snapshot.fullSizeEyes = fullSizeEyes
+    }
+    if !colorIsBottomUp {
+      snapshot.enabled = true
+      snapshot.passThroughSBS = false
+    }
+    guard snapshot.shouldProcess else { return false }
+    let glOriented = colorIsBottomUp ? !snapshot.verticalFlip : snapshot.verticalFlip
+    guard encode(
+      commandQueue: commandQueue,
+      color: color,
+      output: output,
+      snapshot: snapshot,
+      width: output.width,
+      height: output.height,
+      contentAspect: contentAspect,
+      glOriented: glOriented
+    ) else { return false }
+    failureCount = 0
+    return true
   }
 
   // MARK: - Depth
@@ -121,6 +182,16 @@ final class Immersive3DCompositor {
     guard delta >= changeThreshold || stale || lastSubmit == .distantPast else { return }
     lastSubmit = now
     DepthEstimator.shared.submit(topDownRGBA: pixels, width: modelWidth, height: modelHeight, token: ObjectIdentifier(self), whenReady: whenDepthReady)
+  }
+
+  private func considerDepthPixels(_ pixels: [UInt8], width: Int, height: Int, whenDepthReady: @escaping () -> Void) {
+    let now = Date()
+    let delta = previousSmall.map { meanLumaDelta($0, pixels) } ?? 255
+    let stale = now.timeIntervalSince(lastSubmit) >= maxReuseInterval
+    previousSmall = pixels
+    guard delta >= changeThreshold || stale || lastSubmit == .distantPast else { return }
+    lastSubmit = now
+    DepthEstimator.shared.submit(topDownRGBA: pixels, width: width, height: height, token: ObjectIdentifier(self), whenReady: whenDepthReady)
   }
 
   private func uploadDepthIfNeeded(device: MTLDevice) -> MTLTexture? {
@@ -180,17 +251,26 @@ final class Immersive3DCompositor {
     }
   }
 
-  private func encode(commandQueue: MTLCommandQueue, surfaces: SharedSurfaces, snapshot: Immersive3DController.Snapshot, width: Int, height: Int) -> Bool {
+  private func encode(
+    commandQueue: MTLCommandQueue,
+    color: MTLTexture,
+    output: MTLTexture,
+    snapshot: Immersive3DController.Snapshot,
+    width: Int,
+    height: Int,
+    contentAspect: Float,
+    glOriented: Bool
+  ) -> Bool {
     guard let pipeline, let depthTexture,
           let commandBuffer = commandQueue.makeCommandBuffer(),
           let encoder = commandBuffer.makeComputeCommandEncoder() else { return false }
-    let content = contentRect(fullSizeEyes: snapshot.fullSizeEyes, width: width, height: height)
+    let content = contentRect(fullSizeEyes: snapshot.fullSizeEyes, width: width, height: height, contentAspect: contentAspect)
     var params = StereoParams(
       maxShift: snapshot.maxShift,
       convergence: snapshot.convergence,
       holeThreshold: 0.08,
       invertDepth: snapshot.invertDepth ? 1 : 0,
-      glOriented: snapshot.verticalFlip ? 0 : 1,
+      glOriented: glOriented ? 1 : 0,
       searchPixels: 18,
       contentX: content.x,
       contentY: content.y,
@@ -198,9 +278,9 @@ final class Immersive3DCompositor {
       contentH: content.h
     )
     encoder.setComputePipelineState(pipeline)
-    encoder.setTexture(surfaces.colorMetal, index: 0)
+    encoder.setTexture(color, index: 0)
     encoder.setTexture(depthTexture, index: 1)
-    encoder.setTexture(surfaces.outputMetal, index: 2)
+    encoder.setTexture(output, index: 2)
     encoder.setBytes(&params, length: MemoryLayout<StereoParams>.stride, index: 0)
     let threads = MTLSize(width: width, height: height, depth: 1)
     let group = MTLSize(width: 16, height: 16, depth: 1)
@@ -219,16 +299,21 @@ final class Immersive3DCompositor {
   /// Half-SBS (1920×1080 glasses) uses the full frame. A double-wide 3840×1080
   /// framebuffer pillarboxes a 16:9 picture into the center half; each eye then
   /// samples that half at full size.
-  private func contentRect(fullSizeEyes: Bool, width: Int, height: Int) -> (x: Float, y: Float, w: Float, h: Float) {
+  private func contentRect(fullSizeEyes: Bool, width: Int, height: Int, contentAspect: Float) -> (x: Float, y: Float, w: Float, h: Float) {
     guard fullSizeEyes, width > 1, height > 1 else { return (0, 0, 1, 1) }
-    var videoW = 0
-    var videoH = 0
-    if !PlayerCore.playerCores.isEmpty {
-      videoW = PlayerCore.active.info.displayWidth ?? 0
-      videoH = PlayerCore.active.info.displayHeight ?? 0
-    }
     let frameAspect = Float(width) / Float(height)
-    let videoAspect = (videoW > 0 && videoH > 0) ? Float(videoW) / Float(videoH) : (16.0 / 9.0)
+    let videoAspect: Float
+    if contentAspect > 0.01 {
+      videoAspect = contentAspect
+    } else {
+      var videoW = 0
+      var videoH = 0
+      if !PlayerCore.playerCores.isEmpty {
+        videoW = PlayerCore.active.info.displayWidth ?? 0
+        videoH = PlayerCore.active.info.displayHeight ?? 0
+      }
+      videoAspect = (videoW > 0 && videoH > 0) ? Float(videoW) / Float(videoH) : (16.0 / 9.0)
+    }
     if videoAspect >= frameAspect {
       let contentH = min(max(frameAspect / videoAspect, 0.01), 1)
       return (0, (1 - contentH) * 0.5, 1, contentH)

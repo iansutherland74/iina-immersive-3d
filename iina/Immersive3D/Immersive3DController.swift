@@ -11,6 +11,7 @@
 //  the long-press into 3D. Mirroring leaves a single NSScreen.
 
 import Cocoa
+import Metal
 
 final class Immersive3DController: NSObject, NSWindowDelegate {
   static let shared = Immersive3DController()
@@ -113,6 +114,13 @@ final class Immersive3DController: NSObject, NSWindowDelegate {
   private var savedMirrorLinks: [SavedMirrorLink]?
   private var screenParameterObserver: NSObjectProtocol?
   private(set) var glassesActive = false
+  /// Browser Capture's output window is on the glasses. Screen changes repin it
+  /// without moving the player window.
+  private var captureWindowPinned = false
+  var captureGlassesHandler: ((NSScreen, Bool) -> Void)?
+  /// Stereo pass for Browser Capture. The player keeps its own compositor so
+  /// this one is never touched from the OpenGL thread.
+  private let captureCompositor = Immersive3DCompositor()
   /// True after quit teardown starts. Fullscreen-state changes must not talk to mpv.
   var isShuttingDown: Bool { shuttingDown }
 
@@ -136,6 +144,73 @@ final class Immersive3DController: NSObject, NSWindowDelegate {
     lock.lock()
     defer { lock.unlock() }
     return snapshot
+  }
+
+  /// One stereo path for the player framebuffer and for Browser Capture.
+  /// Pass the view-layer compositor from OpenGL. Pass nil from capture; that
+  /// uses `captureCompositor`. `contentAspect` of 0 keeps the player video aspect.
+  @discardableResult
+  func submitFrame(
+    color: MTLTexture,
+    output: MTLTexture,
+    contentAspect: Float,
+    colorIsBottomUp: Bool,
+    depthRGBA: [UInt8]?,
+    modelWidth: Int,
+    modelHeight: Int,
+    fullSizeEyes: Bool?,
+    compositor: Immersive3DCompositor?,
+    whenDepthReady: @escaping () -> Void
+  ) -> Bool {
+    let pass = compositor ?? captureCompositor
+    return pass.submitFrame(
+      color: color,
+      output: output,
+      contentAspect: contentAspect,
+      colorIsBottomUp: colorIsBottomUp,
+      depthRGBA: depthRGBA,
+      modelWidth: modelWidth,
+      modelHeight: modelHeight,
+      fullSizeEyes: fullSizeEyes,
+      whenDepthReady: whenDepthReady
+    )
+  }
+
+  /// Puts `window` on the glasses display with the same frame, level, and
+  /// mirror handling as Play on Glasses. Does not move the player window.
+  func placeWindowOnGlasses(_ window: NSWindow) -> (screen: NSScreen, fullSizeEyes: Bool)? {
+    guard let screen = resolvedGlassesScreen() ?? Self.glassesCandidates().first else { return nil }
+    if !glassesActive {
+      rememberGlasses(screen)
+      _ = ensureGlassesExtended()
+    }
+    let target = resolvedGlassesScreen() ?? screen
+    pinExternalWindow(window, to: target)
+    captureWindowPinned = true
+    startObservingScreenParameters()
+    let fullSize = Self.isFullWidthSBS(target)
+    return (target, fullSize)
+  }
+
+  /// Returns a capture window to a normal preview frame. Mirroring is restored
+  /// only when Play on Glasses is not using the same session.
+  func returnWindowFromGlasses(_ window: NSWindow, previewFrame: NSRect) {
+    captureWindowPinned = false
+    window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
+    window.level = .normal
+    window.isMovable = true
+    window.hasShadow = true
+    window.collectionBehavior = [.canJoinAllSpaces]
+    let aspect = Self.safeAspect(NSSize(width: 16, height: 9))
+    window.aspectRatio = aspect
+    window.contentAspectRatio = aspect
+    if Self.isUsableWindowFrame(previewFrame) {
+      window.setFrame(previewFrame, display: true, animate: false)
+    }
+    if !glassesActive {
+      stopObservingScreenParameters()
+      restoreMirroringIfNeeded()
+    }
   }
 
   // MARK: - Media
@@ -230,7 +305,7 @@ final class Immersive3DController: NSObject, NSWindowDelegate {
     autoGlasses.target = self
     autoGlassesItem = autoGlasses
 
-    let block = [
+    var block = [
       enabled,
       strengthItem,
       modelMenuItem,
@@ -240,6 +315,10 @@ final class Immersive3DController: NSObject, NSWindowDelegate {
       autoGlasses,
       NSMenuItem.separator()
     ]
+    if #available(macOS 12.3, *) {
+      block.append(contentsOf: BrowserCaptureWindowController.shared.makeMenuItems())
+      block.append(NSMenuItem.separator())
+    }
     for (offset, item) in block.enumerated() {
       videoMenu.insertItem(item, at: min(2 + offset, videoMenu.numberOfItems))
     }
@@ -269,6 +348,9 @@ final class Immersive3DController: NSObject, NSWindowDelegate {
     da3ModelItem?.state = model == .depthAnything3Small ? .on : .off
     autoGlassesItem?.state = Preference.bool(for: .immersive3DAutoGlassesDisplay) ? .on : .off
     rebuildGlassesItem()
+    if #available(macOS 12.3, *) {
+      BrowserCaptureWindowController.shared.syncMenu()
+    }
   }
 
   @objc func toggleAutoGlassesDisplay(_ sender: Any?) {
@@ -519,6 +601,34 @@ final class Immersive3DController: NSObject, NSWindowDelegate {
     GlassesEyeControls.shared.sync()
   }
 
+  /// Same chrome as Play on Glasses, for a window that is not the player.
+  private func pinExternalWindow(_ window: NSWindow, to screen: NSScreen) {
+    window.styleMask = [.borderless]
+    window.titleVisibility = .hidden
+    window.titlebarAppearsTransparent = true
+    window.isOpaque = true
+    window.backgroundColor = .black
+    window.hasShadow = false
+    window.isMovable = false
+    window.isMovableByWindowBackground = false
+    window.hidesOnDeactivate = false
+    window.level = NSWindow.Level(rawValue: Self.glassesWindowLevel.rawValue + 1)
+    window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
+    window.minSize = NSSize(width: 1, height: 1)
+    window.contentMinSize = NSSize(width: 1, height: 1)
+    let aspect = Self.safeAspect(screen.frame.size)
+    window.aspectRatio = aspect
+    window.contentAspectRatio = aspect
+    applyGlassesFrame(screen.frame, to: window)
+    window.contentView?.layer?.contentsScale = screen.backingScaleFactor
+    NSApp.activate(ignoringOtherApps: true)
+    window.orderFrontRegardless()
+  }
+
+  func repinExternalWindow(_ window: NSWindow, on screen: NSScreen) {
+    pinExternalWindow(window, to: screen)
+  }
+
   /// Puts the window on `target` exactly. Origin is applied last because `setContentSize`
   /// keeps the top-left corner fixed.
   private func applyGlassesFrame(_ target: NSRect, to window: NSWindow) {
@@ -552,7 +662,11 @@ final class Immersive3DController: NSObject, NSWindowDelegate {
     shuttingDown = true
     LiveCaptionController.shared.noteFileEnded()
     pendingDisplayID = nil
+    captureWindowPinned = false
     stopObservingScreenParameters()
+    if #available(macOS 12.3, *) {
+      BrowserCaptureWindowController.shared.stopAll()
+    }
     DepthEstimator.shared.shutdown()
     exitGlasses(closePanel: true)
     guard !PlayerCore.playerCores.isEmpty, let main = PlayerCore.active.mainWindow else { return }
@@ -666,7 +780,16 @@ final class Immersive3DController: NSObject, NSWindowDelegate {
   }
 
   private func glassesScreenParametersChanged() {
-    guard !shuttingDown, glassesActive, !isPinningGlasses, !applyingDisplayConfig else { return }
+    guard !shuttingDown, !isPinningGlasses, !applyingDisplayConfig else { return }
+    if captureWindowPinned {
+      if !glassesActive {
+        _ = ensureGlassesExtended()
+      }
+      if let screen = resolvedGlassesScreen() ?? Self.glassesCandidates().first {
+        captureGlassesHandler?(screen, Self.isFullWidthSBS(screen))
+      }
+    }
+    guard glassesActive else { return }
     // A 2D/3D mode switch can put the glasses back into a mirror set.
     if ensureGlassesExtended() {
       playerOSD("Glasses set to an extended display")
@@ -738,17 +861,22 @@ final class Immersive3DController: NSObject, NSWindowDelegate {
     let saved = savedWindow
     if !glassesActive && saved == nil {
       hidePanel(close: closePanel)
-      stopObservingScreenParameters()
+      if !captureWindowPinned {
+        stopObservingScreenParameters()
+        restoreMirroringIfNeeded()
+      }
       GlassesEyeControls.shared.sync()
-      restoreMirroringIfNeeded()
       return
     }
     glassesActive = false
     glassesFullSizeEyes = false
     pendingDisplayID = nil
     // Drop the screen observer before setFrame or display reconfiguration, so a
-    // parameter change cannot pin the window again mid-quit.
-    stopObservingScreenParameters()
+    // parameter change cannot pin the player window again mid-quit. Browser
+    // Capture keeps the observer while its own window is still on the glasses.
+    if !captureWindowPinned {
+      stopObservingScreenParameters()
+    }
     let player = PlayerCore.playerCores.isEmpty ? nil : PlayerCore.active
     if let saved, let window = player?.mainWindow.window {
       let aspect = Self.safeAspect(saved.aspectRatio)
@@ -807,7 +935,9 @@ final class Immersive3DController: NSObject, NSWindowDelegate {
       }
     }
     GlassesEyeControls.shared.sync()
-    restoreMirroringIfNeeded()
+    if !captureWindowPinned {
+      restoreMirroringIfNeeded()
+    }
   }
 
   private func showPanel(for glasses: NSScreen) {

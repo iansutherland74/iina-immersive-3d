@@ -162,6 +162,11 @@
 		A3D1A0032F00000100BEEF03 /* DepthEstimator.swift in Sources */ = {isa = PBXBuildFile; fileRef = A3D1A0042F00000100BEEF04 /* DepthEstimator.swift */; };
 		A3D1A0052F00000100BEEF05 /* Immersive3DCompositor.swift in Sources */ = {isa = PBXBuildFile; fileRef = A3D1A0062F00000100BEEF06 /* Immersive3DCompositor.swift */; };
 		A3D1A0072F00000100BEEF07 /* Immersive3D.metal in Sources */ = {isa = PBXBuildFile; fileRef = A3D1A0082F00000100BEEF08 /* Immersive3D.metal */; };
+		A3D1A0122F00000100BEEF12 /* BrowserCaptureManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = A3D1A0132F00000100BEEF13 /* BrowserCaptureManager.swift */; };
+		A3D1A0142F00000100BEEF14 /* BrowserCaptureWindowController.swift in Sources */ = {isa = PBXBuildFile; fileRef = A3D1A0152F00000100BEEF15 /* BrowserCaptureWindowController.swift */; };
+		A3D1A0162F00000100BEEF16 /* BrowserCaptureRenderer.swift in Sources */ = {isa = PBXBuildFile; fileRef = A3D1A0172F00000100BEEF17 /* BrowserCaptureRenderer.swift */; };
+		A3D1A0182F00000100BEEF18 /* BrowserCaptureAudio.swift in Sources */ = {isa = PBXBuildFile; fileRef = A3D1A0192F00000100BEEF19 /* BrowserCaptureAudio.swift */; };
+		A3D1A01A2F00000100BEEF1A /* BrowserCaptureCrop.swift in Sources */ = {isa = PBXBuildFile; fileRef = A3D1A01B2F00000100BEEF1B /* BrowserCaptureCrop.swift */; };
 		B1E700012F00000100BEEF01 /* IPTVModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1E700022F00000100BEEF02 /* IPTVModels.swift */; };
 		B1E700032F00000100BEEF03 /* IPTVParsers.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1E700042F00000100BEEF04 /* IPTVParsers.swift */; };
 		B1E700052F00000100BEEF05 /* IPTVLibrary.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1E700062F00000100BEEF06 /* IPTVLibrary.swift */; };
@@ -1214,6 +1219,11 @@
 		A3D1A0042F00000100BEEF04 /* DepthEstimator.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = DepthEstimator.swift; sourceTree = "<group>"; };
 		A3D1A0062F00000100BEEF06 /* Immersive3DCompositor.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = Immersive3DCompositor.swift; sourceTree = "<group>"; };
 		A3D1A0082F00000100BEEF08 /* Immersive3D.metal */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.metal; path = Immersive3D.metal; sourceTree = "<group>"; };
+		A3D1A0132F00000100BEEF13 /* BrowserCaptureManager.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = BrowserCaptureManager.swift; sourceTree = "<group>"; };
+		A3D1A0152F00000100BEEF15 /* BrowserCaptureWindowController.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = BrowserCaptureWindowController.swift; sourceTree = "<group>"; };
+		A3D1A0172F00000100BEEF17 /* BrowserCaptureRenderer.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = BrowserCaptureRenderer.swift; sourceTree = "<group>"; };
+		A3D1A0192F00000100BEEF19 /* BrowserCaptureAudio.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = BrowserCaptureAudio.swift; sourceTree = "<group>"; };
+		A3D1A01B2F00000100BEEF1B /* BrowserCaptureCrop.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = BrowserCaptureCrop.swift; sourceTree = "<group>"; };
 		B1E700022F00000100BEEF02 /* IPTVModels.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = IPTVModels.swift; sourceTree = "<group>"; };
 		B1E700042F00000100BEEF04 /* IPTVParsers.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = IPTVParsers.swift; sourceTree = "<group>"; };
 		B1E700062F00000100BEEF06 /* IPTVLibrary.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = IPTVLibrary.swift; sourceTree = "<group>"; };
@@ -2421,6 +2431,11 @@
 				A3D1A0102F00000100BEEF10 /* GlassesEyeControls.swift */,
 				A3D1A0042F00000100BEEF04 /* DepthEstimator.swift */,
 				A3D1A0062F00000100BEEF06 /* Immersive3DCompositor.swift */,
+				A3D1A0132F00000100BEEF13 /* BrowserCaptureManager.swift */,
+				A3D1A0152F00000100BEEF15 /* BrowserCaptureWindowController.swift */,
+				A3D1A0172F00000100BEEF17 /* BrowserCaptureRenderer.swift */,
+				A3D1A0192F00000100BEEF19 /* BrowserCaptureAudio.swift */,
+				A3D1A01B2F00000100BEEF1B /* BrowserCaptureCrop.swift */,
 				A3D1A0082F00000100BEEF08 /* Immersive3D.metal */,
 			);
 			path = Immersive3D;
@@ -3148,6 +3163,11 @@
 				A3D1A0032F00000100BEEF03 /* DepthEstimator.swift in Sources */,
 				A3D1A0052F00000100BEEF05 /* Immersive3DCompositor.swift in Sources */,
 				A3D1A0072F00000100BEEF07 /* Immersive3D.metal in Sources */,
+				A3D1A0122F00000100BEEF12 /* BrowserCaptureManager.swift in Sources */,
+				A3D1A0142F00000100BEEF14 /* BrowserCaptureWindowController.swift in Sources */,
+				A3D1A0162F00000100BEEF16 /* BrowserCaptureRenderer.swift in Sources */,
+				A3D1A0182F00000100BEEF18 /* BrowserCaptureAudio.swift in Sources */,
+				A3D1A01A2F00000100BEEF1A /* BrowserCaptureCrop.swift in Sources */,
 				B1E700012F00000100BEEF01 /* IPTVModels.swift in Sources */,
 				B1E700032F00000100BEEF03 /* IPTVParsers.swift in Sources */,
 				B1E700052F00000100BEEF05 /* IPTVLibrary.swift in Sources */,
