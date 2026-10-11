@@ -153,6 +153,7 @@ final class IPTVLiveOverlayController {
     }
     let anchor = main.videoView.superview === container ? main.videoView : nil
     container.addSubview(host, positioned: .above, relativeTo: anchor)
+    GlassesEyeControls.shared.bringToFront()
     host.needsLayout = true
     ensureClock()
     redraw()
@@ -409,6 +410,16 @@ final class IPTVLiveOverlayController {
     attachIfNeeded()
   }
 
+  func showChannelList() {
+    guard session != nil else { return }
+    showList()
+  }
+
+  func showProgrammeGuide() {
+    guard session != nil else { return }
+    showGuide()
+  }
+
   private func showList() {
     clearDigits()
     revealCurrent()
@@ -647,8 +658,10 @@ struct IPTVLiveChrome {
   static func layout(in bounds: NSRect, mode: IPTVLiveOverlayController.Mode) -> IPTVLiveChrome {
     var chrome = IPTVLiveChrome()
     let inset: CGFloat = 18
+    // The per-eye control bar sits on the bottom of each half while the pointer is showing it.
+    let reserve: CGFloat = GlassesEyeControls.shared.shown ? 80 : 0
     let bannerHeight: CGFloat = min(132, max(96, bounds.height * 0.22))
-    chrome.banner = NSRect(x: inset, y: bounds.height - bannerHeight - inset, width: max(0, bounds.width - inset * 2), height: bannerHeight)
+    chrome.banner = NSRect(x: inset, y: bounds.height - bannerHeight - inset - reserve, width: max(0, bounds.width - inset * 2), height: bannerHeight)
     let buttonWidth: CGFloat = 92
     let buttonHeight: CGFloat = 26
     chrome.guideButton = NSRect(x: chrome.banner.maxX - buttonWidth - 14, y: chrome.banner.minY + 12, width: buttonWidth, height: buttonHeight)
@@ -658,7 +671,7 @@ struct IPTVLiveChrome {
       chrome.list = NSRect(x: inset, y: inset, width: width, height: max(0, chrome.banner.minY - inset * 2))
     }
     if mode == .guide {
-      chrome.guide = NSRect(x: inset, y: inset, width: max(0, bounds.width - inset * 2), height: max(0, bounds.height - inset * 2))
+      chrome.guide = NSRect(x: inset, y: inset, width: max(0, bounds.width - inset * 2), height: max(0, bounds.height - inset * 2 - reserve))
       chrome.banner = .zero
       chrome.channelsButton = .zero
       chrome.guideButton = .zero
@@ -889,7 +902,7 @@ final class IPTVLiveOverlayPane: NSView {
   }
 }
 
-private enum IPTVLiveDraw {
+enum IPTVLiveDraw {
   static let clock: DateFormatter = {
     let formatter = DateFormatter()
     formatter.timeStyle = .short

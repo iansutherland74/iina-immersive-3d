@@ -338,6 +338,7 @@ final class Immersive3DController: NSObject, NSWindowDelegate {
     } else {
       playerOSD("Immersive 3D off")
     }
+    GlassesEyeControls.shared.sync()
   }
 
   // MARK: - Glasses
@@ -512,6 +513,7 @@ final class Immersive3DController: NSObject, NSWindowDelegate {
     if !Self.framesMatch(window.frame, screen.frame) {
       log3D("Play on glasses: window frame \(Self.frameDescription(window.frame)) does not match \(screen.localizedName) \(Self.frameDescription(screen.frame))", level: .error)
     }
+    GlassesEyeControls.shared.sync()
   }
 
   /// Puts the window on `target` exactly. Origin is applied last because `setContentSize`
@@ -733,6 +735,7 @@ final class Immersive3DController: NSObject, NSWindowDelegate {
     if !glassesActive && saved == nil {
       hidePanel(close: closePanel)
       stopObservingScreenParameters()
+      GlassesEyeControls.shared.sync()
       restoreMirroringIfNeeded()
       return
     }
@@ -797,6 +800,7 @@ final class Immersive3DController: NSObject, NSWindowDelegate {
         player.mainWindow.showUI()
       }
     }
+    GlassesEyeControls.shared.sync()
     restoreMirroringIfNeeded()
   }
 
