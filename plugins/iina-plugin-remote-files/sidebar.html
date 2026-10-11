@@ -1,0 +1,347 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Remote Files</title>
+  <style>
+    :root { color-scheme: dark light; --line: rgba(127,127,127,.35); --muted: #8e8e93; --accent: #0a84ff; --warn: #ff9f0a; }
+    * { box-sizing: border-box; }
+    body { margin: 0; padding: 12px; font: 13px/1.35 -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif; }
+    h1 { font-size: 15px; margin: 0 0 8px; }
+    label { display: block; margin: 8px 0 4px; color: var(--muted); }
+    input, select { width: 100%; font: inherit; padding: 6px 8px; border-radius: 6px; border: 1px solid var(--line); background: transparent; color: inherit; }
+    button { font: inherit; border: 0; border-radius: 6px; padding: 6px 10px; background: var(--accent); color: white; }
+    button.plain { background: transparent; color: var(--accent); padding: 6px 0; margin-right: 8px; }
+    button.item { width: 100%; text-align: left; background: transparent; color: inherit; border-radius: 0; margin: 0; padding: 8px 2px; }
+    .note { color: var(--muted); }
+    .warn { color: var(--warn); }
+    ul { list-style: none; margin: 8px 0 0; padding: 0; }
+    li { border-top: 1px solid var(--line); }
+    .meta { color: var(--muted); float: right; }
+    .row { display: flex; gap: 8px; margin-top: 8px; align-items: center; }
+    #editor { margin-top: 12px; }
+    .thumb { width: 42px; height: 42px; object-fit: cover; border-radius: 4px; margin-right: 8px; vertical-align: middle; background: rgba(127,127,127,.25); }
+    .bar { height: 3px; background: rgba(127,127,127,.35); margin-top: 4px; }
+    .bar > span { display: block; height: 100%; background: var(--accent); }
+  </style>
+</head>
+<body>
+  <div id="servers">
+    <h1>Remote files</h1>
+    <p class="note">WebDAV, FTP, FTPS, SMB, SFTP, Jellyfin, Plex, Emby, and DLNA. FebBox is https://webdav.febbox.com. Nextcloud is https://host/remote.php/dav/files/name/</p>
+    <div class="row">
+      <button id="discover" class="plain" type="button">Discover</button>
+      <button id="history" class="plain" type="button">History</button>
+      <button id="favourites" class="plain" type="button">Favourites</button>
+    </div>
+    <ul id="server-list"></ul>
+    <ul id="extra"></ul>
+    <p id="server-warning" class="warn" hidden></p>
+    <div id="editor">
+      <label for="name">Name</label>
+      <input id="name" placeholder="FebBox">
+      <label for="protocol">Protocol</label>
+      <select id="protocol">
+        <option value="webdav">WebDAV</option>
+        <option value="ftp">FTP</option>
+        <option value="ftps">FTPS</option>
+        <option value="smb">SMB</option>
+        <option value="sftp">SFTP</option>
+        <option value="jellyfin">Jellyfin</option>
+        <option value="plex">Plex</option>
+        <option value="emby">Emby</option>
+        <option value="dlna">DLNA</option>
+      </select>
+      <label for="url">Address</label>
+      <input id="url" spellcheck="false" placeholder="https://webdav.febbox.com">
+      <label for="user">Username</label>
+      <input id="user" autocomplete="username">
+      <label for="password">Password</label>
+      <input id="password" type="password" autocomplete="current-password" placeholder="Saved in the Keychain">
+      <label id="tls-row"><input id="insecure" type="checkbox" style="width:auto"> Allow insecure TLS for FTP</label>
+      <label for="oskey">OpenSubtitles API key</label>
+      <input id="oskey" type="password" autocomplete="off" placeholder="Optional. Saved in the Keychain">
+      <button id="save-os" class="plain" type="button">Save OpenSubtitles key</button>
+      <div class="row">
+        <button id="save" type="button">Save</button>
+        <button id="cancel" class="plain" type="button" hidden>Cancel edit</button>
+      </div>
+    </div>
+  </div>
+  <div id="browser" hidden>
+    <div class="row">
+      <button id="back" class="plain" type="button">Servers</button>
+      <button id="up" class="plain" type="button" hidden>Up</button>
+      <button id="refresh" class="plain" type="button">Refresh</button>
+      <button id="play-folder" class="plain" type="button">Play folder</button>
+    </div>
+    <label for="query">Search</label>
+    <input id="query" placeholder="Filter this folder">
+    <div class="row">
+      <select id="sort">
+        <option value="name">Name</option>
+        <option value="date">Date</option>
+        <option value="size">Size</option>
+      </select>
+      <label style="margin:0"><input id="autoplay" type="checkbox" style="width:auto" checked> Next episode</label>
+    </div>
+    <h1 id="title">Folder</h1>
+    <div id="path" class="note"></div>
+    <p id="status" class="note"></p>
+    <ul id="list"></ul>
+  </div>
+  <script>
+    var editing = "";
+    var current = "";
+    var stack = [];
+    var folderEntries = [];
+
+    function post(name, data) { iina.postMessage(name, data || {}); }
+    function show(id) {
+      document.getElementById("servers").hidden = id !== "servers";
+      document.getElementById("browser").hidden = id !== "browser";
+    }
+    function setWarn(text) {
+      var node = document.getElementById("server-warning");
+      node.hidden = !text;
+      node.textContent = text || "";
+    }
+    function sizeText(bytes) {
+      if (!bytes) return "";
+      var units = ["B", "KB", "MB", "GB"];
+      var value = bytes, unit = 0;
+      while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit += 1; }
+      return (unit ? value.toFixed(1) : value) + " " + units[unit];
+    }
+    function syncTLS() {
+      var protocol = document.getElementById("protocol").value;
+      document.getElementById("tls-row").hidden = protocol !== "ftp" && protocol !== "ftps";
+    }
+    function shownEntries() {
+      var query = document.getElementById("query").value.trim().toLowerCase();
+      if (!query) return folderEntries;
+      return folderEntries.filter(function (entry) {
+        return String(entry.name || "").toLowerCase().indexOf(query) !== -1;
+      });
+    }
+    function clearEditor() {
+      editing = "";
+      ["name", "url", "user", "password"].forEach(function (id) { document.getElementById(id).value = ""; });
+      document.getElementById("protocol").value = "webdav";
+      document.getElementById("insecure").checked = false;
+      document.getElementById("password").placeholder = "Saved in the Keychain";
+      document.getElementById("cancel").hidden = true;
+      syncTLS();
+    }
+    function renderServers(servers) {
+      var list = document.getElementById("server-list");
+      list.textContent = "";
+      (servers || []).forEach(function (server) {
+        var item = document.createElement("li");
+        var open = document.createElement("button");
+        open.type = "button";
+        open.className = "item";
+        open.textContent = server.name + "  ";
+        var meta = document.createElement("span");
+        meta.className = "meta";
+        meta.textContent = server.protocol.toUpperCase();
+        open.appendChild(meta);
+        open.addEventListener("click", function () {
+          stack = [];
+          show("browser");
+          post("connect", { id: server.id });
+        });
+        var edit = document.createElement("button");
+        edit.type = "button";
+        edit.className = "plain";
+        edit.textContent = "Edit";
+        edit.addEventListener("click", function () {
+          editing = server.id;
+          document.getElementById("name").value = server.name || "";
+          document.getElementById("protocol").value = server.protocol || "webdav";
+          document.getElementById("url").value = server.url || "";
+          document.getElementById("user").value = server.username || "";
+          document.getElementById("password").value = "";
+          document.getElementById("password").placeholder = server.hasPassword ? "Saved in the Keychain" : "Password";
+          document.getElementById("insecure").checked = !!server.insecureTLS;
+          document.getElementById("cancel").hidden = false;
+          syncTLS();
+        });
+        var remove = document.createElement("button");
+        remove.type = "button";
+        remove.className = "plain";
+        remove.textContent = "Remove";
+        remove.addEventListener("click", function () { post("delete-server", { id: server.id }); });
+        item.appendChild(open);
+        item.appendChild(edit);
+        item.appendChild(remove);
+        list.appendChild(item);
+      });
+    }
+    function renderExtra(rows, onClick) {
+      var list = document.getElementById("extra");
+      list.textContent = "";
+      (rows || []).forEach(function (row) {
+        var item = document.createElement("li");
+        var button = document.createElement("button");
+        button.type = "button";
+        button.className = "item";
+        button.textContent = row.name + (row.server ? "  " : "");
+        if (row.kind || row.server) {
+          var meta = document.createElement("span");
+          meta.className = "meta";
+          meta.textContent = row.server || String(row.kind || "").toUpperCase();
+          button.appendChild(meta);
+        }
+        button.addEventListener("click", function () { onClick(row); });
+        item.appendChild(button);
+        list.appendChild(item);
+      });
+    }
+    function renderFiles(entries) {
+      var list = document.getElementById("list");
+      list.textContent = "";
+      (entries || []).forEach(function (entry) {
+        var item = document.createElement("li");
+        var button = document.createElement("button");
+        button.type = "button";
+        button.className = "item";
+        if (entry.image) {
+          var image = document.createElement("img");
+          image.className = "thumb";
+          image.alt = "";
+          image.src = entry.image;
+          button.appendChild(image);
+        }
+        button.appendChild(document.createTextNode((entry.folder ? "Folder  " : "") + entry.name));
+        var bits = [];
+        if (!entry.folder && entry.size) bits.push(sizeText(entry.size));
+        if (entry.date) bits.push(new Date(entry.date).toLocaleDateString());
+        if (bits.length) {
+          var meta = document.createElement("span");
+          meta.className = "meta";
+          meta.textContent = bits.join("  ");
+          button.appendChild(meta);
+        }
+        if (entry.progress > 0) {
+          var bar = document.createElement("div");
+          bar.className = "bar";
+          var fill = document.createElement("span");
+          fill.style.width = Math.round(entry.progress * 100) + "%";
+          bar.appendChild(fill);
+          button.appendChild(bar);
+        }
+        button.addEventListener("click", function () {
+          if (entry.folder) {
+            stack.push(current);
+            document.getElementById("query").value = "";
+            post("open", { href: entry.href });
+          } else {
+            post("play", { href: entry.href, name: entry.name });
+          }
+        });
+        var star = document.createElement("button");
+        star.type = "button";
+        star.className = "plain";
+        star.textContent = entry.favourite ? "Unfavourite" : "Favourite";
+        star.addEventListener("click", function () {
+          post("favourite", { href: entry.href, name: entry.name });
+        });
+        item.appendChild(button);
+        item.appendChild(star);
+        list.appendChild(item);
+      });
+    }
+
+    document.getElementById("protocol").addEventListener("change", syncTLS);
+    document.getElementById("save").addEventListener("click", function () {
+      post("save-server", {
+        id: editing,
+        name: document.getElementById("name").value,
+        protocol: document.getElementById("protocol").value,
+        url: document.getElementById("url").value,
+        username: document.getElementById("user").value,
+        password: document.getElementById("password").value,
+        insecureTLS: document.getElementById("insecure").checked
+      });
+    });
+    document.getElementById("cancel").addEventListener("click", clearEditor);
+    document.getElementById("back").addEventListener("click", function () {
+      stack = [];
+      show("servers");
+      post("servers");
+    });
+    document.getElementById("up").addEventListener("click", function () {
+      var previous = stack.pop();
+      if (previous) post("open", { href: previous });
+    });
+    document.getElementById("refresh").addEventListener("click", function () {
+      post("open", { href: current });
+    });
+    document.getElementById("play-folder").addEventListener("click", function () { post("play-folder"); });
+    document.getElementById("query").addEventListener("input", function () { renderFiles(shownEntries()); });
+    document.getElementById("sort").addEventListener("change", function () {
+      post("sort", { mode: document.getElementById("sort").value });
+    });
+    document.getElementById("autoplay").addEventListener("change", function () {
+      post("autoplay", { on: document.getElementById("autoplay").checked });
+    });
+    document.getElementById("discover").addEventListener("click", function () { post("discover"); });
+    document.getElementById("history").addEventListener("click", function () { post("history"); });
+    document.getElementById("favourites").addEventListener("click", function () { post("favourites"); });
+    document.getElementById("save-os").addEventListener("click", function () {
+      post("save-os-key", { key: document.getElementById("oskey").value });
+      document.getElementById("oskey").value = "";
+    });
+
+    iina.onMessage("servers", function (data) {
+      show("servers");
+      document.getElementById("extra").textContent = "";
+      renderServers(data && data.servers);
+      setWarn(data && data.warning);
+      if (data && data.saved) clearEditor();
+    });
+    iina.onMessage("form-error", function (data) {
+      setWarn(data && data.text);
+    });
+    iina.onMessage("listing", function (data) {
+      if (!data) return;
+      show("browser");
+      if (data.url != null) current = data.url;
+      document.getElementById("title").textContent = data.title || "Folder";
+      document.getElementById("path").textContent = data.display || current;
+      document.getElementById("up").hidden = stack.length === 0;
+      if (data.sort) document.getElementById("sort").value = data.sort;
+      document.getElementById("autoplay").checked = data.autoplay !== false;
+      document.getElementById("status").textContent = data.loading ? "Loading…" : (data.error || "");
+      if (!data.loading) {
+        folderEntries = data.entries || [];
+        renderFiles(shownEntries());
+      }
+    });
+    iina.onMessage("discovered", function (data) {
+      show("servers");
+      renderExtra(data && data.rows, function (row) {
+        document.getElementById("name").value = row.name || "";
+        document.getElementById("protocol").value = row.kind || "webdav";
+        document.getElementById("url").value = row.url || "";
+        syncTLS();
+      });
+    });
+    iina.onMessage("saved-items", function (data) {
+      show("servers");
+      renderExtra(data && data.rows, function (row) {
+        if (!row.serverId) return;
+        stack = [];
+        show("browser");
+        post("play-saved", { serverId: row.serverId, href: row.href, parent: row.parent, name: row.name });
+      });
+    });
+    iina.onMessage("status", function (data) {
+      document.getElementById("status").textContent = data && data.text || "";
+    });
+    syncTLS();
+    post("ready");
+  </script>
+</body>
+</html>
