@@ -550,6 +550,7 @@ final class Immersive3DController: NSObject, NSWindowDelegate {
     guard !didPrepareForTermination else { return }
     didPrepareForTermination = true
     shuttingDown = true
+    LiveCaptionController.shared.noteFileEnded()
     pendingDisplayID = nil
     stopObservingScreenParameters()
     DepthEstimator.shared.shutdown()

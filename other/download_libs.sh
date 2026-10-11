@@ -202,6 +202,95 @@ echo -e "${YELLOW}Downloading yt-dlp...${NC}"
 curl -s -L "$YT_DLP_DOWNLOAD_PATH" -o "$YT_DLP_PATH" && echo -e "${GREEN}yt-dlp downloaded${NC}"
 chmod +x "$YT_DLP_PATH"
 
+# whisper.cpp is built here and copied into the app. Model weights are not
+# downloaded; Settings downloads ggml-base.bin or ggml-small.bin later.
+build_whisper() {
+  local tag="v1.7.6"
+  local src="$DEPS_PATH/src/whisper.cpp"
+  local stamp="$src/.iina-tag"
+  local out="$LIB_PATH/libiina_whisper.dylib"
+  local arch
+  local jobs
+
+  if ! command -v cmake >/dev/null 2>&1; then
+    echo -e "${RED}cmake is required to build whisper.cpp${NC}" >&2
+    return 1
+  fi
+  if ! command -v git >/dev/null 2>&1; then
+    echo -e "${RED}git is required to fetch whisper.cpp ${tag}${NC}" >&2
+    return 1
+  fi
+
+  case "$ARCH" in
+    x86_64) arch="x86_64" ;;
+    *) arch="arm64" ;;
+  esac
+  if [[ "$ARCH" == "universal" ]]; then
+    echo -e "${YELLOW}whisper.cpp is built for arm64. Live captions target Apple Silicon.${NC}"
+  fi
+
+  if [[ -f "$out" && -f "$stamp" && "$(cat "$stamp")" == "$tag" ]]; then
+    echo -e "${GREEN}whisper.cpp ${tag} already built${NC}"
+    return 0
+  fi
+
+  rm -rf "$src"
+  mkdir -p "$DEPS_PATH/src"
+  echo -e "${YELLOW}Cloning whisper.cpp ${tag}...${NC}"
+  git clone --depth 1 --branch "$tag" https://github.com/ggml-org/whisper.cpp.git "$src" || return 1
+  printf "%s\n" "$tag" > "$stamp"
+
+  jobs="$(sysctl -n hw.ncpu 2>/dev/null || echo 4)"
+
+  try_whisper_build() {
+    local metal="$1"
+    local coreml="$2"
+    local dir="$DEPS_PATH/src/iina-whisper-build-${metal}-${coreml}"
+    local found
+    rm -rf "$dir"
+    echo -e "${YELLOW}Configuring whisper.cpp metal=${metal} coreml=${coreml} arch=${arch}${NC}"
+    cmake -S "$ROOT_PATH/other/whisper" -B "$dir" \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_OSX_ARCHITECTURES="${arch}" \
+      -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0 \
+      -DWHISPER_SRC="$src" \
+      -DIINA_GGML_METAL="${metal}" \
+      -DIINA_WHISPER_COREML="${coreml}" \
+      -DGGML_METAL_MACOSX_VERSION_MIN=13.0 || return 1
+    cmake --build "$dir" --config Release --parallel "$jobs" || return 1
+    found="$(find "$dir" -name 'libiina_whisper.dylib' -type f | head -n 1)"
+    if [[ -z "$found" ]]; then
+      echo -e "${RED}libiina_whisper.dylib was not produced${NC}" >&2
+      return 1
+    fi
+    cp -f "$found" "$out" || return 1
+    install_name_tool -id "@rpath/libiina_whisper.dylib" "$out" || true
+    printf "%s:%s\n" "$metal" "$coreml" > "$LIB_PATH/iina_whisper_backend.txt"
+    return 0
+  }
+
+  if [[ "$arch" == "arm64" ]]; then
+    if try_whisper_build ON ON; then
+      echo -e "${GREEN}Built whisper.cpp ${tag} with Metal and Core ML (encoder weights are optional at runtime)${NC}"
+      return 0
+    fi
+    echo -e "${YELLOW}Metal+Core ML build failed. Retrying with Metal only.${NC}"
+    if try_whisper_build ON OFF; then
+      echo -e "${GREEN}Built whisper.cpp ${tag} with Metal. Core ML was left out of this build.${NC}"
+      return 0
+    fi
+    echo -e "${YELLOW}Metal build failed. Retrying CPU only.${NC}"
+  fi
+  if try_whisper_build OFF OFF; then
+    echo -e "${YELLOW}Built whisper.cpp ${tag} for CPU only. Metal was not usable at deployment target 13.${NC}"
+    return 0
+  fi
+  echo -e "${RED}whisper.cpp build failed${NC}" >&2
+  return 1
+}
+
+build_whisper || exit 1
+
 mkdir -p "$PLUGIN_PATH"
 
 if [[ "$SKIP_PLUGINS" == true ]]; then

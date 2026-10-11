@@ -2114,6 +2114,7 @@ class PlayerCore: NSObject {
       IPTVLiveOverlayController.shared.attachIfNeeded()
       IPTVBrowseOverlayController.shared.noteForeignFile()
       IPTVBrowseOverlayController.shared.attachIfNeeded()
+      LiveCaptionController.shared.noteFileStarted(core: self)
     }
     if let url = info.currentURL {
       info.mpvMd5 = Utility.mpvWatchLaterMd5(url, ignorePathInWatchLaterConfig)
@@ -2287,6 +2288,7 @@ class PlayerCore: NSObject {
   }
 
   func fileEnded(_ dueToStopCommand: Bool) {
+    LiveCaptionController.shared.noteFileEnded()
     syncPositionIfNeeded()
     IPTVBrowseOverlayController.shared.noteFileEnded(position: info.videoPosition?.second, duration: info.videoDuration?.second, stopped: dueToStopCommand)
     IPTVLibrary.shared.playbackEnded(position: info.videoPosition?.second, duration: info.videoDuration?.second)
