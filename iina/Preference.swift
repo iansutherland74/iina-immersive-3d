@@ -101,6 +101,8 @@ struct Preference {
     static let liveCaptionLiveDelay = Key("liveCaptionLiveDelay")
     /** Raise the live buffer when measured transcription takes longer. */
     static let liveCaptionLiveDelayAuto = Key("liveCaptionLiveDelayAuto")
+    /** Draw caption status on the picture. Off hides it except a short start or error line. */
+    static let liveCaptionDiagnostics = Key("liveCaptionDiagnostics")
     /** HTTPS translation endpoint used when an API key is saved. */
     static let liveCaptionTranslateEndpoint = Key("liveCaptionTranslateEndpoint")
 
@@ -1212,6 +1214,7 @@ struct Preference {
     .liveCaptionSync: true,
     .liveCaptionLiveDelay: 5.0,
     .liveCaptionLiveDelayAuto: true,
+    .liveCaptionDiagnostics: false,
     .liveCaptionTranslateEndpoint: "https://api-free.deepl.com/v2/translate",
     .pauseWhenMinimized: false,
     .pauseWhenInactive: false,

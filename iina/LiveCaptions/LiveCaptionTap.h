@@ -14,6 +14,7 @@
 void iina_caption_tap_set_enabled(int enabled);
 void iina_caption_tap_arm(void);
 void iina_caption_tap_disarm(void);
+void iina_caption_tap_expect(int rate, int channels);
 void iina_caption_tap_mark(void);
 int iina_caption_tap_attached(void);
 int iina_caption_tap_rate(void);

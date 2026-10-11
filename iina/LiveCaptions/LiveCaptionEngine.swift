@@ -175,6 +175,9 @@ final class LiveCaptionController {
   private var savedCaptionSubVisibility: Bool?
   private var triedFlatTrack = false
   private var lastOSD = ""
+  private var osdShown = ""
+  private var osdHide: DispatchWorkItem?
+  private var bannerVisibleUntil: Date?
   private var audioMisses = 0
   private var loggedQuiet = false
   private var loggedEmpty = false
@@ -242,6 +245,13 @@ final class LiveCaptionController {
     return "Subtitles synced, live +\(seconds)s"
   }
 
+  /// The sync line is a status message. It is drawn only while diagnostics are on, and only for about two seconds after the text changes.
+  var transientBannerText: String? {
+    guard Preference.bool(for: .liveCaptionDiagnostics) else { return nil }
+    guard let bannerText, let until = bannerVisibleUntil, Date() < until else { return nil }
+    return bannerText
+  }
+
   func attachIfNeeded() {
     guard running else { return }
     overlay.attachIfNeeded()
@@ -277,36 +287,40 @@ final class LiveCaptionController {
     }
     if audioMisses >= 4 {
       if source.bufferedSeconds() >= 0.5 {
-        setStatus("Audio is buffered, but the playhead is outside that range. \(state)", osd: "Live captions: error: playhead outside audio")
+        setStatus("Audio is buffered, but the playhead is outside that range. \(state)", osd: "Live captions: playhead outside audio")
       } else if source.isCacheThin() {
-        setStatus("No audio has arrived from the player. \(state)", osd: "Live captions: error: no audio from the player")
+        setStatus("No audio has arrived from the player. \(state)", osd: "Live captions: no audio from the player")
       } else {
-        setStatus("No audio has arrived for captions. \(state)", osd: "Live captions: error: no audio captured")
+        setStatus("No audio has arrived for captions. \(state)", osd: "Live captions: no audio captured")
       }
     } else {
       presentStatusOSD("Live captions: listening")
     }
   }
 
-  /// Small top-of-picture line. Real captions use the subtitle track or overlay 7.
+  /// Top-of-picture status. Errors and the start line stay up for about two seconds. Other lines are logged always and drawn only when caption diagnostics are on.
   private func presentStatusOSD(_ line: String) {
     let draw = {
-      let captionVisible = !self.displayedText.isEmpty
-      let keep = line.contains("error:") || line.contains("loading")
-      if captionVisible && !keep {
-        if !self.lastOSD.isEmpty {
-          self.clearStatusOSD()
-        }
-        return
+      if line != self.lastOSD {
+        self.lastOSD = line
+        liveCaptionInfo(line)
       }
-      if line == self.lastOSD { return }
-      self.lastOSD = line
-      liveCaptionInfo(line)
+      let isError = line.contains("error:")
+      let isStart = line.contains("loading") || line == "Live captions on"
+      guard isError || isStart || Preference.bool(for: .liveCaptionDiagnostics) else { return }
+      if line == self.osdShown { return }
+      self.osdHide?.cancel()
+      self.osdShown = line
       let body = "{\\an8\\fs28\\bord2}" + self.escapeASS(line)
       let code = self.overlayCommand(id: 8, format: "ass-events", data: self.assEvent(body))
       if code < 0 {
         liveCaptionError("status osd-overlay failed \(code)")
       }
+      let hide = DispatchWorkItem { [weak self] in
+        self?.clearStatusOSD()
+      }
+      self.osdHide = hide
+      DispatchQueue.main.asyncAfter(deadline: .now() + 2, execute: hide)
     }
     if Thread.isMainThread {
       draw()
@@ -316,7 +330,6 @@ final class LiveCaptionController {
   }
 
   private func clearStatusOSD() {
-    lastOSD = ""
     _ = overlayCommand(id: 8, format: "none", data: "")
   }
 
@@ -408,6 +421,9 @@ final class LiveCaptionController {
     let time = core.mpv.getDouble(MPVProperty.timePos)
     let kind = url.isFileURL ? "file" : "network"
     liveCaptionInfo("engine start \(kind)")
+    // Drop the previous item's rate so a preview unit cannot match it before this item's output exists.
+    iina_caption_tap_expect(0, 0)
+    refreshTapExpect()
     iina_caption_tap_set_enabled(1)
     iina_caption_tap_mark()
     // The playback callback is installed when the audio output is created.
@@ -431,7 +447,8 @@ final class LiveCaptionController {
     installTimer()
     overlay.attachIfNeeded()
     let pace = CaptionPace.current()
-    setStatus("Listening. Captions lag the picture by about \(Int(pace.window)) seconds, plus model time.", osd: "Live captions: listening")
+    setStatus("Listening. Captions lag the picture by about \(Int(pace.window)) seconds, plus model time.", osd: "Live captions on")
+    refreshTapExpect()
     schedule(generation: token, delay: 0.4)
   }
 
@@ -445,6 +462,8 @@ final class LiveCaptionController {
       whisper.requestAbort(reason)
     }
     iina_caption_tap_set_enabled(0)
+    osdHide?.cancel()
+    osdShown = ""
     source.close()
     cues.removeAll()
     assSignature = ""
@@ -510,6 +529,7 @@ final class LiveCaptionController {
       return
     }
     loggedTime = false
+    refreshTapExpect()
     let waiting = playbackShouldWait()
     let ahead = (!waiting && !source.isLiveEdge) ? lookaheadLead() : 0
     reportedLookahead = ahead
@@ -572,6 +592,8 @@ final class LiveCaptionController {
       return
     }
     loggedEmpty = false
+    let spoken = parsed.map(\.text).joined(separator: " | ")
+    liveCaptionInfo("whisper text \(spoken.prefix(160))")
     parsed = parsed.map { cue in
       var next = cue
       let translated = translate(cue.text, sourceLanguage: sourceLanguage, target: target, alreadyEnglish: translateToEnglish)
@@ -609,18 +631,60 @@ final class LiveCaptionController {
   }
 
   private func ingest(_ incoming: [CaptionCue]) {
-    for cue in incoming where !cue.text.isEmpty {
-      let duplicate = cues.contains { existing in
-        existing.text == cue.text && abs(existing.start - cue.start) < 1.2
-      }
-      if !duplicate {
-        cues.append(cue)
+    var next = cues
+    for cue in incoming {
+      let text = captionLines(cue.text)
+      guard !text.isEmpty else { continue }
+      var item = cue
+      item.text = text
+      if let index = next.lastIndex(where: { sameCaption($0.text, text) && item.start <= $0.end + 2 }) {
+        var kept = next[index]
+        kept.start = min(kept.start, item.start)
+        kept.end = max(kept.end, item.end)
+        if text.count > kept.text.count { kept.text = text }
+        next[index] = kept
+      } else {
+        next.append(item)
       }
     }
-    cues.sort { $0.start < $1.start }
+    cues = clipCues(next)
     if cues.count > 24 {
       cues.removeFirst(cues.count - 24)
     }
+  }
+
+  /// Overlapping whisper windows repeat the same words. One cue is on screen at a time, and it wraps to at most two lines.
+  private func captionLines(_ text: String) -> String {
+    let parts = text.split(whereSeparator: \.isNewline).map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+    guard parts.count > 2 else { return parts.joined(separator: "\n") }
+    return parts.suffix(2).joined(separator: "\n")
+  }
+
+  private func captionKey(_ text: String) -> String {
+    text.lowercased()
+      .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+      .trimmingCharacters(in: CharacterSet(charactersIn: " .!?,;:\"'"))
+  }
+
+  private func sameCaption(_ lhs: String, _ rhs: String) -> Bool {
+    let left = captionKey(lhs)
+    let right = captionKey(rhs)
+    if left.isEmpty || right.isEmpty { return false }
+    if left == right { return true }
+    guard left.count >= 12, right.count >= 12 else { return false }
+    return left.contains(right) || right.contains(left)
+  }
+
+  private func clipCues(_ incoming: [CaptionCue]) -> [CaptionCue] {
+    var sorted = incoming.sorted { $0.start < $1.start }
+    for index in sorted.indices.dropLast() {
+      let limit = sorted[index + 1].start
+      if sorted[index].end > limit {
+        sorted[index].end = limit
+      }
+    }
+    return sorted.filter { $0.end > $0.start + 0.05 }
   }
 
   private func redisplay() {
@@ -661,9 +725,6 @@ final class LiveCaptionController {
         showFlatCaption(syncing: timed)
       }
     }
-    if !lastOSD.isEmpty {
-      presentStatusOSD(lastOSD)
-    }
   }
 
   /// A file, movie, or catch-up is timed to the audio. A live channel is too, once the
@@ -674,8 +735,9 @@ final class LiveCaptionController {
   }
 
   private func visibleText(at time: Double, timed: Bool) -> String {
-    guard timed else { return cues.last?.text ?? "" }
-    return cues.last { $0.start - 0.12 <= time && time < $0.end + 0.2 }?.text ?? ""
+    guard timed else { return captionLines(cues.last?.text ?? "") }
+    let text = cues.last { $0.start <= time && time < $0.end }?.text ?? ""
+    return captionLines(text)
   }
 
   private var displayedText = ""
@@ -836,6 +898,8 @@ final class LiveCaptionController {
     }
     suppressMPVCaption()
     clearStatusOSD()
+    lastOSD = ""
+    osdShown = ""
     guard let core else {
       previousSID = nil
       savedCaptionSubVisibility = nil
@@ -873,6 +937,8 @@ final class LiveCaptionController {
     Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     \(events)
     """
+    let summary = lines.map { "\(String(format: "%.2f", $0.start))-\(String(format: "%.2f", $0.end)) \($0.text)" }.joined(separator: " | ")
+    liveCaptionInfo("caption cues \(lines.count) \(summary.prefix(180))")
     do {
       try body.data(using: .utf8)?.write(to: subtitleURL, options: .atomic)
     } catch {
@@ -954,29 +1020,47 @@ final class LiveCaptionController {
     timingSamples += 1
   }
 
-  /// An IPTV live channel, and any other unseekable stream, cannot be decoded
-  /// from the future, so the picture waits. A file or a movie is read ahead
-  /// instead and is never held back, even if a live-channel session is still
-  /// set. The delay setting only turns this hold off.
+  /// An IPTV live channel cannot be decoded from the future, so the picture
+  /// waits. A file, movie, or any item with a finite duration is never held,
+  /// even when a live-channel session is still set. The delay setting only
+  /// turns this hold off.
   private func playbackShouldWait() -> Bool {
     guard Preference.bool(for: .liveCaptionEnabled), Preference.bool(for: .liveCaptionSync) else { return false }
     if activeURL?.isFileURL == true || source.isLocalFile { return false }
-    let decision = { () -> Bool? in
-      guard let session = IPTVLiveOverlayController.shared.session else { return nil }
-      if session.catchup != nil { return false }
-      if session.item.kind == .live { return true }
-      return false
+    let path = activeURL?.absoluteString ?? ""
+    let decision = { () -> Bool in
+      if IPTVLiveOverlayController.shared.holdsLiveCaption(path: path) { return true }
+      if !PlayerCore.playerCores.isEmpty, PlayerCore.active.mpv != nil {
+        let duration = PlayerCore.active.mpv.getDouble(MPVProperty.duration)
+        if duration.isFinite && duration > 1 && duration < 86400 { return false }
+      }
+      if IPTVLiveOverlayController.shared.session != nil { return false }
+      return self.source.isLiveEdge && self.source.isOpenEnded
     }
-    let known: Bool?
     if Thread.isMainThread {
-      known = decision()
-    } else {
-      var value: Bool?
-      DispatchQueue.main.sync { value = decision() }
-      known = value
+      return decision()
     }
-    if let known { return known }
-    return source.isLiveEdge && source.isOpenEnded
+    var value = false
+    DispatchQueue.main.sync { value = decision() }
+    return value
+  }
+
+  /// Remember the sample rate of the audio output that is actually playing, so a preview or other unit is ignored.
+  private func refreshTapExpect() {
+    let read = { () -> (Int, Int) in
+      guard let core = self.core, core.mpv != nil, core.info.state.active else { return (0, 0) }
+      return (core.mpv.getInt("audio-out-params/samplerate"), core.mpv.getInt("audio-out-params/channel-count"))
+    }
+    let params: (Int, Int)
+    if Thread.isMainThread {
+      params = read()
+    } else {
+      var value = (0, 0)
+      DispatchQueue.main.sync { value = read() }
+      params = value
+    }
+    guard params.0 >= 8000 else { return }
+    iina_caption_tap_expect(Int32(params.0), Int32(params.1))
   }
 
   private func desiredLiveDelay() -> Double {
@@ -1116,8 +1200,19 @@ final class LiveCaptionController {
     let text = describeSync()
     let banner = bannerText
     guard text != syncText || banner != lastBanner else { return }
+    let bannerChanged = banner != lastBanner
     syncText = text
     lastBanner = banner
+    if bannerChanged {
+      if banner != nil && Preference.bool(for: .liveCaptionDiagnostics) {
+        bannerVisibleUntil = Date().addingTimeInterval(2)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.05) {
+          IPTVLiveOverlayController.shared.redraw()
+        }
+      } else {
+        bannerVisibleUntil = nil
+      }
+    }
     NotificationCenter.default.post(name: .liveCaptionStatusChanged, object: nil)
     IPTVLiveOverlayController.shared.redraw()
   }
@@ -1684,6 +1779,7 @@ final class CaptionSource {
 
   private var mediaURL: URL?
   private var tapMisses = 0
+  private var tapProven = false
   private var forcedReload = false
   private var loggedTapFormat = false
   private var nativeScratch: [Float] = []
@@ -1740,6 +1836,7 @@ final class CaptionSource {
       self.mediaURL = url
       self.mode = .mpv
       self.tapMisses = 0
+      self.tapProven = false
       self.forcedReload = false
       self.loggedTapFormat = false
       self.setCapture(live: false, openEnded: false, localFile: url.isFileURL, duration: .infinity)
@@ -1764,10 +1861,14 @@ final class CaptionSource {
       let position = playhead.isFinite ? max(0, playhead) : 0
       self.playhead = position
       if self.pullTap(playhead: position, window: window) {
+        self.releaseDecoder()
         self.mode = .mpv
         self.tapMisses = 0
+        self.tapProven = true
         return
       }
+      // A working tap owns the buffer. A tap that has gone away can be armed again.
+      if self.tapProven && iina_caption_tap_attached() != 0 { return }
       if self.mode == .mpv {
         let attached = iina_caption_tap_attached() != 0
         let rateOK = iina_caption_tap_rate() >= 8000
@@ -1775,7 +1876,7 @@ final class CaptionSource {
         // START_FILE can arm before the output exists, and ao-reload is then
         // a no-op. One later reload covers the callback that was installed
         // in between, or an output that was recreated without the wrapper.
-        if !self.forcedReload && self.tapMisses == 3 && !attached {
+        if !self.forcedReload && self.tapMisses == 3 && (!attached || !self.tapProven) {
           self.forcedReload = true
           iina_caption_tap_arm()
           DispatchQueue.main.async {
@@ -2187,6 +2288,17 @@ final class CaptionSource {
     }
   }
 
+  private func releaseDecoder() {
+    if let decoder {
+      iina_caption_close(decoder)
+    }
+    decoder = nil
+    reader?.cancelReading()
+    reader = nil
+    readerOutput = nil
+    readerAsset = nil
+  }
+
   private func clearFailure() {
     failureStatus = nil
     failureOSD = nil
@@ -2208,6 +2320,7 @@ final class CaptionSource {
     readerAsset = nil
     mediaURL = nil
     tapMisses = 0
+    tapProven = false
     forcedReload = false
     cacheThin = false
     failureStatus = nil
@@ -2326,13 +2439,16 @@ final class LiveCaptionSettingsView: NSView {
     let auto = NSButton(checkboxWithTitle: "Auto-tune the live buffer to the measured transcription time", target: self, action: #selector(autoChanged(_:)))
     auto.state = Preference.bool(for: .liveCaptionLiveDelayAuto) ? .on : .off
 
+    let diagnostics = NSButton(checkboxWithTitle: "Show caption diagnostics", target: self, action: #selector(diagnosticsChanged(_:)))
+    diagnostics.state = Preference.bool(for: .liveCaptionDiagnostics) ? .on : .off
+
     syncLabel.translatesAutoresizingMaskIntoConstraints = false
     syncLabel.preferredMaxLayoutWidth = 400
     syncLabel.textColor = .secondaryLabelColor
     syncLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
     refreshStatus()
 
-    let note = NSTextField(wrappingLabelWithString: "Captions use the audio mpv is already playing, for any format the player can open, without a second connection. A local file can fall back to its own decode, then AVFoundation, only if that playback audio never arrives. A network or live stream is not opened again. A live channel holds the picture in mpv's cache (about 4–6 seconds unless transcription takes longer). A file never takes that hold. Changing channel detects again. Turning captions off jumps that channel back to live. Delay live TV, above, turns the hold off and leaves the channel at the live edge. The banner shows Subtitles synced, live +Ns while the hold is on. Depth is computed from the frame already on screen, so it waits with that picture. Each line uses the audio time, not the time the text arrived. Base is lighter; Small uses more CPU and GPU on an M2. Whisper translates into English only. Other languages use the macOS 26 system translator when that language is installed, or the API key (caption text only). On earlier macOS, without a key, the line stays in the recognized language. Place ggml-base-encoder.mlmodelc or ggml-small-encoder.mlmodelc next to the ggml file to use the Core ML encoder; otherwise Metal or the CPU runs the model. This was not timed on a Mac.")
+    let note = NSTextField(wrappingLabelWithString: "Captions use the audio mpv is already playing, for any format the player can open, without a second connection. A local file can fall back to its own decode, then AVFoundation, only if that playback audio never arrives. A network or live stream is not opened again. A live channel holds the picture in mpv's cache (about 4–6 seconds unless transcription takes longer). A file or movie never takes that hold. Changing channel detects again. Turning captions off jumps that channel back to live. Delay live TV, above, turns the hold off and leaves the channel at the live edge. Status stays off the picture except a short line when captions start or when something fails. Show caption diagnostics adds the sync line and other status for about 2 seconds when they change. Depth is computed from the frame already on screen, so it waits with that picture. Each line uses the audio time, not the time the text arrived, and the previous line ends when the next one starts. Base is lighter; Small uses more CPU and GPU on an M2. Whisper translates into English only. Other languages use the macOS 26 system translator when that language is installed, or the API key (caption text only). On earlier macOS, without a key, the line stays in the recognized language. Place ggml-base-encoder.mlmodelc or ggml-small-encoder.mlmodelc next to the ggml file to use the Core ML encoder; otherwise Metal or the CPU runs the model. This was not timed on a Mac.")
     note.preferredMaxLayoutWidth = 400
     note.textColor = .secondaryLabelColor
     note.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
@@ -2341,6 +2457,7 @@ final class LiveCaptionSettingsView: NSView {
     stack.addArrangedSubview(labeled("Target language", targetPopup))
     stack.addArrangedSubview(liveDelayControl())
     stack.addArrangedSubview(auto)
+    stack.addArrangedSubview(diagnostics)
     stack.addArrangedSubview(syncLabel)
     stack.addArrangedSubview(download)
     stack.addArrangedSubview(status)
@@ -2428,6 +2545,11 @@ final class LiveCaptionSettingsView: NSView {
 
   @objc private func autoChanged(_ sender: NSButton) {
     Preference.set(sender.state == .on, for: .liveCaptionLiveDelayAuto)
+  }
+
+  @objc private func diagnosticsChanged(_ sender: NSButton) {
+    Preference.set(sender.state == .on, for: .liveCaptionDiagnostics)
+    IPTVLiveOverlayController.shared.redraw()
   }
 
   @objc private func downloadModel() {

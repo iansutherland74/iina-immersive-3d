@@ -26,38 +26,43 @@ static atomic_int g_arm;
 static atomic_int g_attached;
 static atomic_int g_rate;
 static atomic_int g_channels;
-static atomic_uintptr_t g_au_proc;
-static atomic_uintptr_t g_hal_proc;
 
 static AudioStreamBasicDescription g_format;
 static int g_format_ready;
 static atomic_int g_logged_format;
+static atomic_int g_expect_rate;
+static atomic_int g_expect_channels;
+static atomic_int g_selected;
+static atomic_int g_slot_seq;
 static os_log_t g_log;
+
+enum { kSlots = 4 };
+
+typedef struct TapSlot {
+  int index;
+  int in_use;
+  int logged;
+  atomic_int accept;
+  AURenderCallback au_proc;
+  void *au_refcon;
+  AudioDeviceIOProc hal_proc;
+  void *hal_client;
+  AudioStreamBasicDescription format;
+  int rate;
+  int channels;
+  int seq;
+} TapSlot;
+
+static TapSlot g_slots[kSlots];
 
 static OSStatus (*g_real_set_property)(AudioUnit, AudioUnitPropertyID, AudioUnitScope, AudioUnitElement, const void *, UInt32);
 static OSStatus (*g_real_create_proc)(AudioObjectID, AudioDeviceIOProc, void *, AudioDeviceIOProcID *);
 
-static void remember_format(const AudioStreamBasicDescription *format) {
-  if (!format || format->mSampleRate < 8000 || format->mSampleRate > 192000) {
-    return;
-  }
-  if (format->mChannelsPerFrame < 1 || format->mChannelsPerFrame > 16) {
-    return;
-  }
-  g_format = *format;
-  g_format_ready = 1;
-  atomic_store(&g_rate, (int)format->mSampleRate);
-  atomic_store(&g_channels, (int)format->mChannelsPerFrame);
-}
-
-static void log_callback(const char *kind) {
+static void log_callback(const char *kind, int rate, int channels) {
   if (!g_log) {
     g_log = os_log_create("com.colliderli.iina", "LiveCaptions");
   }
-  os_log(g_log, "mpv audio callback %{public}s %d Hz %d ch",
-         kind,
-         atomic_load(&g_rate),
-         atomic_load(&g_channels));
+  os_log(g_log, "mpv audio callback %{public}s %d Hz %d ch", kind, rate, channels);
 }
 
 static void push_frames(const float *mono, int count) {
@@ -185,18 +190,119 @@ static void ingest(const AudioBufferList *list, UInt32 frames) {
   }
 }
 
+static int rate_matches(int rate, int channels) {
+  int expect_rate = atomic_load(&g_expect_rate);
+  int expect_channels = atomic_load(&g_expect_channels);
+  // An unknown player rate must not accept the first unit that appears.
+  // The wrapper stays installed, and selection happens once the rate is known.
+  if (expect_rate < 8000 || rate < 8000) {
+    return 0;
+  }
+  int delta = rate - expect_rate;
+  if (delta < 0) {
+    delta = -delta;
+  }
+  if (delta > 1) {
+    return 0;
+  }
+  if (expect_channels > 0 && channels > 0 && channels != expect_channels) {
+    return 0;
+  }
+  return 1;
+}
+
+static TapSlot *claim_slot(void) {
+  int selected = atomic_load(&g_selected);
+  int seq = atomic_fetch_add(&g_slot_seq, 1) + 1;
+  for (int i = 0; i < kSlots; i++) {
+    if (!g_slots[i].in_use) {
+      g_slots[i].index = i;
+      g_slots[i].in_use = 1;
+      g_slots[i].logged = 0;
+      g_slots[i].seq = seq;
+      atomic_store(&g_slots[i].accept, 0);
+      return &g_slots[i];
+    }
+  }
+  for (int i = 0; i < kSlots; i++) {
+    if (selected != i + 1) {
+      g_slots[i].index = i;
+      g_slots[i].in_use = 1;
+      g_slots[i].logged = 0;
+      g_slots[i].seq = seq;
+      g_slots[i].au_proc = NULL;
+      g_slots[i].hal_proc = NULL;
+      atomic_store(&g_slots[i].accept, 0);
+      return &g_slots[i];
+    }
+  }
+  return &g_slots[0];
+}
+
+static void select_matching(void) {
+  int chosen = 0;
+  int best_seq = -1;
+  for (int i = 0; i < kSlots; i++) {
+    if (!g_slots[i].in_use) {
+      continue;
+    }
+    int ok = rate_matches(g_slots[i].rate, g_slots[i].channels);
+    atomic_store(&g_slots[i].accept, ok);
+    if (ok && g_slots[i].seq >= best_seq) {
+      best_seq = g_slots[i].seq;
+      chosen = i + 1;
+    }
+  }
+  int previous = atomic_load(&g_selected);
+  atomic_store(&g_selected, chosen);
+  if (chosen) {
+    TapSlot *slot = &g_slots[chosen - 1];
+    g_format = slot->format;
+    g_format_ready = slot->rate >= 8000;
+    atomic_store(&g_rate, slot->rate);
+    atomic_store(&g_channels, slot->channels);
+    atomic_store(&g_attached, 1);
+    atomic_store(&g_arm, 0);
+    if (chosen != previous) {
+      atomic_store(&g_mark, atomic_load(&g_write));
+    }
+  } else {
+    atomic_store(&g_attached, 0);
+    // Stay armed until the player's own unit is wrapped. A known rate that
+    // matches nothing also re-arms, so a later output can still be wrapped.
+    if (atomic_load(&g_arm) || atomic_load(&g_expect_rate) >= 8000) {
+      atomic_store(&g_arm, 1);
+    }
+  }
+}
+
+static void log_ignored(TapSlot *slot) {
+  if (!slot || slot->logged) {
+    return;
+  }
+  slot->logged = 1;
+  if (!g_log) {
+    g_log = os_log_create("com.colliderli.iina", "LiveCaptions");
+  }
+  os_log(g_log, "ignored audio callback %{public}d Hz %{public}d ch; player expects %{public}d Hz %{public}d ch",
+         slot->rate, slot->channels,
+         atomic_load(&g_expect_rate), atomic_load(&g_expect_channels));
+}
+
 static OSStatus wrapped_au(void *refcon,
                            AudioUnitRenderActionFlags *flags,
                            const AudioTimeStamp *timestamp,
                            UInt32 bus,
                            UInt32 frames,
                            AudioBufferList *data) {
-  AURenderCallback original = (AURenderCallback)atomic_load(&g_au_proc);
+  TapSlot *slot = refcon;
   OSStatus status = noErr;
-  if (original) {
-    status = original(refcon, flags, timestamp, bus, frames, data);
+  if (slot && slot->au_proc) {
+    status = slot->au_proc(slot->au_refcon, flags, timestamp, bus, frames, data);
   }
-  if (status == noErr) {
+  if (status == noErr && slot && atomic_load(&slot->accept) && atomic_load(&g_selected) == slot->index + 1) {
+    g_format = slot->format;
+    g_format_ready = slot->rate >= 8000;
     ingest(data, frames);
   }
   return status;
@@ -209,12 +315,14 @@ static OSStatus wrapped_hal(AudioObjectID device,
                             AudioBufferList *output,
                             const AudioTimeStamp *output_time,
                             void *client) {
-  AudioDeviceIOProc original = (AudioDeviceIOProc)atomic_load(&g_hal_proc);
+  TapSlot *slot = client;
   OSStatus status = noErr;
-  if (original) {
-    status = original(device, now, input, input_time, output, output_time, client);
+  if (slot && slot->hal_proc) {
+    status = slot->hal_proc(device, now, input, input_time, output, output_time, slot->hal_client);
   }
-  if (status == noErr) {
+  if (status == noErr && slot && atomic_load(&slot->accept) && atomic_load(&g_selected) == slot->index + 1) {
+    g_format = slot->format;
+    g_format_ready = slot->rate >= 8000;
     ingest(output, frame_count(output));
   }
   return status;
@@ -223,12 +331,16 @@ static OSStatus wrapped_hal(AudioObjectID device,
 typedef OSStatus (*IINAUnitGetProperty)(AudioUnit, AudioUnitPropertyID, AudioUnitScope, AudioUnitElement, void *, UInt32 *);
 static IINAUnitGetProperty g_get_property;
 
-static void note_unit_format(AudioUnit unit) {
+static int read_unit_format(AudioUnit unit, AudioStreamBasicDescription *out) {
+  if (!out) {
+    return 0;
+  }
+  memset(out, 0, sizeof(*out));
   if (!g_get_property) {
     g_get_property = (IINAUnitGetProperty)dlsym(RTLD_NEXT, "AudioUnitGetProperty");
   }
   if (!g_get_property) {
-    return;
+    return 0;
   }
   AudioUnitScope scopes[2] = { kAudioUnitScope_Input, kAudioUnitScope_Output };
   for (int i = 0; i < 2; i++) {
@@ -236,11 +348,29 @@ static void note_unit_format(AudioUnit unit) {
     memset(&format, 0, sizeof(format));
     UInt32 size = sizeof(format);
     if (g_get_property(unit, kAudioUnitProperty_StreamFormat, scopes[i], 0, &format, &size) == noErr &&
-        format.mSampleRate >= 8000) {
-      remember_format(&format);
-      return;
+        format.mSampleRate >= 8000 &&
+        format.mChannelsPerFrame >= 1 &&
+        format.mChannelsPerFrame <= 16) {
+      *out = format;
+      return 1;
     }
   }
+  return 0;
+}
+
+static void store_slot_format(TapSlot *slot, const AudioStreamBasicDescription *format, int ok) {
+  if (!slot) {
+    return;
+  }
+  if (!ok || !format) {
+    memset(&slot->format, 0, sizeof(slot->format));
+    slot->rate = 0;
+    slot->channels = 0;
+    return;
+  }
+  slot->format = *format;
+  slot->rate = (int)format->mSampleRate;
+  slot->channels = (int)format->mChannelsPerFrame;
 }
 
 static OSStatus iina_AudioUnitSetProperty(AudioUnit unit,
@@ -258,16 +388,25 @@ static OSStatus iina_AudioUnitSetProperty(AudioUnit unit,
       atomic_load(&g_arm) &&
       g_real_set_property) {
     const AURenderCallbackStruct *incoming = data;
-    atomic_store(&g_au_proc, (uintptr_t)incoming->inputProc);
-    note_unit_format(unit);
+    TapSlot *slot = claim_slot();
+    slot->au_proc = incoming->inputProc;
+    slot->au_refcon = incoming->inputProcRefCon;
+    slot->hal_proc = NULL;
+    AudioStreamBasicDescription format;
+    store_slot_format(slot, &format, read_unit_format(unit, &format));
     AURenderCallbackStruct wrapped = incoming[0];
     wrapped.inputProc = wrapped_au;
+    wrapped.inputProcRefCon = slot;
     OSStatus status = g_real_set_property(unit, property, scope, element, &wrapped, sizeof(wrapped));
     if (status == noErr) {
-      atomic_store(&g_mark, atomic_load(&g_write));
-      atomic_store(&g_attached, 1);
-      atomic_store(&g_arm, 0);
-      log_callback("audiounit");
+      if (rate_matches(slot->rate, slot->channels)) {
+        log_callback("audiounit", slot->rate, slot->channels);
+      } else if (atomic_load(&g_expect_rate) >= 8000) {
+        log_ignored(slot);
+      }
+      select_matching();
+    } else {
+      slot->in_use = 0;
     }
     return status;
   }
@@ -277,10 +416,12 @@ static OSStatus iina_AudioUnitSetProperty(AudioUnit unit,
   return g_real_set_property(unit, property, scope, element, data, size);
 }
 
-static void note_device_format(AudioObjectID device) {
-  AudioStreamBasicDescription format;
-  memset(&format, 0, sizeof(format));
-  UInt32 size = sizeof(format);
+static int read_device_format(AudioObjectID device, AudioStreamBasicDescription *out) {
+  if (!out) {
+    return 0;
+  }
+  memset(out, 0, sizeof(*out));
+  UInt32 size = sizeof(*out);
   AudioObjectPropertyAddress address = {
     kAudioDevicePropertyStreamFormat,
     kAudioObjectPropertyScopeOutput,
@@ -292,9 +433,14 @@ static void note_device_format(AudioObjectID device) {
   };
   OSStatus (*get_data)(AudioObjectID, const AudioObjectPropertyAddress *, UInt32, const void *, UInt32 *, void *) =
       (OSStatus (*)(AudioObjectID, const AudioObjectPropertyAddress *, UInt32, const void *, UInt32 *, void *))dlsym(RTLD_NEXT, "AudioObjectGetPropertyData");
-  if (get_data && get_data(device, &address, 0, NULL, &size, &format) == noErr) {
-    remember_format(&format);
+  if (get_data && get_data(device, &address, 0, NULL, &size, out) == noErr &&
+      out->mSampleRate >= 8000 &&
+      out->mChannelsPerFrame >= 1 &&
+      out->mChannelsPerFrame <= 16) {
+    return 1;
   }
+  memset(out, 0, sizeof(*out));
+  return 0;
 }
 
 static OSStatus iina_AudioDeviceCreateIOProcID(AudioObjectID device,
@@ -305,14 +451,22 @@ static OSStatus iina_AudioDeviceCreateIOProcID(AudioObjectID device,
     g_real_create_proc = (OSStatus (*)(AudioObjectID, AudioDeviceIOProc, void *, AudioDeviceIOProcID *))dlsym(RTLD_NEXT, "AudioDeviceCreateIOProcID");
   }
   if (atomic_load(&g_arm) && proc && g_real_create_proc) {
-    atomic_store(&g_hal_proc, (uintptr_t)proc);
-    note_device_format(device);
-    OSStatus status = g_real_create_proc(device, wrapped_hal, client, out_proc);
+    TapSlot *slot = claim_slot();
+    slot->hal_proc = proc;
+    slot->hal_client = client;
+    slot->au_proc = NULL;
+    AudioStreamBasicDescription format;
+    store_slot_format(slot, &format, read_device_format(device, &format));
+    OSStatus status = g_real_create_proc(device, wrapped_hal, slot, out_proc);
     if (status == noErr) {
-      atomic_store(&g_mark, atomic_load(&g_write));
-      atomic_store(&g_attached, 1);
-      atomic_store(&g_arm, 0);
-      log_callback("hal");
+      if (rate_matches(slot->rate, slot->channels)) {
+        log_callback("hal", slot->rate, slot->channels);
+      } else if (atomic_load(&g_expect_rate) >= 8000) {
+        log_ignored(slot);
+      }
+      select_matching();
+    } else {
+      slot->in_use = 0;
     }
     return status;
   }
@@ -348,6 +502,15 @@ void iina_caption_tap_arm(void) {
 
 void iina_caption_tap_disarm(void) {
   atomic_store(&g_arm, 0);
+}
+
+void iina_caption_tap_expect(int rate, int channels) {
+  if (rate == atomic_load(&g_expect_rate) && channels == atomic_load(&g_expect_channels) && atomic_load(&g_selected) != 0) {
+    return;
+  }
+  atomic_store(&g_expect_rate, rate);
+  atomic_store(&g_expect_channels, channels);
+  select_matching();
 }
 
 void iina_caption_tap_mark(void) {

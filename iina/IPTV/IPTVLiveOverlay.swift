@@ -116,6 +116,15 @@ final class IPTVLiveOverlayController {
     redraw()
   }
 
+  /// True only while this overlay's live channel is the file that is playing.
+  func holdsLiveCaption(path: String) -> Bool {
+    guard let session else { return false }
+    if session.catchup != nil { return false }
+    guard session.item.kind == .live else { return false }
+    guard !path.isEmpty else { return false }
+    return session.matches(path)
+  }
+
   func end() {
     removeKeyMonitor()
     session = nil
@@ -1032,11 +1041,10 @@ final class IPTVLiveOverlayPane: NSView {
   }
 
   private func drawSyncChip(in bounds: NSRect) {
-    guard let sync = LiveCaptionController.shared.bannerText else { return }
+    guard let sync = LiveCaptionController.shared.transientBannerText else { return }
     let height: CGFloat = 28
     let width = min(420, max(220, bounds.width * 0.34))
-    let reserve: CGFloat = GlassesEyeControls.shared.shown ? 80 : 0
-    let y = max(16, bounds.height - height - 18 - reserve)
+    let y: CGFloat = 18
     let rect = NSRect(x: (bounds.width - width) / 2, y: y, width: width, height: height)
     IPTVLiveDraw.panel(rect, radius: 8)
     IPTVLiveDraw.text(sync, in: rect.insetBy(dx: 10, dy: 4), font: .systemFont(ofSize: 13, weight: .semibold), color: .white, align: .center)
@@ -1071,7 +1079,7 @@ final class IPTVLiveOverlayPane: NSView {
       IPTVLiveDraw.progress(controller.progress(for: programme, catchup: session.catchup != nil), in: bar)
     }
     IPTVLiveDraw.text(secondary, in: NSRect(x: textX, y: rect.minY + 76, width: textWidth, height: 18), font: .systemFont(ofSize: 12, weight: .regular), color: NSColor(calibratedWhite: 1, alpha: 0.72))
-    if rect.height > 108, let sync = LiveCaptionController.shared.bannerText {
+    if rect.height > 108, let sync = LiveCaptionController.shared.transientBannerText {
       IPTVLiveDraw.text(sync, in: NSRect(x: textX, y: rect.maxY - 22, width: textWidth, height: 16), font: .systemFont(ofSize: 12, weight: .semibold), color: NSColor(calibratedRed: 0.55, green: 0.88, blue: 1, alpha: 1))
     } else if rect.height > 108 {
       let footer = controller.notice ?? "↑↓ channel    0–9    ⌫ last    ⏎ list    G guide"
