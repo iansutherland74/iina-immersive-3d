@@ -533,9 +533,9 @@ private struct GLState {
 
 private func compileShader(_ type: GLenum, _ source: String) -> GLuint {
   let shader = glCreateShader(type)
-  source.withCString { pointer in
-    var pointer = pointer
-    glShaderSource(shader, 1, &pointer, nil)
+  source.withCString { cString in
+    var cString: UnsafePointer<GLchar>? = cString
+    glShaderSource(shader, 1, &cString, nil)
   }
   glCompileShader(shader)
   var status: GLint = 0

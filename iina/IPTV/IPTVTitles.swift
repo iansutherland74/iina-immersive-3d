@@ -554,8 +554,8 @@ enum IPTVTMDB {
       var copy = details
       for (index, update) in updates {
         guard copy.episodes.indices.contains(index) else { continue }
-        let overview = update.0.isEmpty ? nil : update.0
-        let still = update.1.isEmpty ? nil : update.1
+        let overview = update.0.flatMap { $0.isEmpty ? nil : $0 }
+        let still = update.1.flatMap { $0.isEmpty ? nil : $0 }
         copy.episodes[index] = IPTVTitleParser.applyingEpisodeTMDB(copy.episodes[index], overview: overview, stillPath: still)
       }
       completion(copy)
@@ -616,7 +616,7 @@ enum IPTVTMDB {
     return components.url
   }
 
-  private static func data(_ url: URL, key: String, session: URLSession, completion: @escaping (Result<[String: Any], Error>) -> Void) {
+  private static func data(_ url: URL, key: String, session: URLSession, completion: @escaping (Swift.Result<[String: Any], Error>) -> Void) {
     var request = URLRequest(url: url)
     if key.hasPrefix("ey") {
       request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
