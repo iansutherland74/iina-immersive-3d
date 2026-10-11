@@ -1,0 +1,19 @@
+{
+  "name": "Remote Files",
+  "identifier": "io.iina.remote-files",
+  "version": "1.0.0",
+  "author": {
+    "name": "IINA Immersive 3D contributors",
+    "url": "https://github.com/iansutherland74/iina-immersive-3d"
+  },
+  "description": "Browse saved WebDAV, FTP, and FTPS servers, play videos, and load subtitles that sit next to them.",
+  "entry": "main.js",
+  "permissions": ["network-request", "file-system"],
+  "allowedDomains": ["*"],
+  "sidebarTab": {
+    "name": "Remote"
+  },
+  "preferenceDefaults": {
+    "servers": "[]"
+  }
+}

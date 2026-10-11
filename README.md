@@ -118,6 +118,20 @@ FebBox's WebDAV address is `https://webdav.febbox.com` (create the account in th
 
 Folders and video files are shown. Other files are left out. Play sets mpv `http-header-fields` to `Authorization: Basic …` and opens the file URL with no user and no password in it, so history does not receive the password. The header stays while that host is the current file and is restored when another host starts. Opening the same URL again from history does not send the password; play it from the sidebar. `iina.http.get` and `post` cannot send `PROPFIND`. `iina.http.request` does. The debug log hides the header value.
 
+## Remote files
+
+`plugins/iina-plugin-remote-files` is a second JavaScript plugin, also not compiled into the player. It keeps a list of servers. Each entry is a name, a protocol (WebDAV, FTP, or FTPS), an address, and a username. The password is stored in the Keychain under that server's id. If the Keychain write fails, the sidebar says so and the password stays in memory until IINA quits.
+
+WebDAV browsing is a `PROPFIND` through `iina.http.request`, the same limit as the WebDAV plugin: `get` and `post` cannot send that method. FTP and FTPS listings use `/usr/bin/curl` with the password in a temporary config file under the plugin's temp directory, not on the command line. The listing itself is written to a second temp file and both files are deleted when curl finishes. That needs the file-system permission, which the install prompt shows. Explicit FTPS (the usual NAS mode, port 21) is `ftp://` plus `--ssl-reqd`. An address on port 990, or one pasted as `ftps://`, is listed as implicit FTPS. A checkbox allows curl's `-k` and mpv `tls-verify=no` for a certificate the Mac does not trust. WebDAV still checks the certificate.
+
+Folders and videos are shown. A subtitle file next to the video (`Movie.srt`, `Movie.en.ass`, `Movie.vtt`, and the same stem with `.ssa`) is added with mpv `sub-add` after the file has loaded. Other files are left out of the list. An address pasted with `user:password@` does not keep that password in the server list; it is saved with the Keychain item.
+
+WebDAV playback is the https or http URL with no user and no password, plus mpv `http-header-fields` set to `Authorization: Basic …`. FTP playback is `ftp://` with the user and password percent-encoded, passed to mpv `loadfile` on the same player, so Immersive 3D and Play on Glasses still apply. Explicit FTPS uses that `ftp://` URL and sets `stream-lavf-o` to `tls=1`. Implicit FTPS uses `ftps://`. `iina.core.open` would percent-encode the `@` on macOS 13 and break that URL. The command log drops `user:password@`. History for an FTP file can still contain the password, because the URL mpv is playing is the credentialed one. WebDAV history does not. Opening either URL again from history does not reload a WebDAV header or a fresh FTP password; play it from the sidebar.
+
+Install `iina-plugin-remote-files-1.0.0.iinaplgz` from the macOS Release artifacts with **Settings → Plugins → Install Local Package…**. **Get Plugins…** does not see this folder. FebBox's WebDAV address is `https://webdav.febbox.com`. Nextcloud is `https://host/remote.php/dav/files/USERNAME/`. More protocols can be added in this plugin later; they are not implemented now.
+
+The plugin was not installed in IINA. No WebDAV, FTP, or FTPS server was contacted, and the Keychain was not written. The listing and subtitle-name checks were run locally.
+
 ## IPTV
 
 **File → IPTV…** (Option-Command-I) opens a TV-style browser. It is not a sidebar tab. Playback goes through the normal player, so **Video → Immersive 3D** and **Play on Glasses** apply to these streams the same way they apply to any other URL.
@@ -186,6 +200,7 @@ Saved sources and favourites live in `~/Library/Application Support/com.collider
 - The guide was not compiled or shown. It keeps listings from 7 days ago through 26 hours ahead, not every programme in a multi-week XMLTV file, and not catch-up older than that even when `catchup-days` is larger. Quoted `#EXTINF` values are not unescaped (`\"` stays as two characters). A junk token before an attribute is skipped. Catch-up URL assembly was checked as a Python transcription of the rules above, then deleted; the Swift was not compiled, and no provider was contacted.
 - The poster grid and the details page were not compiled or shown. Series episodes come from `get_series_info` when the details page opens, not with the first catalog request. Movies and series do not use the EPG columns. An episode opened from Continue watching keeps its series only when that series is still in the catalog; otherwise the page uses the fields already stored on the episode.
 - The WebDAV plugin was not installed in IINA and was not pointed at FebBox, Nextcloud, or a NAS. No PROPFIND was sent and the Keychain was not written. The sample listing parser was run locally. Playback through Immersive 3D and Play on Glasses was not tried.
+- The remote-files plugin was not installed in IINA. No WebDAV, FTP, or FTPS server was contacted, and the Keychain was not written. Subtitle auto-load and both-eye playback were not tried. Explicit FTPS playback through mpv was not tried. The sample FTP listing, pasted-address, and subtitle-name checks were run locally.
 
 ---
 
