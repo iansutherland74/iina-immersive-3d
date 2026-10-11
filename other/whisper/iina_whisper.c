@@ -114,8 +114,11 @@ int iina_whisper_transcribe(
   params.suppress_nst = true;
   params.temperature = 0.0f;
   params.initial_prompt = NULL;
+  // "auto" makes whisper.cpp detect the language and then keep transcribing.
+  // detect_language must stay false: that flag returns as soon as the language
+  // id is known, so the caller gets an empty string and the screen stays blank.
   params.language = (language && language[0] && strcmp(language, "auto") != 0) ? language : "auto";
-  params.detect_language = (params.language == NULL || strcmp(params.language, "auto") == 0) ? true : false;
+  params.detect_language = false;
   if (beam > 1) {
     params.beam_search.beam_size = beam;
   } else {
