@@ -55,8 +55,8 @@
 "settings.liveCaptionLatency.items.0" = "Low latency";
 "settings.liveCaptionLatency.items.1" = "Balanced";
 "settings.liveCaptionLatency.items.2" = "Accuracy";
-"settings.liveCaptionSync.label" = "Sync mode";
-"settings.liveCaptionSync.desc" = "Lines the words up with the voice. Files, movies, and catch-up are recognized ahead of the playhead, so playback is not delayed. Live TV holds the picture and the sound by a few seconds. Depth is estimated from the frame on screen, so it stays on that same delayed picture.";
+"settings.liveCaptionSync.label" = "Delay live TV";
+"settings.liveCaptionSync.desc" = "On by default. A live channel or other unseekable stream holds the picture and sound a few seconds so the words match, and the banner shows the delay. Files, movies, and catch-up are read ahead instead, and are not delayed. Turn this off to leave a live channel at the live edge. Changing channel picks the mode again. Turning captions off jumps a delayed channel back to live.";
 
 "settings.transportRTSPThrough.items.1" = "TCP";
 "settings.transportRTSPThrough.items.2" = "UDP";

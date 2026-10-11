@@ -10,10 +10,12 @@
 //  graph inside mpv cannot hand samples to the host, and replacing the audio
 //  output would mute playback. This engine decodes the same URL again with
 //  AVFoundation and runs whisper.cpp in-process. Each line is stamped with the
-//  audio PTS, not the time the text arrived. Sync mode reads that audio ahead
-//  of the playhead for files, movies, and catch-up. A live stream cannot be
-//  read from the future, so sync mode holds mpv's demuxer cache and the
-//  picture waits with the sound. Depth is estimated from the frame mpv has
+//  audio PTS, not the time the text arrived. The choice is automatic. A file,
+//  a movie, or catch-up is read ahead of the playhead, so playback is not
+//  delayed. An IPTV live channel, or any other unseekable stream, cannot be
+//  read from the future, so the demuxer cache holds the picture and the sound.
+//  Changing the URL detects that again. Turning captions off seeks a held
+//  channel back to the live edge. Depth is estimated from the frame mpv has
 //  already drawn, so it stays on that same delayed picture. Only caption text
 //  leaves the Mac, and only when a translation API key is set.
 
@@ -160,7 +162,8 @@ final class LiveCaptionController {
   private let subtitleURL = FileManager.default.temporaryDirectory.appendingPathComponent("iina-live-caption.ass")
 
   private(set) var statusText = "Live captions are off."
-  private(set) var syncText = "Sync is off."
+  private(set) var syncText = "Files and movies are read ahead. A live channel is held back unless that delay is turned off."
+  private var lastBanner: String?
 
   private struct SavedCache {
     var cache: String?
@@ -197,14 +200,21 @@ final class LiveCaptionController {
     startObserving()
     self.core = core
     guard Preference.bool(for: .liveCaptionEnabled) else {
-      stop()
+      stop(jumpToLive: false)
       return
     }
     start()
   }
 
   func noteFileEnded() {
-    stop()
+    stop(jumpToLive: false)
+  }
+
+  /// Shown on the live banner while a live channel is being held back. Nil for a file, a movie, or catch-up.
+  var bannerText: String? {
+    guard Preference.bool(for: .liveCaptionEnabled), running, playbackShouldWait() else { return nil }
+    let seconds = max(1, Int(appliedLiveDelay.rounded()))
+    return "Subtitles synced, live +\(seconds)s"
   }
 
   func attachIfNeeded() {
@@ -226,7 +236,7 @@ final class LiveCaptionController {
 
   private func applyEnabled() {
     guard Preference.bool(for: .liveCaptionEnabled) else {
-      stop()
+      stop(jumpToLive: true)
       return
     }
     guard !PlayerCore.playerCores.isEmpty else { return }
@@ -239,7 +249,7 @@ final class LiveCaptionController {
   private func start() {
     guard let core, core.mpv != nil, let url = core.info.currentURL else { return }
     if running, activeURL == url { return }
-    stop()
+    stop(jumpToLive: false)
     generation += 1
     let token = generation
     running = true
@@ -261,11 +271,11 @@ final class LiveCaptionController {
     schedule(generation: token, delay: 0.4)
   }
 
-  private func stop() {
+  private func stop(jumpToLive: Bool) {
     generation += 1
     running = false
     activeURL = nil
-    restorePlaybackDelay()
+    restorePlaybackDelay(jumpToLive: jumpToLive)
     whisper.setAbort(1)
     source.close()
     cues.removeAll()
@@ -282,6 +292,7 @@ final class LiveCaptionController {
     } else {
       setStatus("Live captions are off.")
     }
+    refreshSyncText()
   }
 
   private func installTimer() {
@@ -324,9 +335,8 @@ final class LiveCaptionController {
       return
     }
     guard let time = mediaTime(), time.isFinite else { return }
-    let syncing = Preference.bool(for: .liveCaptionSync)
     let waiting = playbackShouldWait()
-    let lead = (syncing && !waiting && !source.isLiveEdge) ? lookaheadLead() : 0
+    let lead = (!waiting && !source.isLiveEdge) ? lookaheadLead() : 0
     reportedLookahead = lead
     let coverEnd = time + lead + pace.window
     source.follow(coveringEnd: coverEnd, window: pace.window)
@@ -362,7 +372,7 @@ final class LiveCaptionController {
     let earliest = parsed.map(\.start).min() ?? audio.start
     noteTiming(inference: inference, span: max(0, audio.start + duration - earliest))
     let signature = parsed.map(\.text).joined(separator: "\n")
-    if signature == lastRaw && syncing {
+    if signature == lastRaw && !usesTimedCues() {
       return
     }
     lastRaw = signature
@@ -406,12 +416,12 @@ final class LiveCaptionController {
 
   private func redisplay() {
     guard running else { return }
-    let syncing = Preference.bool(for: .liveCaptionSync)
+    let timed = usesTimedCues()
     if let now = mediaTime() {
       cues.removeAll { $0.end < now - 6 && $0.end < 30000 }
     }
     let now = mediaTime() ?? 0
-    let text = visibleText(at: now, syncing: syncing)
+    let text = visibleText(at: now, timed: timed)
     let signature = cues.map { "\(Int($0.start * 100))-\(Int($0.end * 100))-\($0.text)" }.joined(separator: "|")
     let sbs = IPTVLiveOverlayController.duplicatesEyes
     let chrome = GlassesEyeControls.shared.shown
@@ -439,13 +449,20 @@ final class LiveCaptionController {
       }
       overlay.setText("")
       if textChanged || modeChanged || cuesChanged {
-        showFlatCaption(syncing: syncing)
+        showFlatCaption(syncing: timed)
       }
     }
   }
 
-  private func visibleText(at time: Double, syncing: Bool) -> String {
-    guard syncing else { return cues.last?.text ?? "" }
+  /// A file, movie, or catch-up is timed to the audio. A live channel is too, once the
+  /// picture is held back. With that delay turned off, the latest line shows when it is ready.
+  private func usesTimedCues() -> Bool {
+    if source.isLiveEdge && !playbackShouldWait() { return false }
+    return true
+  }
+
+  private func visibleText(at time: Double, timed: Bool) -> String {
+    guard timed else { return cues.last?.text ?? "" }
     return cues.last { $0.start - 0.12 <= time && time < $0.end + 0.2 }?.text ?? ""
   }
 
@@ -659,13 +676,16 @@ final class LiveCaptionController {
     timingSamples += 1
   }
 
-  /// Live IPTV cannot be decoded from the future. Files, movies, and catch-up can.
+  /// An IPTV live channel, and any other unseekable stream, cannot be decoded
+  /// from the future, so the picture waits. A file, a movie, or catch-up is
+  /// read ahead instead. The delay setting only turns this hold off.
   private func playbackShouldWait() -> Bool {
-    guard Preference.bool(for: .liveCaptionSync), source.isLiveEdge else { return false }
+    guard Preference.bool(for: .liveCaptionEnabled), Preference.bool(for: .liveCaptionSync) else { return false }
     let decision = { () -> Bool? in
       guard let session = IPTVLiveOverlayController.shared.session else { return nil }
       if session.catchup != nil { return false }
-      return session.item.kind == .live
+      if session.item.kind == .live { return true }
+      return false
     }
     let known: Bool?
     if Thread.isMainThread {
@@ -676,7 +696,7 @@ final class LiveCaptionController {
       known = value
     }
     if let known { return known }
-    return source.isOpenEnded
+    return source.isLiveEdge && source.isOpenEnded
   }
 
   private func desiredLiveDelay() -> Double {
@@ -689,7 +709,7 @@ final class LiveCaptionController {
     guard running, mpvIsUsable(), let core else { return }
     guard playbackShouldWait() else {
       if savedCache != nil || holdingPlayback {
-        restorePlaybackDelay()
+        restorePlaybackDelay(jumpToLive: true)
       }
       return
     }
@@ -747,7 +767,7 @@ final class LiveCaptionController {
     }
   }
 
-  private func restorePlaybackDelay() {
+  private func restorePlaybackDelay(jumpToLive: Bool) {
     holdingPlayback = false
     gaveUpHold = false
     guard !Immersive3DController.shared.isShuttingDown, let saved = savedCache, let core, core.mpv != nil else {
@@ -756,6 +776,9 @@ final class LiveCaptionController {
     }
     if saved.wePaused, core.info.state.active {
       core.mpv.setFlag(MPVOption.PlaybackControl.pause, false)
+    }
+    if jumpToLive, core.info.state.active {
+      seekToLiveEdge(core)
     }
     if let cache = saved.cache {
       core.mpv.setString(MPVOption.Cache.cache, cache)
@@ -778,6 +801,19 @@ final class LiveCaptionController {
     savedCache = nil
   }
 
+  /// The demuxer head is the newest packet. Seeking there drops the hold and returns to the live edge.
+  private func seekToLiveEdge(_ core: PlayerCore) {
+    let pos = core.mpv.getDouble(MPVProperty.timePos)
+    if let edge = mpvDouble(MPVProperty.demuxerCacheTime, core), edge.isFinite, pos.isFinite, edge > pos + 0.25 {
+      core.mpv.command(.seek, args: [String(edge), "absolute"], checkError: false)
+      return
+    }
+    let cached = core.mpv.getDouble(MPVProperty.demuxerCacheDuration)
+    if cached.isFinite, cached > 0.25 {
+      core.mpv.command(.seek, args: [String(cached), "relative"], checkError: false)
+    }
+  }
+
   private func mpvDouble(_ name: String, _ core: PlayerCore) -> Double? {
     guard let text = core.mpv.getString(name) else { return nil }
     return Double(text)
@@ -793,33 +829,29 @@ final class LiveCaptionController {
 
   private func refreshSyncText() {
     let text = describeSync()
-    guard text != syncText else { return }
+    let banner = bannerText
+    guard text != syncText || banner != lastBanner else { return }
     syncText = text
+    lastBanner = banner
     NotificationCenter.default.post(name: .liveCaptionStatusChanged, object: nil)
+    IPTVLiveOverlayController.shared.redraw()
   }
 
   private func describeSync() -> String {
-    guard Preference.bool(for: .liveCaptionSync) else {
-      return "Sync is off. A line shows when recognition finishes, which is a few seconds after the words."
-    }
     if playbackShouldWait() {
-      let cached: Double
-      if mpvIsUsable(), let core {
-        cached = core.mpv.getDouble(MPVProperty.demuxerCacheDuration)
-      } else {
-        cached = .nan
-      }
-      let shown = cached.isFinite && cached > 0.2 ? cached : appliedLiveDelay
-      let auto = Preference.bool(for: .liveCaptionLiveDelayAuto) ? ", auto" : ""
+      let seconds = max(1, Int(appliedLiveDelay.rounded()))
       if holdingPlayback {
-        return String(format: "Holding live playback. Buffer %.1f s%@. Transcription needs about %.1f s. Depth waits on this same frame.", shown, auto, measuredWork)
+        return "Subtitles synced, live +\(seconds)s. Playback is moving back from the live edge. Depth stays on this frame."
       }
-      return String(format: "Live delay %.1f s%@. Picture, sound, and depth stay this far behind the broadcast. Transcription needs about %.1f s.", shown, auto, measuredWork)
+      return "Subtitles synced, live +\(seconds)s. Picture, sound, and depth are this far behind the broadcast."
+    }
+    if !Preference.bool(for: .liveCaptionSync) && source.isLiveEdge {
+      return "Live delay is off, so this channel stays at the live edge. The line can arrive after the words."
     }
     if source.isLiveEdge {
-      return "Sync is on, but this item could not be read ahead and it is not a live channel, so the line can still arrive late."
+      return "This item is not a live channel and could not be read ahead, so the line can arrive after the words."
     }
-    return String(format: "Lookahead %.1f s. Playback is not delayed. Whisper is taking about %.1f s, and the line is stamped with the audio time.", reportedLookahead, measuredInference)
+    return String(format: "Reading %.1f s ahead. Playback is not delayed. Whisper is taking about %.1f s.", reportedLookahead, measuredInference)
   }
 
   private func rms(_ samples: [Float]) -> Float {
@@ -945,11 +977,13 @@ final class LiveCaptionController {
 @available(macOS 15.0, *)
 enum LiveCaptionTranslator {
   static func system(_ text: String, source: String, target: String) async -> String? {
-    let sourceLanguage: Locale.Language? = (source == "auto" || source == "original") ? nil : Locale.Language(identifier: source)
-    let session = TranslationSession(installedSource: sourceLanguage, target: Locale.Language(identifier: target))
+    guard source != "auto", source != "original", !target.isEmpty else { return nil }
+    let sourceLanguage = Locale.Language(identifier: source)
+    let targetLanguage = Locale.Language(identifier: target)
+    let session = TranslationSession(installedSource: sourceLanguage, target: targetLanguage)
     do {
       let response = try await session.translate(text)
-      let value = response.targetText.trimmingCharacters(in: .whitespacesAndNewlines)
+      let value = response.targetText.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
       return value.isEmpty ? nil : value
     } catch {
       return nil
@@ -975,7 +1009,6 @@ final class LiveCaptionDownloads: NSObject, URLSessionDownloadDelegate {
     let selected: Preference.LiveCaptionModel = Preference.enum(for: .liveCaptionModel)
     model = selected
     task?.cancel()
-    let destination = LiveCaptionStore.file(for: selected)
     if LiveCaptionStore.isInstalled(selected) {
       LiveCaptionController.shared.setStatus("\(selected == .small ? "Small" : "Base") is already downloaded.")
       return
@@ -1350,7 +1383,7 @@ final class CaptionSource {
     if seekable && startReader(asset: asset, track: track, at: max(0, time - 0.4)) {
       mode = .reader
       setCapture(live: false, openEnded: false, duration: finite ? duration : .infinity)
-      Logger.log("Live captions are decoding the same media again, ahead of the playhead when sync is on.", level: .warning)
+      Logger.log("Live captions are decoding the same media again, ahead of the playhead for a file or movie.", level: .warning)
       return
     }
     mode = .tap
@@ -1363,7 +1396,7 @@ final class CaptionSource {
       player.start(url: url, userAgent: userAgent)
     }
     Logger.log("Live captions opened a second read because this item could not be seeked.", level: .warning)
-    LiveCaptionController.shared.setStatus("Live source: captions come from a second read of the stream, so they can sit a few seconds off the picture.")
+    LiveCaptionController.shared.setStatus("Live source: a second read of the stream feeds the captions. A live channel holds the picture so the words can match.")
   }
 
   private func startReader(asset: AVAsset, track: AVAssetTrack, at start: Double) -> Bool {
@@ -1526,15 +1559,17 @@ final class MutedAudioTap: NSObject {
 
   private func installTap(on item: AVPlayerItem) {
     guard let track = item.asset.tracks(withMediaType: .audio).first else { return }
-    var callbacks = MTAudioProcessingTapCallbacks()
-    callbacks.version = kMTAudioProcessingTapCallbacksVersion_0
-    callbacks.clientInfo = Unmanaged.passUnretained(self).toOpaque()
-    callbacks.`init` = captionTapInit
-    callbacks.prepare = captionTapPrepare
-    callbacks.process = captionTapProcess
+    var callbacks = MTAudioProcessingTapCallbacks(
+      version: Int32(kMTAudioProcessingTapCallbacksVersion_0),
+      clientInfo: Unmanaged.passUnretained(self).toOpaque(),
+      init: captionTapInit,
+      finalize: nil,
+      prepare: captionTapPrepare,
+      unprepare: nil,
+      process: captionTapProcess
+    )
     var tap: MTAudioProcessingTap?
-    var callbackCopy = callbacks
-    let status = withUnsafePointer(to: &callbackCopy) { pointer in
+    let status = withUnsafePointer(to: &callbacks) { pointer in
       MTAudioProcessingTapCreate(kCFAllocatorDefault, pointer, kMTAudioProcessingTapCreationFlag_PreEffects, &tap)
     }
     guard status == noErr, let tap else { return }
@@ -1774,7 +1809,7 @@ final class LiveCaptionSettingsView: NSView {
     syncLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
     refreshStatus()
 
-    let note = NSTextField(wrappingLabelWithString: "The player decodes the same URL a second time. libmpv does not provide its PCM, and a lavfi graph cannot export it without replacing playback. Sync mode reads ahead on a file, a movie, or catch-up, so the line is ready before it is spoken and playback is not delayed. Live TV cannot be read from the future: the picture and sound wait in mpv's cache (about 4–6 seconds unless transcription takes longer). Depth is computed from the frame already on screen, so it waits with that picture. Each line uses the audio time, not the time the text arrived. Base is lighter; Small uses more CPU and GPU on an M2. Whisper translates into English only. Other languages use the macOS 15 system translator when that language is installed, or the API key (caption text only). On macOS 13 without a key, the line stays in the recognized language. Place ggml-base-encoder.mlmodelc or ggml-small-encoder.mlmodelc next to the ggml file to use the Core ML encoder; otherwise Metal or the CPU runs the model. This was not timed on a Mac.")
+    let note = NSTextField(wrappingLabelWithString: "The player decodes the same URL a second time. libmpv does not provide its PCM, and a lavfi graph cannot export it without replacing playback. With captions on, a file, a movie, or catch-up is read ahead of the playhead, so the line is ready before it is spoken and playback is not delayed. A live channel, or another stream that cannot be seeked, is detected on its own and the picture and sound wait in mpv's cache (about 4–6 seconds unless transcription takes longer). Changing channel detects again. Turning captions off jumps that channel back to live. Delay live TV, above, turns the hold off and leaves the channel at the live edge. The banner shows Subtitles synced, live +Ns while the hold is on. Depth is computed from the frame already on screen, so it waits with that picture. Each line uses the audio time, not the time the text arrived. Base is lighter; Small uses more CPU and GPU on an M2. Whisper translates into English only. Other languages use the macOS 15 system translator when that language is installed, or the API key (caption text only). On macOS 13 without a key, the line stays in the recognized language. Place ggml-base-encoder.mlmodelc or ggml-small-encoder.mlmodelc next to the ggml file to use the Core ML encoder; otherwise Metal or the CPU runs the model. This was not timed on a Mac.")
     note.preferredMaxLayoutWidth = 400
     note.textColor = .secondaryLabelColor
     note.font = .systemFont(ofSize: NSFont.smallSystemFontSize)

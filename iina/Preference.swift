@@ -95,7 +95,7 @@ struct Preference {
     static let liveCaptionModel = Key("liveCaptionModel")
     /** 0 low latency, 1 balanced, 2 accuracy. */
     static let liveCaptionLatency = Key("liveCaptionLatency")
-    /** Line captions up with speech. Files look ahead; live TV delays playback. */
+    /** When on, a live channel or unseekable stream is held back so captions can match. Files always look ahead. */
     static let liveCaptionSync = Key("liveCaptionSync")
     /** Seconds to hold a live picture and its sound. Auto may raise this. */
     static let liveCaptionLiveDelay = Key("liveCaptionLiveDelay")
