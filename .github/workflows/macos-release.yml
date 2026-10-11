@@ -1,0 +1,145 @@
+name: macOS Release
+
+# Apple Silicon hosted runner (newer than macos-15) with the latest stable
+# Xcode 16 or newer. IINA 1.5.0's asset catalogs are template format 7.0, which
+# Xcode 15 cannot compile.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build IINA (arm64)
+    runs-on: macos-26
+    timeout-minutes: 120
+    steps:
+      - name: Checkout into a directory named iina
+        uses: actions/checkout@v7
+        with:
+          # other/download_libs.sh walks up from other/ until it finds a
+          # directory named iina. The repo directory is iina-immersive-3d.
+          path: iina
+
+      - name: Select latest stable Xcode
+        run: |
+          set -euo pipefail
+          uname -m
+          selected="$(python3 - <<'PY'
+          import plistlib
+          import sys
+          from pathlib import Path
+
+          def version_key(text):
+              parts = []
+              for piece in str(text).split("."):
+                  digits = "".join(ch for ch in piece if ch.isdigit())
+                  parts.append(int(digits) if digits else 0)
+              return tuple(parts)
+
+          candidates = []
+          for app in sorted(Path("/Applications").glob("Xcode*.app")):
+              lowered = app.name.lower()
+              if any(word in lowered for word in ("beta", "preview")):
+                  print(f"skip {app.name} (pre-release name)", file=sys.stderr)
+                  continue
+              info_path = app / "Contents" / "Info.plist"
+              if not info_path.is_file():
+                  continue
+              with info_path.open("rb") as handle:
+                  info = plistlib.load(handle)
+              version = str(info.get("CFBundleShortVersionString") or "")
+              key = version_key(version)
+              if not key or key[0] < 16:
+                  print(f"skip {app.name} version {version}", file=sys.stderr)
+                  continue
+              candidates.append((key, version, str(app)))
+              print(f"candidate {version} {app}", file=sys.stderr)
+
+          if not candidates:
+              raise SystemExit("No stable Xcode 16 or newer found under /Applications")
+          candidates.sort()
+          _key, version, app = candidates[-1]
+          print(f"{app}\t{version}")
+          PY
+          )"
+          app="${selected%%$'\t'*}"
+          version="${selected#*$'\t'}"
+          echo "Using Xcode ${version} at ${app}"
+          sudo xcode-select -s "${app}/Contents/Developer"
+          xcodebuild -version
+
+      - name: Download mpv libraries and yt-dlp
+        working-directory: iina
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          test "$(basename "$PWD")" = "iina"
+          ./other/download_libs.sh --arch arm64
+
+      - name: Build Release for arm64
+        working-directory: iina
+        run: |
+          set -uo pipefail
+          set +e
+          xcodebuild \
+            -project iina.xcodeproj \
+            -scheme iina \
+            -configuration Release \
+            -destination 'generic/platform=macOS' \
+            -derivedDataPath "$PWD/build" \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=YES \
+            CODE_SIGN_IDENTITY=- \
+            build 2>&1 | tee build.log
+          status=${PIPESTATUS[0]}
+          set -e
+          if [[ "$status" -ne 0 ]]; then
+            grep -E 'error:|fatal error:|The following build commands failed' build.log | tail -n 300 > build-errors.txt || true
+            exit "$status"
+          fi
+
+      - name: Upload compiler errors
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-errors
+          path: iina/build-errors.txt
+          if-no-files-found: ignore
+
+      - name: Zip IINA.app and record minimum OS
+        working-directory: iina
+        run: |
+          set -euo pipefail
+          app="build/Build/Products/Release/IINA.app"
+          test -d "$app"
+          bin="$app/Contents/MacOS/IINA"
+          echo "==== codesign ===="
+          codesign -dv --verbose=4 "$app" 2>&1 || true
+          echo "==== IINA ===="
+          vtool -show-build "$bin"
+          echo "LSMinimumSystemVersion=$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$app/Contents/Info.plist")"
+          echo "==== bundled libraries ===="
+          find "$app/Contents" -name '*.dylib' -print | sort | while read -r lib; do
+            echo "-- $(basename "$lib")"
+            vtool -show-build "$lib" | awk '/minos|sdk /'
+          done
+          ditto -c -k --keepParent "$app" IINA-macos-arm64.zip
+          ls -lh IINA-macos-arm64.zip
+
+      - name: Upload IINA.app
+        uses: actions/upload-artifact@v7
+        with:
+          name: IINA-macos-arm64.zip
+          path: iina/IINA-macos-arm64.zip
+          if-no-files-found: error
+          archive: false
