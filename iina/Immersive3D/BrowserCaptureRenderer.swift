@@ -112,13 +112,19 @@ final class BrowserCaptureRenderer: NSView {
     sizeLocked = lock
     stageLock.unlock()
     let apply = {
-      guard let layer = self.layer as? CAMetalLayer else { return }
-      layer.contentsScale = scale
-      layer.drawableSize = CGSize(width: width, height: height)
+      let ready = self.layer is CAMetalLayer
+      if let layer = self.layer as? CAMetalLayer {
+        layer.contentsScale = scale
+        layer.drawableSize = CGSize(width: width, height: height)
+      }
       if self.loggedDrawableWidth != width || self.loggedDrawableHeight != height {
         self.loggedDrawableWidth = width
         self.loggedDrawableHeight = height
-        browserCaptureLog.info("output drawable \(width)x\(height) scale \(Double(scale), privacy: .public)")
+        if ready {
+          browserCaptureLog.info("output drawable \(width)x\(height) scale \(Double(scale), privacy: .public)")
+        } else {
+          browserCaptureLog.error("output drawable \(width)x\(height) waiting for the metal layer")
+        }
       }
     }
     if Thread.isMainThread {
@@ -130,17 +136,36 @@ final class BrowserCaptureRenderer: NSView {
 
   override func viewDidMoveToWindow() {
     super.viewDidMoveToWindow()
+    applyLockedDrawable()
     adoptViewSizeIfNeeded()
   }
 
   override func layout() {
     super.layout()
+    applyLockedDrawable()
     adoptViewSizeIfNeeded()
   }
 
   override func viewDidChangeBackingProperties() {
     super.viewDidChangeBackingProperties()
+    applyLockedDrawable()
     adoptViewSizeIfNeeded()
+  }
+
+  /// A glasses size can be chosen before the layer exists. Layout applies it once the layer is there.
+  private func applyLockedDrawable() {
+    stageLock.lock()
+    let width = pixelWidth
+    let height = pixelHeight
+    let locked = sizeLocked
+    stageLock.unlock()
+    guard locked, width >= 32, height >= 32, let layer = self.layer as? CAMetalLayer else { return }
+    let target = CGSize(width: width, height: height)
+    guard layer.drawableSize != target else { return }
+    let scale = window?.backingScaleFactor ?? 2
+    layer.contentsScale = scale
+    layer.drawableSize = target
+    browserCaptureLog.info("output drawable \(width)x\(height) scale \(Double(scale), privacy: .public)")
   }
 
   /// Preview size follows the view once it has a real bounds. A locked size is the glasses screen.

@@ -130,6 +130,10 @@ jobs:
           sudo xcode-select -s "${app}/Contents/Developer"
           xcodebuild -version
 
+      - name: Browser Capture self-test
+        working-directory: iina
+        run: bash other/browser-capture-selftest.sh
+
       - name: Download mpv libraries, yt-dlp, and build whisper.cpp
         working-directory: iina
         env:

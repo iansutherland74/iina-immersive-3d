@@ -113,7 +113,11 @@ final class Immersive3DController: NSObject, NSWindowDelegate {
   private var didPrepareForTermination = false
   private var savedMirrorLinks: [SavedMirrorLink]?
   private var screenParameterObserver: NSObjectProtocol?
+  private var panelIsClosing = false
   private(set) var glassesActive = false
+  /// Player or capture, and whether that picture is the glasses output.
+  private var session = GlassesSession()
+  var captureOnGlasses: Bool { session.source == .capture }
   /// Browser Capture's output window is on the glasses. Screen changes repin it
   /// without moving the player window.
   private var captureWindowPinned = false
@@ -426,25 +430,16 @@ final class Immersive3DController: NSObject, NSWindowDelegate {
   // MARK: - Glasses
 
   @objc func playOnGlasses(_ sender: Any?) {
-    if glassesActive {
-      exitGlasses()
-      return
-    }
     let screens = Self.glassesCandidates()
-    if screens.isEmpty {
+    if screens.isEmpty && !session.isOn {
       showMessage(
         title: "No glasses display found",
         body: "Connect the TCL NXTWEAR S with USB-C. macOS should list it as SmartGlasses, usually 1920×1080 or 3840×1080. If the displays are mirrored there is only one screen; Play on Glasses still covers that screen. Then choose Video → Play on Glasses."
       )
       return
     }
-    if screens.count == 1 {
-      beginGlasses(on: screens[0])
-    } else if let preferred = screens.first(where: { Self.looksLikeNXTWEAR($0) }) {
-      beginGlasses(on: preferred)
-    } else {
-      beginGlasses(on: screens[0])
-    }
+    let ordered = Self.orderedGlasses(screens)
+    perform(session.transition(.play(displays: ordered.map(Self.displayChoice(for:)), captureRunning: captureIsRunning)))
   }
 
   @objc func playOnScreen(_ sender: NSMenuItem) {
@@ -453,7 +448,74 @@ final class Immersive3DController: NSObject, NSWindowDelegate {
       showMessage(title: "That display is gone", body: "The selected screen is no longer connected.")
       return
     }
-    beginGlasses(on: screen)
+    perform(session.transition(.playOn(Self.displayChoice(for: screen), captureRunning: captureIsRunning)))
+  }
+
+  /// Capture became the running picture. Glasses that are connected take it immediately.
+  func captureDidStart() {
+    let displays = Self.orderedGlasses(Self.glassesCandidates()).map(Self.displayChoice(for:))
+    perform(session.transition(.captureStarted(displays: displays)))
+  }
+
+  func captureDidStop() {
+    perform(session.transition(.captureStopped))
+  }
+
+  private var captureIsRunning: Bool {
+    guard #available(macOS 12.3, *) else { return false }
+    return BrowserCaptureManager.shared.isRunning
+  }
+
+  private static func orderedGlasses(_ screens: [NSScreen]) -> [NSScreen] {
+    if screens.count <= 1 { return screens }
+    if let preferred = screens.first(where: { looksLikeNXTWEAR($0) }) {
+      return [preferred] + screens.filter { $0 != preferred }
+    }
+    return screens
+  }
+
+  private func perform(_ plan: GlassesSession.Transition) {
+    var kept = session
+    kept.captureRunning = plan.session.captureRunning
+    if apply(plan.effects) {
+      session = plan.session
+    } else {
+      session = kept
+    }
+    syncMenu()
+    if #available(macOS 12.3, *) {
+      BrowserCaptureWindowController.shared.syncMenu()
+    }
+  }
+
+  private func apply(_ effects: [GlassesEffect]) -> Bool {
+    for effect in effects {
+      switch effect {
+      case .noDisplay:
+        showMessage(
+          title: "No glasses display found",
+          body: "Connect the TCL NXTWEAR S with USB-C. macOS should list it as SmartGlasses, usually 1920×1080 or 3840×1080."
+        )
+        return false
+      case .pinPlayer(let display):
+        guard let screen = screen(for: display), beginGlasses(on: screen) else { return false }
+      case .unpinPlayer:
+        pendingDisplayID = nil
+        exitGlasses(closePanel: !panelIsClosing)
+      case .pinCapture(let display):
+        guard #available(macOS 12.3, *), let screen = screen(for: display) else { return false }
+        guard BrowserCaptureWindowController.shared.presentCapture(on: screen) else { return false }
+      case .unpinCapture:
+        guard #available(macOS 12.3, *) else { return false }
+        BrowserCaptureWindowController.shared.returnCaptureToPreview()
+      }
+    }
+    return true
+  }
+
+  private func screen(for display: GlassesDisplayChoice) -> NSScreen? {
+    if let screen = NSScreen.screens.first(where: { $0.displayId == display.id }) { return screen }
+    return Self.glassesCandidates().first
   }
 
   func mainWindowDidExitFullScreen() {
@@ -467,6 +529,11 @@ final class Immersive3DController: NSObject, NSWindowDelegate {
 
   func mainWindowFailedToExitFullScreen() {
     pendingDisplayID = nil
+    if session.source == .player && !glassesActive {
+      session.output = .off
+      session.restorePlayer = false
+      syncMenu()
+    }
   }
 
   func mainWindowWillClose() {
@@ -477,19 +544,21 @@ final class Immersive3DController: NSObject, NSWindowDelegate {
     DepthEstimator.shared.cancelPending()
   }
 
-  private func beginGlasses(on screen: NSScreen) {
+  @discardableResult
+  private func beginGlasses(on screen: NSScreen) -> Bool {
     let player = PlayerCore.active
     guard !player.isInMiniPlayer else {
       showMessage(title: "Exit music mode first", body: "Play on Glasses uses the main video window.")
-      return
+      return false
     }
-    guard player.mainWindow.window != nil else { return }
+    guard player.mainWindow.window != nil else { return false }
     if player.mainWindow.fsState.isFullscreen {
       pendingDisplayID = screen.displayId
       player.mainWindow.toggleWindowFullScreen()
-      return
+      return true
     }
     enterGlasses(on: screen)
+    return true
   }
 
   private func enterGlasses(on screen: NSScreen) {
@@ -786,6 +855,7 @@ final class Immersive3DController: NSObject, NSWindowDelegate {
         _ = ensureGlassesExtended()
       }
       if let screen = resolvedGlassesScreen() ?? Self.glassesCandidates().first {
+        session.noteScreen(Self.displayChoice(for: screen))
         captureGlassesHandler?(screen, Self.isFullWidthSBS(screen))
       }
     }
@@ -858,6 +928,10 @@ final class Immersive3DController: NSObject, NSWindowDelegate {
   }
 
   func exitGlasses(closePanel: Bool = true, restoreUI: Bool = true) {
+    if session.source == .player {
+      session.output = .off
+      session.restorePlayer = false
+    }
     let saved = savedWindow
     if !glassesActive && saved == nil {
       hidePanel(close: closePanel)
@@ -924,9 +998,11 @@ final class Immersive3DController: NSObject, NSWindowDelegate {
       Preference.set(saved.immersiveWasEnabled, for: .immersive3DEnabled)
     }
     savedWindow = nil
-    glassesScreen = nil
-    glassesDisplayID = nil
-    glassesUUID = nil
+    if !captureWindowPinned {
+      glassesScreen = nil
+      glassesDisplayID = nil
+      glassesUUID = nil
+    }
     hidePanel(close: closePanel)
     if restoreUI, !shuttingDown, let saved, let player {
       publishAndRedraw()
@@ -1064,7 +1140,7 @@ final class Immersive3DController: NSObject, NSWindowDelegate {
   }
 
   @objc func exitGlassesClicked(_ sender: Any?) {
-    exitGlasses()
+    perform(session.transition(.exit))
   }
 
   @objc func panelPresetChanged(_ sender: NSPopUpButton) {
@@ -1075,7 +1151,9 @@ final class Immersive3DController: NSObject, NSWindowDelegate {
   }
 
   func windowShouldClose(_ sender: NSWindow) -> Bool {
-    exitGlasses(closePanel: false)
+    panelIsClosing = true
+    perform(session.transition(.exit))
+    panelIsClosing = false
     return true
   }
 
@@ -1091,10 +1169,21 @@ final class Immersive3DController: NSObject, NSWindowDelegate {
   }
 
   static func pixelSize(of screen: NSScreen) -> (width: Int, height: Int) {
-    let scale = screen.backingScaleFactor
-    return (
-      Int((screen.frame.width * scale).rounded()),
-      Int((screen.frame.height * scale).rounded())
+    GlassesDrawable.pixels(
+      pointsWidth: Double(screen.frame.width),
+      pointsHeight: Double(screen.frame.height),
+      scale: Double(screen.backingScaleFactor)
+    ) ?? (width: 0, height: 0)
+  }
+
+  static func displayChoice(for screen: NSScreen) -> GlassesDisplayChoice {
+    let pixels = pixelSize(of: screen)
+    return GlassesDisplayChoice(
+      id: screen.displayId ?? 0,
+      pixelWidth: pixels.width,
+      pixelHeight: pixels.height,
+      fullSizeEyes: isFullWidthSBS(screen),
+      name: screen.localizedName
     )
   }
 
@@ -1299,7 +1388,7 @@ final class Immersive3DController: NSObject, NSWindowDelegate {
 
   private func rebuildGlassesItem() {
     guard let glassesItem else { return }
-    if glassesActive {
+    if glassesActive || captureOnGlasses {
       glassesItem.submenu = nil
       glassesItem.title = "Exit Glasses"
       glassesItem.action = #selector(playOnGlasses(_:))

@@ -90,6 +90,11 @@ final class BrowserCaptureWindowController: NSWindowController, NSTableViewDataS
       self?.reflectSettings()
       self?.syncMenu()
     }
+    manager.onStopped = {
+      DispatchQueue.main.async {
+        Immersive3DController.shared.captureDidStop()
+      }
+    }
     settings.onDetected = { [weak self] insets in
       self?.showDetected(insets)
     }
@@ -144,6 +149,7 @@ final class BrowserCaptureWindowController: NSWindowController, NSTableViewDataS
   }
 
   func stopAll() {
+    Immersive3DController.shared.captureDidStop()
     onGlasses = false
     outputWindow?.orderOut(nil)
     Task { await manager.stop() }
@@ -180,6 +186,7 @@ final class BrowserCaptureWindowController: NSWindowController, NSTableViewDataS
       Task { [weak self] in
         await self?.manager.stop()
         DispatchQueue.main.async {
+          Immersive3DController.shared.captureDidStop()
           self?.syncMenu()
           self?.setStatus("Capture stopped.")
         }
@@ -195,25 +202,42 @@ final class BrowserCaptureWindowController: NSWindowController, NSTableViewDataS
   }
 
   @objc func toggleGlasses(_ sender: Any?) {
-    guard let output = ensureOutput() else { return }
-    if onGlasses {
-      onGlasses = false
-      renderer.setFullSizeEyes(false)
-      Immersive3DController.shared.returnWindowFromGlasses(output, previewFrame: previewFrame)
-      fitRendererToWindow()
-      syncMenu()
-      return
-    }
-    guard manager.isRunning else {
+    guard manager.isRunning || Immersive3DController.shared.captureOnGlasses else {
       setStatus("Start capture, then send it to the glasses.")
       return
     }
-    guard let placed = Immersive3DController.shared.placeWindowOnGlasses(output) else {
+    Immersive3DController.shared.playOnGlasses(sender)
+  }
+
+  /// The glasses session asked for the capture picture. Returns false when the display cannot be used.
+  func presentCapture(on screen: NSScreen) -> Bool {
+    guard ensureOutput() != nil else { return false }
+    onGlasses = true
+    guard let outputWindow else {
+      onGlasses = false
+      return false
+    }
+    guard Immersive3DController.shared.placeWindowOnGlasses(outputWindow) != nil else {
+      onGlasses = false
       setStatus("No SmartGlasses, NXTWEAR, or 3840×1080 / 1920×1080 display is connected.")
+      return false
+    }
+    applyGlassesScreen(screen, fullSizeEyes: Immersive3DController.isFullWidthSBS(screen))
+    let pixels = Immersive3DController.pixelSize(of: screen)
+    browserCaptureLog.info("glasses source capture \(pixels.width)x\(pixels.height) \(screen.localizedName, privacy: .public)")
+    syncMenu()
+    return true
+  }
+
+  func returnCaptureToPreview() {
+    guard let output = outputWindow else {
+      onGlasses = false
       return
     }
-    onGlasses = true
-    applyGlassesScreen(placed.screen, fullSizeEyes: placed.fullSizeEyes)
+    onGlasses = false
+    renderer.setFullSizeEyes(false)
+    Immersive3DController.shared.returnWindowFromGlasses(output, previewFrame: previewFrame)
+    fitRendererToWindow()
     syncMenu()
   }
 
@@ -433,6 +457,7 @@ final class BrowserCaptureWindowController: NSWindowController, NSTableViewDataS
           self?.syncMenu()
           self?.setStatus(self?.captureStatus() ?? "Capturing.")
           self?.window?.orderOut(nil)
+          Immersive3DController.shared.captureDidStart()
         }
       } catch {
         DispatchQueue.main.async {
@@ -579,23 +604,17 @@ final class BrowserCaptureWindowController: NSWindowController, NSTableViewDataS
 
   private func fitRendererToWindow() {
     guard let outputWindow, !onGlasses else { return }
-    let scale = max(outputWindow.backingScaleFactor, 1)
+    let scale = Double(max(outputWindow.backingScaleFactor, 1))
     outputWindow.layoutIfNeeded()
     var size = renderer.bounds.size
     if size.width < 32 || size.height < 32 {
-      outputWindow.setContentSize(NSSize(width: 960, height: 540))
+      outputWindow.setContentSize(NSSize(width: CGFloat(GlassesDrawable.previewPointWidth), height: CGFloat(GlassesDrawable.previewPointHeight)))
       outputWindow.layoutIfNeeded()
       size = renderer.bounds.size
     }
-    if size.width < 32 || size.height < 32 {
-      size = NSSize(width: 960, height: 540)
-    }
-    renderer.setPixelSize(
-      width: Int((size.width * scale).rounded()),
-      height: Int((size.height * scale).rounded()),
-      scale: scale,
-      lock: false
-    )
+    let pixels = GlassesDrawable.pixels(pointsWidth: Double(size.width), pointsHeight: Double(size.height), scale: scale)
+      ?? GlassesDrawable.previewPixels(scale: scale)
+    renderer.setPixelSize(width: pixels.width, height: pixels.height, scale: CGFloat(scale), lock: false)
   }
 
   private func refreshOutputPixels() {
@@ -648,16 +667,15 @@ final class BrowserCaptureWindowController: NSWindowController, NSTableViewDataS
   func windowShouldClose(_ sender: NSWindow) -> Bool {
     guard sender == outputWindow else { return true }
     if onGlasses {
-      onGlasses = false
-      renderer.setFullSizeEyes(false)
-      Immersive3DController.shared.returnWindowFromGlasses(sender, previewFrame: previewFrame)
-      fitRendererToWindow()
-      syncMenu()
+      Immersive3DController.shared.playOnGlasses(nil)
       return false
     }
     Task { [weak self] in
       await self?.manager.stop()
-      DispatchQueue.main.async { self?.syncMenu() }
+      DispatchQueue.main.async {
+        Immersive3DController.shared.captureDidStop()
+        self?.syncMenu()
+      }
     }
     return true
   }

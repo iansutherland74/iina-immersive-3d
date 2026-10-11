@@ -156,7 +156,8 @@ final class Immersive3DCompositor {
       width: output.width,
       height: output.height,
       contentAspect: contentAspect,
-      glOriented: glOriented
+      glOriented: glOriented,
+      colorIsPicture: !colorIsBottomUp
     ) else { return false }
     failureCount = 0
     return true
@@ -259,13 +260,12 @@ final class Immersive3DCompositor {
     width: Int,
     height: Int,
     contentAspect: Float,
-    glOriented: Bool
+    glOriented: Bool,
+    colorIsPicture: Bool
   ) -> Bool {
-    guard let pipeline, let depthTexture,
-          let commandBuffer = commandQueue.makeCommandBuffer(),
-          let encoder = commandBuffer.makeComputeCommandEncoder() else { return false }
-    let content = contentRect(fullSizeEyes: snapshot.fullSizeEyes, width: width, height: height, contentAspect: contentAspect)
-    var params = StereoParams(
+    guard let pipeline, let depthTexture else { return false }
+    let content = contentRect(fullSizeEyes: snapshot.fullSizeEyes, width: width, height: height, contentAspect: contentAspect, colorIsPicture: colorIsPicture)
+    let params = StereoOffscreen.Params(
       maxShift: snapshot.maxShift,
       convergence: snapshot.convergence,
       holeThreshold: 0.08,
@@ -277,49 +277,42 @@ final class Immersive3DCompositor {
       contentW: content.w,
       contentH: content.h
     )
-    encoder.setComputePipelineState(pipeline)
-    encoder.setTexture(color, index: 0)
-    encoder.setTexture(depthTexture, index: 1)
-    encoder.setTexture(output, index: 2)
-    encoder.setBytes(&params, length: MemoryLayout<StereoParams>.stride, index: 0)
-    let threads = MTLSize(width: width, height: height, depth: 1)
-    let group = MTLSize(width: 16, height: 16, depth: 1)
-    encoder.dispatchThreads(threads, threadsPerThreadgroup: group)
-    encoder.endEncoding()
-    commandBuffer.commit()
-    commandBuffer.waitUntilCompleted()
-    if let error = commandBuffer.error {
-      log3D("Stereo command buffer failed: \(error.localizedDescription)", level: .error)
-      return false
+    let wrote = StereoOffscreen.encode(
+      commandQueue: commandQueue,
+      pipeline: pipeline,
+      color: color,
+      depth: depthTexture,
+      output: output,
+      params: params
+    )
+    if !wrote {
+      log3D("Stereo command buffer failed", level: .error)
     }
-    return true
+    return wrote
   }
 
-  /// Normalized top-down rect of the aspect-fitted picture inside the framebuffer.
-  /// Half-SBS (1920×1080 glasses) uses the full frame. A double-wide 3840×1080
-  /// framebuffer pillarboxes a 16:9 picture into the center half; each eye then
-  /// samples that half at full size.
-  private func contentRect(fullSizeEyes: Bool, width: Int, height: Int, contentAspect: Float) -> (x: Float, y: Float, w: Float, h: Float) {
-    guard fullSizeEyes, width > 1, height > 1 else { return (0, 0, 1, 1) }
-    let frameAspect = Float(width) / Float(height)
-    let videoAspect: Float
-    if contentAspect > 0.01 {
-      videoAspect = contentAspect
-    } else {
-      var videoW = 0
-      var videoH = 0
-      if !PlayerCore.playerCores.isEmpty {
-        videoW = PlayerCore.active.info.displayWidth ?? 0
-        videoH = PlayerCore.active.info.displayHeight ?? 0
-      }
-      videoAspect = (videoW > 0 && videoH > 0) ? Float(videoW) / Float(videoH) : (16.0 / 9.0)
+  /// Normalized top-down rect of the picture inside the color texture.
+  /// The player framebuffer already pillarboxes. A capture texture is the picture, so each eye samples all of it.
+  private func contentRect(fullSizeEyes: Bool, width: Int, height: Int, contentAspect: Float, colorIsPicture: Bool) -> StereoOffscreen.Rect {
+    StereoOffscreen.contentRect(
+      outputWidth: width,
+      outputHeight: height,
+      contentAspect: pictureAspect(contentAspect),
+      fullSizeEyes: fullSizeEyes,
+      colorIsPicture: colorIsPicture
+    )
+  }
+
+  private func pictureAspect(_ contentAspect: Float) -> Float {
+    if contentAspect > 0.01 { return contentAspect }
+    var videoW = 0
+    var videoH = 0
+    if !PlayerCore.playerCores.isEmpty {
+      videoW = PlayerCore.active.info.displayWidth ?? 0
+      videoH = PlayerCore.active.info.displayHeight ?? 0
     }
-    if videoAspect >= frameAspect {
-      let contentH = min(max(frameAspect / videoAspect, 0.01), 1)
-      return (0, (1 - contentH) * 0.5, 1, contentH)
-    }
-    let contentW = min(max(videoAspect / frameAspect, 0.01), 1)
-    return ((1 - contentW) * 0.5, 0, contentW, 1)
+    if videoW > 0 && videoH > 0 { return Float(videoW) / Float(videoH) }
+    return 16.0 / 9.0
   }
 
   // MARK: - OpenGL
@@ -544,19 +537,6 @@ final class Immersive3DCompositor {
       glFailed = true
     }
   }
-}
-
-private struct StereoParams {
-  var maxShift: Float
-  var convergence: Float
-  var holeThreshold: Float
-  var invertDepth: Float
-  var glOriented: Float
-  var searchPixels: Float
-  var contentX: Float
-  var contentY: Float
-  var contentW: Float
-  var contentH: Float
 }
 
 private struct SmallTarget {

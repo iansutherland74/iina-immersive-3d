@@ -86,6 +86,10 @@ final class BrowserCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
   private var lastComplete = CACurrentMediaTime()
   private(set) var currentID: CGWindowID?
   private(set) var activeTarget: BrowserCaptureTarget?
+  private var trackedBundle = ""
+  private var trackedOwner = ""
+  private var trackedTitle = ""
+  private var trackedDisplay: CGDirectDisplayID = 0
   private(set) var sourcePID: pid_t?
   private(set) var audioActive = false
 
@@ -96,6 +100,8 @@ final class BrowserCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
   var onStatus: ((String?) -> Void)?
   var onNote: ((String) -> Void)?
   var onMuteChanged: (() -> Void)?
+  /// The stream gave up after an error. The glasses session drops the capture source.
+  var onStopped: (() -> Void)?
   /// Read on the main thread. Window numbers are AppKit objects.
   var excludedWindowIDs: () -> Set<CGWindowID> = { [] }
 
@@ -256,6 +262,18 @@ final class BrowserCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
     activeTarget = resolved.target
     currentID = resolved.target.kind == .window ? resolved.target.id : nil
     sourcePID = resolved.pid
+    if resolved.target.kind == .window {
+      trackedBundle = resolved.target.bundleID
+      trackedOwner = resolved.target.owner
+      trackedTitle = resolved.target.title
+      let frame = content.windows.first { $0.windowID == resolved.target.id }?.frame ?? .zero
+      trackedDisplay = Self.displayID(covering: frame, displays: content.displays)
+    } else {
+      trackedBundle = ""
+      trackedOwner = ""
+      trackedTitle = ""
+      trackedDisplay = resolved.target.displayID
+    }
     loggedFirstFrame = false
     framesInWindow = 0
     windowStarted = CACurrentMediaTime()
@@ -318,6 +336,10 @@ final class BrowserCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
       currentID = nil
       activeTarget = nil
       sourcePID = nil
+      trackedBundle = ""
+      trackedOwner = ""
+      trackedTitle = ""
+      trackedDisplay = 0
     }
     guard let stream else { return }
     self.stream = nil
@@ -344,8 +366,10 @@ final class BrowserCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
         shouldRun = false
         await tearDown(clearTarget: true)
         let status = onStatus
+        let stopped = onStopped
         DispatchQueue.main.async {
           status?(message)
+          stopped?()
         }
         return
       }
@@ -363,11 +387,13 @@ final class BrowserCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
     }
   }
 
-  /// Every half second, the same interval OBS uses in `find_window`. The current window id wins while it still exists, including on another Space. When full screen replaces that id, the next window with the same app and title is captured.
+  /// Every half second, the same interval OBS uses in `find_window`. Full-screen YouTube changes the window id and the title, so a missing id is followed by bundle id and then by the largest window on any Space. If that app has no window, the display it occupied is captured instead.
   private func followTrackedWindow(token: Int) async {
     guard beginSession() else { return }
     defer { endSession() }
-    guard shouldRun, token == epoch, var target = activeTarget, target.kind == .window else { return }
+    guard shouldRun, token == epoch, let target = activeTarget else { return }
+    let followingWindow = target.kind == .window || !trackedBundle.isEmpty || !trackedOwner.isEmpty
+    guard followingWindow else { return }
     let ids = await MainActor.run { self.excludedWindowIDs() }
     guard token == epoch else { return }
     excludedIDs = ids
@@ -379,27 +405,98 @@ final class BrowserCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
       return
     }
     guard token == epoch, shouldRun else { return }
-    let windows = content.windows.filter { Self.isListableWindow($0, excluding: ids) }
-    if windows.contains(where: { $0.windowID == target.id }) {
-      let current = windows.first { $0.windowID == target.id }
-      if let replacement = Self.replacement(for: target, current: current, in: windows), replacement.windowID != target.id {
-        target.id = replacement.windowID
-        target.title = replacement.title ?? target.title
-        target.width = Int(replacement.frame.width.rounded())
-        target.height = Int(replacement.frame.height.rounded())
-        await retarget(target, window: replacement, token: token)
+    let windows = content.windows.filter { Self.isFollowableWindow($0, excluding: ids) }
+    let records = windows.map { Self.record($0, displays: content.displays) }
+    let track = CaptureTrack(
+      kind: target.kind == .display ? .display : .window,
+      windowID: target.kind == .window ? target.id : 0,
+      title: trackedTitle,
+      owner: trackedOwner,
+      bundleID: trackedBundle,
+      displayID: trackedDisplay
+    )
+    let decision = CaptureWindowMatch.decide(
+      track: track,
+      windows: records,
+      displayIDs: content.displays.map(\.displayID)
+    )
+    switch decision {
+    case .keep:
+      if let current = windows.first(where: { $0.windowID == target.id }), target.kind == .window {
+        let display = Self.displayID(covering: current.frame, displays: content.displays)
+        if display != 0 { trackedDisplay = display }
       }
-      return
+    case .window(let found, let reason):
+      guard let window = windows.first(where: { $0.windowID == found.id }) else { return }
+      browserCaptureLog.info("\(reason, privacy: .public)")
+      var updated = target
+      updated.kind = .window
+      updated.id = window.windowID
+      updated.title = window.title ?? found.title
+      updated.owner = window.owningApplication?.applicationName ?? found.owner
+      updated.bundleID = window.owningApplication?.bundleIdentifier ?? found.bundleID
+      updated.width = found.width
+      updated.height = found.height
+      trackedTitle = updated.title
+      trackedOwner = updated.owner
+      trackedBundle = updated.bundleID
+      if found.displayID != 0 { trackedDisplay = found.displayID }
+      await retarget(updated, window: window, token: token)
+    case .display(let displayID, let reason):
+      guard let display = content.displays.first(where: { $0.displayID == displayID }) ?? content.displays.first else { return }
+      browserCaptureLog.info("\(reason, privacy: .public)")
+      let skip = content.windows.filter { ids.contains($0.windowID) }
+      await retargetDisplay(display, excluding: skip, token: token)
     }
-    guard let found = Self.matchWindow(owner: target.owner, title: target.title, bundle: target.bundleID, in: windows) else {
-      browserCaptureLog.info("tracked window \(target.id) is gone; no app+title match")
-      return
+  }
+
+  private func retargetDisplay(_ display: SCDisplay, excluding skip: [SCWindow], token: Int) async {
+    guard token == epoch, let stream else { return }
+    let filter = SCContentFilter(display: display, excludingWindows: skip)
+    let updated = await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+      stream.updateContentFilter(filter) { error in
+        if let error {
+          browserCaptureLog.error("updateContentFilter failed: \(error.localizedDescription, privacy: .public)")
+          continuation.resume(returning: false)
+        } else {
+          continuation.resume(returning: true)
+        }
+      }
     }
-    target.id = found.windowID
-    target.title = found.title ?? target.title
-    target.width = Int(found.frame.width.rounded())
-    target.height = Int(found.frame.height.rounded())
-    await retarget(target, window: found, token: token)
+    guard updated, token == epoch else { return }
+    var target = activeTarget ?? BrowserCaptureTarget(
+      kind: .display,
+      id: 0,
+      displayID: display.displayID,
+      title: "Capture whole display",
+      owner: "",
+      bundleID: trackedBundle,
+      width: Int(display.width),
+      height: Int(display.height)
+    )
+    target.kind = .display
+    target.id = 0
+    target.displayID = display.displayID
+    target.title = "Capture whole display"
+    let size = Self.clampedPixels(Int(display.width), Int(display.height))
+    target.width = size.width
+    target.height = size.height
+    activeTarget = target
+    currentID = nil
+    trackedDisplay = display.displayID
+    configuration?.width = size.width
+    configuration?.height = size.height
+    if let configuration {
+      await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+        stream.updateConfiguration(configuration) { error in
+          if let error {
+            browserCaptureLog.error("updateConfiguration failed: \(error.localizedDescription, privacy: .public)")
+          }
+          continuation.resume()
+        }
+      }
+    }
+    browserCaptureLog.info("capturing display \(display.displayID) \(size.width)x\(size.height)")
   }
 
   private func retarget(_ target: BrowserCaptureTarget, window: SCWindow, token: Int) async {
@@ -420,6 +517,9 @@ final class BrowserCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
     activeTarget = target
     currentID = window.windowID
     sourcePID = window.owningApplication?.processID
+    if BrowserCaptureSettings.shared.wantsMute {
+      applyMute()
+    }
     let size = Self.pixelSize(for: window)
     configuration?.width = size.width
     configuration?.height = size.height
@@ -627,6 +727,38 @@ final class BrowserCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
         height: Int(window.frame.height.rounded())
       )
     }.sorted { $0.label.localizedCaseInsensitiveCompare($1.label) == .orderedAscending }
+  }
+
+  private static func record(_ window: SCWindow, displays: [SCDisplay]) -> CaptureWindowRecord {
+    CaptureWindowRecord(
+      id: window.windowID,
+      title: window.title ?? "",
+      owner: window.owningApplication?.applicationName ?? "",
+      bundleID: window.owningApplication?.bundleIdentifier ?? "",
+      width: Int(window.frame.width.rounded()),
+      height: Int(window.frame.height.rounded()),
+      onScreen: window.isOnScreen,
+      displayID: displayID(covering: window.frame, displays: displays)
+    )
+  }
+
+  private static func displayID(covering frame: CGRect, displays: [SCDisplay]) -> UInt32 {
+    CaptureWindowMatch.displayID(
+      covering: frame,
+      displays: displays.map { (id: $0.displayID, frame: $0.frame) }
+    )
+  }
+
+  /// Follow can see a full-screen window whose title was cleared. The chooser still requires a title.
+  private static func isFollowableWindow(_ window: SCWindow, excluding ids: Set<CGWindowID>) -> Bool {
+    if ids.contains(window.windowID) { return false }
+    if window.windowLayer != 0 { return false }
+    let owner = window.owningApplication?.applicationName ?? ""
+    let bundle = window.owningApplication?.bundleIdentifier ?? ""
+    if owner.isEmpty && bundle.isEmpty { return false }
+    let width = Int(window.frame.width.rounded())
+    let height = Int(window.frame.height.rounded())
+    return width >= 80 && height >= 80
   }
 
   private static func isListableWindow(_ window: SCWindow, excluding ids: Set<CGWindowID>) -> Bool {
