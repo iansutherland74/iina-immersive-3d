@@ -249,6 +249,22 @@ final class IPTVLibrary {
     latestStream = stream
     latestAlias = alias
     standInLock.unlock()
+    if Thread.isMainThread {
+      IPTVBrowseOverlayController.shared.notePlaybackRegistered()
+    } else {
+      DispatchQueue.main.async {
+        IPTVBrowseOverlayController.shared.notePlaybackRegistered()
+      }
+    }
+  }
+
+  /// The movie or episode currently handed to the player, before playback end clears it.
+  func activePlayback() -> (sourceID: UUID, itemID: String, record: IPTVWatchRecord)? {
+    guard let active = activeWatch, let bar = active.key.firstIndex(of: "|") else { return nil }
+    let sourcePart = String(active.key[..<bar])
+    let itemPart = String(active.key[active.key.index(after: bar)...])
+    guard let sourceID = UUID(uuidString: sourcePart) else { return nil }
+    return (sourceID, itemPart, active.record)
   }
 
   func historyStandIn(for url: URL?) -> (url: URL, title: String)? {

@@ -549,6 +549,7 @@ final class GlassesEyeHost: NSView {
 
   override func mouseMoved(with event: NSEvent) {
     _ = GlassesEyeControls.shared.handlePointer(event)
+    IPTVBrowseOverlayController.shared.handleHover(event)
     IPTVLiveOverlayController.shared.handleHover(event)
   }
 }

@@ -860,6 +860,7 @@ class MainWindowController: PlayerWindowController {
     ]
     layoutSides.forEach { videoViewConstraints[$0]?.isActive = true }
     IPTVLiveOverlayController.shared.attachIfNeeded()
+    IPTVBrowseOverlayController.shared.attachIfNeeded()
   }
 
   func updateVideoViewConstraints(_ constraints: [NSLayoutConstraint.Attribute: CGFloat]) {
@@ -1078,6 +1079,10 @@ class MainWindowController: PlayerWindowController {
   // MARK: - Mouse / Trackpad events
 
   override func keyDown(with event: NSEvent) {
+    if IPTVBrowseOverlayController.shared.handleKeyDown(event) {
+      IPTVBrowseOverlayController.shared.logKey(event, source: "player-window", consumed: true)
+      return
+    }
     let consumed = IPTVLiveOverlayController.shared.handleKeyDown(event)
     IPTVLiveOverlayController.shared.logKey(event, source: "player-window", consumed: consumed)
     if consumed { return }
@@ -1253,9 +1258,9 @@ class MainWindowController: PlayerWindowController {
   override func scrollWheel(with event: NSEvent) {
     if !interactiveMode.isActive, GlassesEyeControls.shared.handleScroll(event) { return }
     if let container = videoViewContainer,
-       container.bounds.contains(container.convert(event.locationInWindow, from: nil)),
-       IPTVLiveOverlayController.shared.handleScroll(event) {
-      return
+       container.bounds.contains(container.convert(event.locationInWindow, from: nil)) {
+      if IPTVBrowseOverlayController.shared.handleScroll(event) { return }
+      if IPTVLiveOverlayController.shared.handleScroll(event) { return }
     }
     guard !interactiveMode.isActive else { return }
     if !isMomentumScrollingAllowed && !event.momentumPhase.isEmpty {
