@@ -17,6 +17,7 @@
 #import "FixedFontManager.h"
 #import "ObjcUtils.h"
 #import "FFmpegController.h"
+#import "LiveCaptions/LiveCaptionDecode.h"
 
 #import <CommonCrypto/CommonCrypto.h>
 

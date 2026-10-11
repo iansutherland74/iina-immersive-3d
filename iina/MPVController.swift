@@ -1056,6 +1056,26 @@ class MPVController: NSObject {
     MPVNode.free(node)
   }
 
+  /// Named mpv command. osd-overlay rejects the string form: id, res_x, and
+  /// res_y have to be int64, and the format is `ass-events` or `none`.
+  func commandNode(_ payload: [String: Any?], checkError: Bool = false) -> Int32 {
+    guard mpv != nil else { return MPV_ERROR_UNINITIALIZED.rawValue }
+    guard var node = try? MPVNode.create(payload) else {
+      log("commandNode: cannot encode \(payload["name"] ?? "")", level: .error)
+      return MPV_ERROR_INVALID_PARAMETER.rawValue
+    }
+    defer { MPVNode.free(node) }
+    var result = mpv_node()
+    let code = mpv_command_node(mpv, &node, &result)
+    if code >= 0 {
+      mpv_free_node_contents(&result)
+    }
+    if checkError {
+      chkErr(code)
+    }
+    return code
+  }
+
   /// Returns the given node map value as an `Int`.
   ///
   /// This method is intended to be used when extracting values from a `MPV_FORMAT_NODE_MAP` `mpv_node` that contains

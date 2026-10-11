@@ -3,6 +3,9 @@ name: macOS Release
 # Apple Silicon hosted runner (newer than macos-15) with the latest stable
 # Xcode 16 or newer. IINA 1.5.0's asset catalogs are template format 7.0, which
 # Xcode 15 cannot compile.
+# The installable app is produced only from main. Pull requests still compile,
+# so a branch can be checked, but they do not upload IINA.app. Installing a
+# pull-request build dropped features that lived on other branches.
 on:
   push:
     branches: [main]
@@ -165,6 +168,7 @@ jobs:
           if-no-files-found: ignore
 
       - name: Zip IINA.app and record minimum OS
+        if: github.ref == 'refs/heads/main'
         working-directory: iina
         run: |
           set -euo pipefail
@@ -185,6 +189,7 @@ jobs:
           ls -lh IINA-macos-arm64.zip
 
       - name: Upload IINA.app
+        if: github.ref == 'refs/heads/main'
         uses: actions/upload-artifact@v7
         with:
           name: IINA-macos-arm64.zip

@@ -6,24 +6,21 @@
 //  Based on IINA, Copyright (C) 2017-2026 Collider LI and contributors.
 //  Licensed under the GNU General Public License, version 3.
 //
-//  Live auto subtitles. libmpv does not export decoded PCM. A lavfi asplit
-//  graph inside mpv cannot hand samples to the host, and replacing the audio
-//  output would mute playback. This engine decodes the same URL again with
-//  AVFoundation and runs whisper.cpp in-process. Each line is stamped with the
-//  audio PTS, not the time the text arrived. The choice is automatic. A file,
-//  a movie, or catch-up is read ahead of the playhead, so playback is not
-//  delayed. An IPTV live channel, or any other unseekable stream, cannot be
-//  read from the future, so the demuxer cache holds the picture and the sound.
-//  Changing the URL detects that again. Turning captions off seeks a held
-//  channel back to the live edge. Depth is estimated from the frame mpv has
-//  already drawn, so it stays on that same delayed picture. Only caption text
-//  leaves the Mac, and only when a translation API key is set.
+//  Live auto subtitles. libmpv does not export decoded PCM. A local file is
+//  decoded with the FFmpeg already linked into IINA. A network or live stream
+//  is taken from mpv's demuxer cache, so the provider is not opened again.
+//  whisper.cpp runs in-process. Each line is stamped with the audio PTS, not
+//  the time the text arrived. A file or movie is read ahead of the playhead
+//  and playback is not held back. A live channel cannot be read from the
+//  future, so the demuxer cache holds the picture and the sound. Turning
+//  captions off seeks a held channel back to the live edge. Depth is estimated
+//  from the frame mpv has already drawn, so it stays on that same delayed
+//  picture. Only caption text leaves the Mac, and only when a translation API
+//  key is set.
 
-import AVFoundation
-import AudioToolbox
 import Cocoa
 import Darwin
-import MediaToolbox
+import os
 
 #if canImport(Translation)
 import Translation
@@ -31,6 +28,18 @@ import Translation
 
 extension Notification.Name {
   static let liveCaptionStatusChanged = Notification.Name("IINALiveCaptionStatusChanged")
+}
+
+/// Unified-log line for the caption engine. IINA's file logger drops every
+/// message when logging is off, which is the default, so this does not use it.
+private let liveCaptionLog = os.Logger(subsystem: "com.colliderli.iina", category: "LiveCaptions")
+
+private func liveCaptionInfo(_ message: String) {
+  liveCaptionLog.info("\(message, privacy: .public)")
+}
+
+private func liveCaptionError(_ message: String) {
+  liveCaptionLog.error("\(message, privacy: .public)")
 }
 
 enum LiveCaptionLanguage {
@@ -159,6 +168,14 @@ final class LiveCaptionController {
   private var holdingPlayback = false
   private var holdStarted = Date.distantPast
   private var gaveUpHold = false
+  private var delayApplyScheduled = false
+  private var savedCaptionSubVisibility: Bool?
+  private var triedFlatTrack = false
+  private var lastOSD = ""
+  private var audioMisses = 0
+  private var loggedQuiet = false
+  private var loggedEmpty = false
+  private var loggedTime = false
   private let subtitleURL = FileManager.default.temporaryDirectory.appendingPathComponent("iina-live-caption.ass")
 
   private(set) var statusText = "Live captions are off."
@@ -192,8 +209,13 @@ final class LiveCaptionController {
       }
     }
     preferences.add(.liveCaptionSync) { _ in refresh() }
-    preferences.add(.liveCaptionLiveDelay) { _ in refresh() }
     preferences.add(.liveCaptionLiveDelayAuto) { _ in refresh() }
+    // Dragging the slider writes the default on every tick. Applying that to
+    // mpv on the same turn freezes the knob, so the apply waits until the
+    // current mouse event has drawn.
+    preferences.add(.liveCaptionLiveDelay) { [weak self] _ in
+      self?.scheduleDelayApply()
+    }
   }
 
   func noteFileStarted(core: PlayerCore) {
@@ -222,15 +244,123 @@ final class LiveCaptionController {
     overlay.attachIfNeeded()
   }
 
-  func setStatus(_ text: String) {
+  func setStatus(_ text: String, osd: String? = nil) {
     let apply = {
-      self.statusText = text
-      NotificationCenter.default.post(name: .liveCaptionStatusChanged, object: nil)
+      if self.statusText != text {
+        self.statusText = text
+        liveCaptionInfo(text)
+        NotificationCenter.default.post(name: .liveCaptionStatusChanged, object: nil)
+      }
+      if let osd {
+        self.presentStatusOSD(osd)
+      }
     }
     if Thread.isMainThread {
       apply()
     } else {
       DispatchQueue.main.async(execute: apply)
+    }
+  }
+
+  private func noteMissingAudio() {
+    audioMisses += 1
+    let state = source.diagnostic()
+    if audioMisses == 1 || audioMisses == 4 {
+      liveCaptionInfo("waiting for audio (\(state))")
+    }
+    if let failure = source.failure() {
+      setStatus(failure.message, osd: "Live captions: error: \(failure.osd)")
+      return
+    }
+    if audioMisses >= 4 {
+      if source.bufferedSeconds() >= 0.5 {
+        setStatus("Audio is buffered, but the playhead is outside that range. \(state)", osd: "Live captions: error: playhead outside audio")
+      } else if source.isCacheThin() {
+        setStatus("No audio has arrived from the player. \(state)", osd: "Live captions: error: no audio from the player")
+      } else {
+        setStatus("No audio has arrived for captions. \(state)", osd: "Live captions: error: no audio captured")
+      }
+    } else {
+      presentStatusOSD("Live captions: listening")
+    }
+  }
+
+  /// Small top-of-picture line. Real captions use the subtitle track or overlay 7.
+  private func presentStatusOSD(_ line: String) {
+    let draw = {
+      let captionVisible = !self.displayedText.isEmpty
+      let keep = line.contains("error:") || line.contains("loading")
+      if captionVisible && !keep {
+        if !self.lastOSD.isEmpty {
+          self.clearStatusOSD()
+        }
+        return
+      }
+      if line == self.lastOSD { return }
+      self.lastOSD = line
+      liveCaptionInfo(line)
+      let body = "{\\an8\\fs28\\bord2}" + self.escapeASS(line)
+      let code = self.overlayCommand(id: 8, format: "ass-events", data: self.assEvent(body))
+      if code < 0 {
+        liveCaptionError("status osd-overlay failed \(code)")
+      }
+    }
+    if Thread.isMainThread {
+      draw()
+    } else {
+      DispatchQueue.main.async(execute: draw)
+    }
+  }
+
+  private func clearStatusOSD() {
+    lastOSD = ""
+    _ = overlayCommand(id: 8, format: "none", data: "")
+  }
+
+  /// osd-overlay is a named command. The string form returns -4 because id,
+  /// res_x, and res_y are int64, and the only text format is ass-events.
+  private func overlayCommand(id: Int, format: String, data: String) -> Int32 {
+    if !Thread.isMainThread {
+      var code = MPV_ERROR_UNINITIALIZED.rawValue
+      DispatchQueue.main.sync {
+        code = self.overlayCommand(id: id, format: format, data: data)
+      }
+      return code
+    }
+    guard mpvIsUsable(), let core else { return MPV_ERROR_UNINITIALIZED.rawValue }
+    let payload: [String: Any?] = [
+      "name": "osd-overlay",
+      "id": id,
+      "format": format,
+      "data": data,
+      "res_x": 1920,
+      "res_y": 1080,
+      "z": 0
+    ]
+    return core.mpv.commandNode(payload)
+  }
+
+  private func assEvent(_ body: String) -> String {
+    "Dialogue: 0,0:00:00.00,9:59:59.99,Default,,0,0,0,," + body
+  }
+
+  /// Coalesce live-delay edits so a drag updates the label immediately and
+  /// mpv receives one cache change for the value the knob stopped on.
+  private func scheduleDelayApply() {
+    let enqueue = {
+      guard !self.delayApplyScheduled else { return }
+      self.delayApplyScheduled = true
+      DispatchQueue.main.async { [weak self] in
+        guard let self else { return }
+        self.delayApplyScheduled = false
+        self.maintainLiveDelay()
+        self.refreshSyncText()
+      }
+    }
+    if Thread.isMainThread {
+      enqueue()
+    } else {
+      DispatchQueue.main.async(execute: enqueue)
     }
   }
 
@@ -247,9 +377,14 @@ final class LiveCaptionController {
   }
 
   private func start() {
-    guard let core, core.mpv != nil, let url = core.info.currentURL else { return }
+    guard let core, core.mpv != nil, let url = core.info.currentURL else {
+      liveCaptionError("engine did not start: player or URL is missing")
+      setStatus("Live captions could not start because playback is not ready.", osd: "Live captions: error: playback is not ready")
+      return
+    }
     if running, activeURL == url { return }
-    stop(jumpToLive: false)
+    let replacing = running
+    stop(jumpToLive: false, reason: replacing ? "new file" : "playback stopped")
     generation += 1
     let token = generation
     running = true
@@ -261,22 +396,32 @@ final class LiveCaptionController {
     assSignature = ""
     shownCueSignature = ""
     gaveUpHold = false
+    audioMisses = 0
+    loggedQuiet = false
+    loggedEmpty = false
+    loggedTime = false
+    triedFlatTrack = false
     let agent = core.mpv.getString("user-agent")
     let time = core.mpv.getDouble(MPVProperty.timePos)
+    let kind = url.isFileURL ? "file" : "network"
+    liveCaptionInfo("engine start \(kind)")
     source.open(url: url, userAgent: agent, at: time.isFinite ? time : 0)
     installTimer()
     overlay.attachIfNeeded()
     let pace = CaptionPace.current()
-    setStatus("Listening. Captions lag the picture by about \(Int(pace.window)) seconds, plus model time.")
+    setStatus("Listening. Captions lag the picture by about \(Int(pace.window)) seconds, plus model time.", osd: "Live captions: listening")
     schedule(generation: token, delay: 0.4)
   }
 
-  private func stop(jumpToLive: Bool) {
+  private func stop(jumpToLive: Bool, reason: String = "playback stopped") {
+    let wasRunning = running
     generation += 1
     running = false
     activeURL = nil
     restorePlaybackDelay(jumpToLive: jumpToLive)
-    whisper.setAbort(1)
+    if wasRunning {
+      whisper.requestAbort(reason)
+    }
     source.close()
     cues.removeAll()
     assSignature = ""
@@ -327,24 +472,47 @@ final class LiveCaptionController {
     guard LiveCaptionStore.isInstalled(model) else {
       let name = model == .small ? "Small" : "Base"
       publish(notice: "Live captions: download the \(name) model in Settings → Subtitles.", token: token)
-      setStatus("\(name) model is not downloaded. It stays on this Mac, under Application Support.")
+      setStatus("\(name) model is not downloaded. It stays on this Mac, under Application Support.", osd: "Live captions: error: \(name) model is not downloaded")
       return
     }
     guard whisper.ensureLoaded(model: model) else {
       publish(notice: "Live captions could not load whisper.cpp.", token: token)
       return
     }
-    guard let time = mediaTime(), time.isFinite else { return }
-    let waiting = playbackShouldWait()
-    let lead = (!waiting && !source.isLiveEdge) ? lookaheadLead() : 0
-    reportedLookahead = lead
-    let coverEnd = time + lead + pace.window
-    source.follow(coveringEnd: coverEnd, window: pace.window)
-    guard let audio = source.samples(coveringEnd: coverEnd, window: pace.window) else { return }
-    if rms(audio.samples) < 0.008 {
+    guard let time = mediaTime(), time.isFinite else {
+      if !loggedTime {
+        loggedTime = true
+        liveCaptionError("playhead time is not ready")
+      }
       return
     }
-    whisper.setAbort(0)
+    loggedTime = false
+    let waiting = playbackShouldWait()
+    let ahead = (!waiting && !source.isLiveEdge) ? lookaheadLead() : 0
+    reportedLookahead = ahead
+    source.follow(playhead: time, window: pace.window, ahead: ahead)
+    guard let audio = source.samples(playhead: time, window: pace.window) else {
+      noteMissingAudio()
+      return
+    }
+    let missed = audioMisses
+    audioMisses = 0
+    if missed >= 4 {
+      presentStatusOSD("Live captions: listening")
+    }
+    let level = rms(audio.samples)
+    let chunkSeconds = Double(audio.samples.count) / 16000
+    liveCaptionInfo(String(format: "chunk rms %.4f samples %d start %.2f dur %.2f", level, audio.samples.count, audio.start, chunkSeconds))
+    if level < 0.008 {
+      if !loggedQuiet {
+        loggedQuiet = true
+        liveCaptionInfo("audio is below the speech threshold")
+      }
+      presentStatusOSD("Live captions: listening")
+      return
+    }
+    loggedQuiet = false
+    whisper.clearAbort()
     let sourceLanguage = Preference.string(for: .liveCaptionSourceLanguage) ?? "auto"
     let target = Preference.string(for: .liveCaptionTargetLanguage) ?? "original"
     let translateToEnglish = target == "en" && sourceLanguage != "en"
@@ -362,7 +530,15 @@ final class LiveCaptionController {
     guard token == generation else { return }
     let duration = Double(audio.samples.count) / 16000
     var parsed = cues(from: raw, audioStart: audio.start, audioDuration: duration)
-    guard !parsed.isEmpty else { return }
+    guard !parsed.isEmpty else {
+      if !loggedEmpty {
+        loggedEmpty = true
+        liveCaptionInfo("whisper returned no words segments \(whisper.lastSegments())")
+      }
+      presentStatusOSD("Live captions: listening")
+      return
+    }
+    loggedEmpty = false
     parsed = parsed.map { cue in
       var next = cue
       let translated = translate(cue.text, sourceLanguage: sourceLanguage, target: target, alreadyEnglish: translateToEnglish)
@@ -452,6 +628,9 @@ final class LiveCaptionController {
         showFlatCaption(syncing: timed)
       }
     }
+    if !lastOSD.isEmpty {
+      presentStatusOSD(lastOSD)
+    }
   }
 
   /// A file, movie, or catch-up is timed to the audio. A live channel is too, once the
@@ -504,32 +683,82 @@ final class LiveCaptionController {
       assSignature = signature
     }
     let hadTrack = mpvTrackID != nil && !usingOSD
-    if mpvTrackID == nil && !usingOSD {
-      if previousSID == nil {
-        previousSID = core.mpv.getInt("sid")
-      }
-      var code: Int32 = 0
-      core.mpv.command(.subAdd, args: [subtitleURL.mpvStr, "select", "Live captions", "und"], checkError: false) { code = $0 }
-      let sid = core.mpv.getInt("sid")
-      if code >= 0 && sid > 0 {
-        mpvTrackID = sid
-        usingOSD = false
-      } else {
-        usingOSD = true
-      }
+    if mpvTrackID == nil || usingOSD {
+      attachFlatTrack(core)
     }
-    if hadTrack, changed, let track = mpvTrackID, !usingOSD {
-      core.mpv.command(.subReload, args: [String(track)], checkError: false)
+    if changed, !usingOSD, let track = mpvTrackID {
+      var code: Int32 = 0
+      core.mpv.command(.subReload, args: [String(track)], checkError: false) { code = $0 }
+      if code < 0 {
+        liveCaptionError("sub-reload \(code) for track \(track)")
+        usingOSD = true
+      } else if !hadTrack {
+        liveCaptionInfo("live caption track \(track) loaded")
+      }
     }
     if usingOSD || mpvTrackID == nil {
       let text = displayedText
       if text.isEmpty {
-        core.mpv.command(.osdOverlay, args: ["7", "none", "", "0", "0", "0"], checkError: false)
+        let code = overlayCommand(id: 7, format: "none", data: "")
+        if code < 0 {
+          liveCaptionError("caption osd-overlay failed \(code)")
+        }
       } else {
         let line = "{\\an2\\fs48\\bord3}" + escapeASS(text)
-        core.mpv.command(.osdOverlay, args: ["7", "ass", line, "1920", "1080", "0"], checkError: false)
+        let code = overlayCommand(id: 7, format: "ass-events", data: assEvent(line))
+        if code < 0 {
+          liveCaptionError("caption osd-overlay failed \(code)")
+        }
       }
     }
+  }
+
+  /// sub-add's select flag can leave the previous sid in place. Only a track
+  /// titled "Live captions" counts. Otherwise the words are drawn with osd-overlay.
+  private func attachFlatTrack(_ core: PlayerCore) {
+    if previousSID == nil {
+      previousSID = core.mpv.getInt("sid")
+    }
+    var added = findLiveCaptionSID(core)
+    if added == nil && !triedFlatTrack {
+      triedFlatTrack = true
+      var code: Int32 = -1
+      core.mpv.command(.subAdd, args: [subtitleURL.mpvStr, "select", "Live captions", "und"], checkError: false) { code = $0 }
+      added = findLiveCaptionSID(core)
+      if code < 0 {
+        liveCaptionError("sub-add failed \(code)")
+      }
+    }
+    guard let added, added > 0 else {
+      usingOSD = true
+      mpvTrackID = nil
+      liveCaptionError("no Live captions subtitle track; drawing with osd-overlay")
+      return
+    }
+    let selected = core.mpv.getInt("sid")
+    if selected != added {
+      core.mpv.setInt("sid", added)
+    }
+    if savedCaptionSubVisibility == nil {
+      savedCaptionSubVisibility = core.mpv.getFlag(MPVOption.Subtitles.subVisibility)
+    }
+    core.mpv.setFlag(MPVOption.Subtitles.subVisibility, true)
+    mpvTrackID = added
+    usingOSD = false
+    liveCaptionInfo("selected live caption track \(added) (previous sid \(previousSID ?? 0), visibility on)")
+  }
+
+  private func findLiveCaptionSID(_ core: PlayerCore) -> Int? {
+    let count = core.mpv.getInt(MPVProperty.trackListCount)
+    guard count > 0 else { return nil }
+    var found: Int?
+    for index in 0..<count {
+      guard core.mpv.getString(MPVProperty.trackListNType(index)) == "sub" else { continue }
+      guard core.mpv.getString(MPVProperty.trackListNTitle(index)) == "Live captions" else { continue }
+      let id = core.mpv.getInt(MPVProperty.trackListNId(index))
+      if id > 0 { found = id }
+    }
+    return found
   }
 
   private func suppressMPVCaption() {
@@ -538,7 +767,10 @@ final class LiveCaptionController {
       core.mpv.command(.subRemove, args: [String(track)], checkError: false)
       mpvTrackID = nil
     }
-    core.mpv.command(.osdOverlay, args: ["7", "none", "", "0", "0", "0"], checkError: false)
+    let code = overlayCommand(id: 7, format: "none", data: "")
+    if code < 0 {
+      liveCaptionError("caption osd-overlay failed \(code)")
+    }
     usingOSD = false
   }
 
@@ -562,13 +794,18 @@ final class LiveCaptionController {
       mpvTrackID = nil
       previousSID = nil
       savedSubVisibility = nil
+      savedCaptionSubVisibility = nil
+      triedFlatTrack = false
       usingOSD = false
+      lastOSD = ""
       try? FileManager.default.removeItem(at: subtitleURL)
       return
     }
     suppressMPVCaption()
+    clearStatusOSD()
     guard let core else {
       previousSID = nil
+      savedCaptionSubVisibility = nil
       return
     }
     if let previous = previousSID, previous > 0 {
@@ -576,6 +813,10 @@ final class LiveCaptionController {
     }
     previousSID = nil
     restoreShiftedSubtitles()
+    if let saved = savedCaptionSubVisibility {
+      core.mpv.setFlag(MPVOption.Subtitles.subVisibility, saved)
+      savedCaptionSubVisibility = nil
+    }
     try? FileManager.default.removeItem(at: subtitleURL)
   }
 
@@ -599,7 +840,11 @@ final class LiveCaptionController {
     Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     \(events)
     """
-    try? body.data(using: .utf8)?.write(to: subtitleURL, options: .atomic)
+    do {
+      try body.data(using: .utf8)?.write(to: subtitleURL, options: .atomic)
+    } catch {
+      liveCaptionError("could not write caption file: \(error.localizedDescription)")
+    }
   }
 
   private func assTime(_ seconds: Double) -> String {
@@ -677,10 +922,12 @@ final class LiveCaptionController {
   }
 
   /// An IPTV live channel, and any other unseekable stream, cannot be decoded
-  /// from the future, so the picture waits. A file, a movie, or catch-up is
-  /// read ahead instead. The delay setting only turns this hold off.
+  /// from the future, so the picture waits. A file or a movie is read ahead
+  /// instead and is never held back, even if a live-channel session is still
+  /// set. The delay setting only turns this hold off.
   private func playbackShouldWait() -> Bool {
     guard Preference.bool(for: .liveCaptionEnabled), Preference.bool(for: .liveCaptionSync) else { return false }
+    if activeURL?.isFileURL == true || source.isLocalFile { return false }
     let decision = { () -> Bool? in
       guard let session = IPTVLiveOverlayController.shared.session else { return nil }
       if session.catchup != nil { return false }
@@ -709,11 +956,16 @@ final class LiveCaptionController {
     guard running, mpvIsUsable(), let core else { return }
     guard playbackShouldWait() else {
       if savedCache != nil || holdingPlayback {
-        restorePlaybackDelay(jumpToLive: true)
+        let jump = source.isLiveEdge && activeURL?.isFileURL != true
+        restorePlaybackDelay(jumpToLive: jump)
       }
       return
     }
     let delay = desiredLiveDelay()
+    if savedCache == nil || abs(delay - appliedLiveDelay) > 0.05 {
+      let configured = min(12, max(2, Preference.double(for: .liveCaptionLiveDelay)))
+      liveCaptionInfo(String(format: "applying live delay %.1f s (slider %.1f s)", delay, configured))
+    }
     appliedLiveDelay = delay
     let hold = delay + 1.5
     if savedCache == nil {
@@ -1071,6 +1323,7 @@ final class WhisperBridge {
   private typealias TranscribeFn = @convention(c) (UnsafePointer<Float>, Int32, UnsafePointer<CChar>?, Int32, Int32, Int32, UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>) -> Int32
   private typealias FreeFn = @convention(c) (UnsafeMutablePointer<CChar>?) -> Void
   private typealias AbortFn = @convention(c) (Int32) -> Void
+  private typealias SegmentsFn = @convention(c) () -> Int32
   private typealias CStringFn = @convention(c) () -> UnsafePointer<CChar>?
 
   private let lock = NSLock()
@@ -1079,32 +1332,61 @@ final class WhisperBridge {
   private var transcribeFn: TranscribeFn?
   private var freeFn: FreeFn?
   private var abortFn: AbortFn?
+  private var segmentsFn: SegmentsFn?
   private var errorFn: CStringFn?
   private var backendFn: CStringFn?
   private var infoFn: CStringFn?
   private var loadedPath = ""
   private var reported = false
 
-  func setAbort(_ flag: Int32) {
+  func requestAbort(_ reason: String) {
+    liveCaptionInfo("whisper abort requested: \(reason)")
     openIfNeeded()
     lock.lock()
     let abort = abortFn
     lock.unlock()
-    abort?(flag)
+    abort?(1)
+  }
+
+  func clearAbort() {
+    openIfNeeded()
+    lock.lock()
+    let abort = abortFn
+    lock.unlock()
+    abort?(0)
+  }
+
+  func lastSegments() -> Int {
+    lock.lock()
+    let segments = segmentsFn
+    lock.unlock()
+    guard let segments else { return -1 }
+    return Int(segments())
   }
 
   func ensureLoaded(model: Preference.LiveCaptionModel) -> Bool {
     openIfNeeded()
     guard loadFn != nil else {
-      LiveCaptionController.shared.setStatus("libiina_whisper.dylib is not in the app. other/download_libs.sh builds it. Model weights are separate.")
+      LiveCaptionController.shared.setStatus(
+        "libiina_whisper.dylib is not in the app. other/download_libs.sh builds it. Model weights are separate.",
+        osd: "Live captions: error: whisper library missing"
+      )
       return false
     }
     let path = LiveCaptionStore.file(for: model).path
     if path == loadedPath { return true }
+    let name = URL(fileURLWithPath: path).lastPathComponent
+    let size = (try? FileManager.default.attributesOfItem(atPath: path)[.size] as? NSNumber)?.int64Value ?? 0
+    liveCaptionInfo("loading model \(name) \(size) bytes")
+    LiveCaptionController.shared.setStatus("Loading the Whisper model.", osd: "Live captions: loading model")
     let rc = path.withCString { loadFn!($0, 1) }
     if rc != 0 {
       let message = lastError()
-      LiveCaptionController.shared.setStatus("Could not load the Whisper model (\(message)).")
+      liveCaptionError("model load failed \(rc): \(message)")
+      LiveCaptionController.shared.setStatus(
+        "Could not load the Whisper model (\(message)).",
+        osd: "Live captions: error: \(message)"
+      )
       loadedPath = ""
       return false
     }
@@ -1113,8 +1395,11 @@ final class WhisperBridge {
       reported = true
       let backend = cString(backendFn)
       let info = cString(infoFn)
-      Logger.log("Live captions backend \(backend). \(info)", level: .warning)
-      LiveCaptionController.shared.setStatus("Whisper is loaded (\(backend)). Speech stays on this Mac. A caption still lags by a few seconds, and Small costs more CPU and GPU than Base.")
+      liveCaptionInfo("backend \(backend). \(info)")
+      LiveCaptionController.shared.setStatus(
+        "Whisper is loaded (\(backend)). Speech stays on this Mac. A caption still lags by a few seconds, and Small costs more CPU and GPU than Base.",
+        osd: "Live captions: listening"
+      )
     }
     return true
   }
@@ -1132,12 +1417,21 @@ final class WhisperBridge {
         freeFn?(out)
       }
     }
+    let segments = lastSegments()
     guard rc == 0, let out else {
-      if rc == 4 { return nil }
+      if rc == 4 {
+        liveCaptionInfo("whisper aborted segments \(segments)")
+        return nil
+      }
       let message = lastError()
-      LiveCaptionController.shared.setStatus("Speech recognition failed (\(message)).")
+      liveCaptionError("whisper rc \(rc): \(message)")
+      LiveCaptionController.shared.setStatus(
+        "Speech recognition failed (\(message)).",
+        osd: "Live captions: error: \(message)"
+      )
       return nil
     }
+    liveCaptionInfo("whisper segments \(segments) language \(language)")
     return String(cString: out)
   }
 
@@ -1158,20 +1452,32 @@ final class WhisperBridge {
       lock.unlock()
       return
     }
-    guard let url = Bundle.main.privateFrameworksURL?.appendingPathComponent("libiina_whisper.dylib"),
-          FileManager.default.fileExists(atPath: url.path) else {
+    let bundled = Bundle.main.privateFrameworksURL?.appendingPathComponent("libiina_whisper.dylib")
+    let besideExecutable = Bundle.main.executableURL?
+      .deletingLastPathComponent()
+      .appendingPathComponent("../Frameworks/libiina_whisper.dylib")
+      .standardized
+    let candidates = [bundled, besideExecutable].compactMap { $0 }
+    let url = candidates.first { FileManager.default.fileExists(atPath: $0.path) }
+    guard let url else {
       lock.unlock()
+      let tried = candidates.map(\.path).joined(separator: ", ")
+      liveCaptionError("libiina_whisper.dylib is not in the app. Looked in \(tried)")
+      LiveCaptionController.shared.setStatus(
+        "libiina_whisper.dylib is not in the app.",
+        osd: "Live captions: error: whisper library missing"
+      )
       return
     }
+    dlerror()
     guard let opened = dlopen(url.path, RTLD_NOW | RTLD_LOCAL) else {
+      let reason = dlerror().map { String(cString: $0) } ?? "dlopen failed"
       lock.unlock()
-      let reason: String
-      if let err = dlerror() {
-        reason = String(cString: err)
-      } else {
-        reason = "dlopen failed"
-      }
-      LiveCaptionController.shared.setStatus("Could not open the Whisper library. \(reason)")
+      liveCaptionError("dlopen \(url.path) failed: \(reason)")
+      LiveCaptionController.shared.setStatus(
+        "Could not open the Whisper library. \(reason)",
+        osd: "Live captions: error: \(reason)"
+      )
       return
     }
     handle = opened
@@ -1179,10 +1485,20 @@ final class WhisperBridge {
     transcribeFn = function("iina_whisper_transcribe")
     freeFn = function("iina_whisper_free_text")
     abortFn = function("iina_whisper_set_abort")
+    segmentsFn = function("iina_whisper_last_segments")
     errorFn = function("iina_whisper_last_error")
     backendFn = function("iina_whisper_backend")
     infoFn = function("iina_whisper_system_info")
+    let missing = [
+      loadFn == nil ? "load" : nil,
+      transcribeFn == nil ? "transcribe" : nil
+    ].compactMap { $0 }
     lock.unlock()
+    if missing.isEmpty {
+      liveCaptionInfo("opened \(url.lastPathComponent) from \(url.deletingLastPathComponent().path)")
+    } else {
+      liveCaptionError("opened \(url.path) but missing symbols: \(missing.joined(separator: ", "))")
+    }
   }
 
   private func function<T>(_ name: String) -> T? {
@@ -1229,6 +1545,11 @@ final class CaptionPCM {
     }
     if time >= end - 0.02 {
       samples.append(contentsOf: chunk)
+    } else if time + Double(chunk.count) / rate > end + 0.02 {
+      let skip = max(0, Int((end - time) * rate))
+      if skip < chunk.count {
+        samples.append(contentsOf: chunk[skip...])
+      }
     }
     let maxCount = Int(rate * 45)
     if samples.count > maxCount {
@@ -1269,19 +1590,27 @@ final class CaptionPCM {
 }
 
 final class CaptionSource {
+  struct Failure {
+    var message: String
+    var osd: String
+  }
+
   let pcm = CaptionPCM()
   private let queue = DispatchQueue(label: "com.colliderli.iina.live-caption-audio", qos: .userInitiated)
-  private var reader: AVAssetReader?
-  private var output: AVAssetReaderTrackOutput?
-  private var asset: AVURLAsset?
-  private var track: AVAssetTrack?
-  private var tap: MutedAudioTap?
+  private var decoder: OpaquePointer?
   private var mode: Mode = .closed
   private var closed = true
-  private var retargeting = false
   private var openEnded = false
   private var liveEdge = false
+  private var localFile = false
+  private var cacheThin = false
   private var mediaDuration = Double.infinity
+  private var failureStatus: String?
+  private var failureOSD: String?
+  private var loggedFailure = false
+  private var requestedStart = 0.0
+  private var requestedEnd = 0.0
+  private var playhead = 0.0
   private let stateLock = NSLock()
 
   var isLiveEdge: Bool {
@@ -1296,35 +1625,82 @@ final class CaptionSource {
     return openEnded
   }
 
-  private func setCapture(live: Bool, openEnded: Bool, duration: Double) {
+  var isLocalFile: Bool {
+    stateLock.lock()
+    defer { stateLock.unlock() }
+    return localFile
+  }
+
+  private func setCapture(live: Bool, openEnded: Bool, localFile: Bool, duration: Double) {
     stateLock.lock()
     liveEdge = live
     self.openEnded = openEnded
+    self.localFile = localFile
     mediaDuration = duration
     stateLock.unlock()
   }
 
-  private enum Mode {
+  private enum Mode: String {
     case closed
-    case reader
-    case tap
+    case file
+    case cache
+    case failed
+  }
+
+  func diagnostic() -> String {
+    var text = ""
+    queue.sync {
+      let coveredStart = self.pcm.startTime
+      let coveredEnd = self.pcm.coveredUntil()
+      let aligned = self.pcm.aligned ? "yes" : "no"
+      text = "mode=\(self.mode.rawValue) requested=\(self.seconds(self.requestedStart))-\(self.seconds(self.requestedEnd)) covered=\(self.seconds(coveredStart))-\(self.seconds(coveredEnd)) playhead=\(self.seconds(self.playhead)) aligned=\(aligned)"
+      if self.cacheThin {
+        text += " cache=thin"
+      }
+      if let failure = self.failureOSD {
+        text += " failure=\(failure)"
+      }
+    }
+    return text
+  }
+
+  func failure() -> Failure? {
+    var result: Failure?
+    queue.sync {
+      if let message = self.failureStatus, let osd = self.failureOSD {
+        result = Failure(message: message, osd: osd)
+      }
+    }
+    return result
+  }
+
+  func bufferedSeconds() -> Double {
+    var span = 0.0
+    queue.sync {
+      span = max(0, self.pcm.coveredUntil() - self.pcm.startTime)
+    }
+    return span
+  }
+
+  func isCacheThin() -> Bool {
+    var thin = false
+    queue.sync { thin = self.cacheThin }
+    return thin
   }
 
   func open(url: URL, userAgent: String?, at time: Double) {
     queue.async {
       self.closeOnQueue()
       self.closed = false
-      var options: [String: Any] = [AVURLAssetPreferPreciseDurationAndTimingKey: false]
-      if let userAgent, !userAgent.isEmpty, !url.isFileURL {
-        options["AVURLAssetHTTPHeaderFieldsKey"] = ["User-Agent": userAgent]
-      }
-      let asset = AVURLAsset(url: url, options: options)
-      self.asset = asset
-      asset.loadValuesAsynchronously(forKeys: ["tracks", "playable", "duration"]) {
-        self.queue.async {
-          guard !self.closed else { return }
-          self.finishOpen(asset: asset, url: url, userAgent: userAgent, at: time)
+      self.playhead = time.isFinite ? time : 0
+      if url.isFileURL {
+        self.openLocal(url)
+      } else {
+        if let userAgent, !userAgent.isEmpty {
+          liveCaptionInfo("network captions use the open player connection")
         }
+        liveCaptionInfo("network audio comes from the player cache")
+        self.beginCache(localFile: false)
       }
     }
   }
@@ -1335,415 +1711,322 @@ final class CaptionSource {
     }
   }
 
-  func follow(coveringEnd end: Double, window: Double) {
+  /// Decode enough audio that the playhead window can be cut. `ahead` only
+  /// extends the read. It does not move the window off the playhead.
+  func follow(playhead: Double, window: Double, ahead: Double) {
     queue.async {
-      guard !self.closed else { return }
-      if self.mode == .reader {
-        let limited = self.limit(end)
-        let start = max(0, limited - window)
-        let covered = self.pcm.coveredUntil()
-        if start + 0.25 < self.pcm.startTime || limited > covered + 0.25 {
-          self.restartReader(at: start)
-        }
-        self.pump(target: limited)
+      guard !self.closed, self.mode != .failed else { return }
+      let position = playhead.isFinite ? max(0, playhead) : 0
+      self.playhead = position
+      if self.mode == .file {
+        self.followFile(playhead: position, window: window, ahead: ahead)
+      } else if self.mode == .cache {
+        self.followCache(playhead: position, window: window, ahead: ahead)
       }
     }
   }
 
-  func samples(coveringEnd end: Double, window: Double) -> CaptionChunk? {
+  /// A chunk runs when the playhead sits inside the buffer, even if the
+  /// lookahead past that playhead is not filled yet.
+  func samples(playhead: Double, window: Double) -> CaptionChunk? {
     var result: CaptionChunk?
     queue.sync {
-      if self.mode == .tap || !self.pcm.aligned {
-        result = self.pcm.latest(seconds: window)
-      } else {
-        let limited = self.limit(end)
-        result = self.pcm.slice(from: max(0, limited - window), to: limited)
+      let position = playhead.isFinite ? max(0, playhead) : self.playhead
+      self.playhead = position
+      let origin = self.pcm.startTime
+      let have = self.pcm.coveredUntil()
+      let requestedStart = position
+      let requestedEnd = position + window
+      self.requestedStart = requestedStart
+      self.requestedEnd = requestedEnd
+      let overlapStart = max(requestedStart, origin)
+      let overlapEnd = min(requestedEnd, have)
+      let overlap = overlapEnd - overlapStart
+      let inside = position >= origin - 0.3 && position <= have + 0.15
+      liveCaptionInfo("window requested \(self.seconds(requestedStart))-\(self.seconds(requestedEnd)) covered \(self.seconds(origin))-\(self.seconds(have)) playhead \(self.seconds(position)) overlap \(self.seconds(max(0, overlap)))")
+      guard self.mode != .failed, self.mode != .closed, self.pcm.aligned, inside, overlap >= 0.5 else { return }
+      result = self.pcm.slice(from: overlapStart, to: overlapEnd)
+      if result == nil {
+        liveCaptionInfo("window covered but slice rejected")
       }
     }
     return result
   }
 
-  private func limit(_ end: Double) -> Double {
-    guard mediaDuration.isFinite else { return end }
-    return min(end, mediaDuration)
+  private func seconds(_ value: Double) -> String {
+    guard value.isFinite else { return "nan" }
+    return String(format: "%.2f", value)
   }
 
-  private func finishOpen(asset: AVURLAsset, url: URL, userAgent: String?, at time: Double) {
-    var error: NSError?
-    let status = asset.statusOfValue(forKey: "tracks", error: &error)
-    guard status == .loaded else {
-      LiveCaptionController.shared.setStatus("Could not read an audio track from this item.")
+  private func openLocal(_ url: URL) {
+    var error = [CChar](repeating: 0, count: 512)
+    let opened = url.path.withCString { iina_caption_open($0, &error, Int32(error.count)) }
+    guard let opened else {
+      let message = String(cString: error)
+      if message.contains("no audio") {
+        liveCaptionError("file audio open failed: \(message)")
+        self.fail(message: "This item has no audio track, so there is nothing to caption.", osd: "no audio track", terminal: true)
+        return
+      }
+      liveCaptionError("file audio open failed: \(message); reading the player cache")
+      self.beginCache(localFile: true)
       return
     }
-    let tracks = asset.tracks(withMediaType: .audio)
-    guard let track = tracks.first else {
-      LiveCaptionController.shared.setStatus("This item has no audio track, so there is nothing to caption.")
-      return
-    }
-    self.track = track
-    let duration = asset.duration.seconds
+    decoder = opened
+    mode = .file
+    let duration = iina_caption_duration(opened)
     let finite = duration.isFinite && duration > 1
-    let seekable = url.isFileURL || finite
-    if seekable && startReader(asset: asset, track: track, at: max(0, time - 0.4)) {
-      mode = .reader
-      setCapture(live: false, openEnded: false, duration: finite ? duration : .infinity)
-      Logger.log("Live captions are decoding the same media again, ahead of the playhead for a file or movie.", level: .warning)
-      return
-    }
-    mode = .tap
-    setCapture(live: true, openEnded: !seekable, duration: finite ? duration : .infinity)
-    pcm.reset(at: 0, aligned: false)
-    DispatchQueue.main.async {
-      guard !self.closed else { return }
-      let player = MutedAudioTap(pcm: self.pcm)
-      self.tap = player
-      player.start(url: url, userAgent: userAgent)
-    }
-    Logger.log("Live captions opened a second read because this item could not be seeked.", level: .warning)
-    LiveCaptionController.shared.setStatus("Live source: a second read of the stream feeds the captions. A live channel holds the picture so the words can match.")
+    setCapture(live: false, openEnded: false, localFile: true, duration: finite ? duration : .infinity)
+    clearFailure()
+    pcm.reset(at: 0, aligned: true)
+    liveCaptionInfo("decoding file audio with libav")
   }
 
-  private func startReader(asset: AVAsset, track: AVAssetTrack, at start: Double) -> Bool {
-    reader?.cancelReading()
-    reader = nil
-    output = nil
-    guard let reader = try? AVAssetReader(asset: asset) else { return false }
-    let settings: [String: Any] = [
-      AVFormatIDKey: kAudioFormatLinearPCM,
-      AVLinearPCMBitDepthKey: 32,
-      AVLinearPCMIsFloatKey: true,
-      AVLinearPCMIsBigEndianKey: false,
-      AVLinearPCMIsNonInterleaved: false,
-      AVSampleRateKey: 16000,
-      AVNumberOfChannelsKey: 1
-    ]
-    let output = AVAssetReaderTrackOutput(track: track, outputSettings: settings)
-    output.alwaysCopiesSampleData = true
-    guard reader.canAdd(output) else { return false }
-    reader.add(output)
-    let startTime = CMTime(seconds: max(0, start), preferredTimescale: 16000)
-    reader.timeRange = CMTimeRange(start: startTime, duration: CMTime.positiveInfinity)
-    guard reader.startReading() else { return false }
-    self.reader = reader
-    self.output = output
-    pcm.reset(at: max(0, start), aligned: true)
-    return true
-  }
-
-  private func restartReader(at time: Double) {
-    guard !retargeting, let asset, let track else { return }
-    retargeting = true
-    if startReader(asset: asset, track: track, at: time) {
-      mode = .reader
-    }
-    retargeting = false
-  }
-
-  private func pump(target: Double) {
-    guard mode == .reader, let output, let reader, reader.status == .reading else { return }
-    var pulls = 0
-    var exhausted = false
-    while pulls < 24 && !exhausted && pcm.coveredUntil() < target + 0.15 {
-      autoreleasepool {
-        guard let sample = output.copyNextSampleBuffer() else {
-          exhausted = true
-          return
-        }
-        pulls += 1
-        self.append(sample)
+  private func beginCache(localFile: Bool) {
+    // Assume a network item is live until the duration read lands. Reading
+    // mpv here with main.sync deadlocks: open() is queued from the main
+    // thread, and that thread is still inside start().
+    mode = .cache
+    setCapture(live: !localFile, openEnded: !localFile, localFile: localFile, duration: .infinity)
+    pcm.reset(at: 0, aligned: true)
+    clearFailure()
+    liveCaptionInfo(localFile ? "cache audio for a local file" : "cache audio for a network stream")
+    DispatchQueue.main.async { [weak self] in
+      guard let self else { return }
+      guard !Immersive3DController.shared.isShuttingDown else { return }
+      guard !PlayerCore.playerCores.isEmpty, PlayerCore.active.mpv != nil, PlayerCore.active.info.state.active else { return }
+      let duration = PlayerCore.active.mpv.getDouble(MPVProperty.duration)
+      let finite = duration.isFinite && duration > 1 && duration < 86400
+      self.queue.async {
+        guard !self.closed, self.mode == .cache else { return }
+        self.setCapture(live: !finite && !localFile, openEnded: !finite && !localFile, localFile: localFile, duration: finite ? duration : .infinity)
+        liveCaptionInfo(finite || localFile ? "cache audio for a finite item" : "cache audio for a live stream")
       }
     }
   }
 
-  private func append(_ sample: CMSampleBuffer) {
-    let count = CMSampleBufferGetNumSamples(sample)
-    guard count > 0, let block = CMSampleBufferGetDataBuffer(sample) else { return }
-    var length = 0
-    var pointer: UnsafeMutablePointer<Int8>?
-    let status = CMBlockBufferGetDataPointer(block, atOffset: 0, lengthAtOffsetOut: nil, totalLengthOut: &length, dataPointerOut: &pointer)
-    guard status == noErr, let pointer else { return }
-    let bytes = count * MemoryLayout<Float>.size
-    guard length >= bytes else { return }
-    var floats = [Float](repeating: 0, count: count)
-    floats.withUnsafeMutableBytes { dest in
-      memcpy(dest.baseAddress, pointer, bytes)
+  private func followFile(playhead: Double, window: Double, ahead: Double) {
+    guard decoder != nil else { return }
+    let origin = pcm.startTime
+    let have = pcm.coveredUntil()
+    let need = playhead + window
+    let coversPlayhead = origin <= playhead + 0.3 && have >= playhead + 0.5
+    let coversWindow = coversPlayhead && have + 0.2 >= need
+    if coversWindow { return }
+    let start = coversPlayhead ? max(0, have - 0.25) : max(0, playhead - 0.2)
+    let seconds = max(window, (playhead + window + ahead) - start)
+    if !coversPlayhead && origin > playhead + 0.3 {
+      liveCaptionInfo("retarget file audio to playhead \(self.seconds(playhead)) (buffer started at \(self.seconds(origin)))")
     }
-    var pts = CMSampleBufferGetPresentationTimeStamp(sample).seconds
-    if !pts.isFinite {
-      pts = pcm.coveredUntil()
+    readDecoder(start: start, seconds: min(30, seconds + 0.4), dumpStart: nil)
+  }
+
+  private func followCache(playhead: Double, window: Double, ahead: Double) {
+    let origin = pcm.startTime
+    let have = pcm.coveredUntil()
+    if origin <= playhead + 0.3 && have + 0.2 >= playhead + window {
+      cacheThin = false
+      return
     }
-    pcm.append(floats, at: pts)
+    let request = CacheDump()
+    let want = window + max(0, ahead) + 0.4
+    DispatchQueue.main.sync {
+      guard !self.closed else { return }
+      guard !Immersive3DController.shared.isShuttingDown else { return }
+      guard !PlayerCore.playerCores.isEmpty else { return }
+      let core = PlayerCore.active
+      guard core.mpv != nil, core.info.state.active else { return }
+      let position = core.mpv.getDouble(MPVProperty.timePos)
+      let cacheDuration = core.mpv.getDouble(MPVProperty.demuxerCacheDuration)
+      let cacheTime = core.mpv.getDouble(MPVProperty.demuxerCacheTime)
+      let play = position.isFinite ? position : playhead
+      let cacheEnd = cacheTime.isFinite ? cacheTime : play + (cacheDuration.isFinite ? cacheDuration : 0)
+      let span = cacheDuration.isFinite ? max(0, cacheDuration) : max(0, cacheEnd - play)
+      let cacheStart = max(0, cacheEnd - span)
+      request.span = span
+      if span < 0.4 || cacheEnd - cacheStart < 0.4 {
+        request.usable = true
+        return
+      }
+      var dumpEnd = min(cacheEnd, play + want)
+      var dumpStart = max(cacheStart, play - 0.2)
+      if dumpEnd - dumpStart < 0.4 {
+        dumpStart = cacheStart
+        dumpEnd = min(cacheEnd, dumpStart + want)
+      }
+      if dumpEnd - dumpStart < 0.4 {
+        request.usable = true
+        return
+      }
+      let path = (NSTemporaryDirectory() as NSString).appendingPathComponent("iina-live-caption-\(UUID().uuidString).mkv")
+      try? FileManager.default.removeItem(atPath: path)
+      request.path = path
+      request.start = dumpStart
+      request.end = dumpEnd
+      var code: Int32 = 0
+      core.mpv.command(.dumpCache, args: [
+        String(format: "%.3f", dumpStart),
+        String(format: "%.3f", dumpEnd),
+        path
+      ], checkError: false) { code = $0 }
+      request.code = code
+      request.ran = true
+      request.usable = true
+    }
+    guard request.usable else { return }
+    if !request.ran {
+      cacheThin = true
+      liveCaptionInfo("player cache thin span \(self.seconds(request.span))")
+      return
+    }
+    cacheThin = false
+    defer { try? FileManager.default.removeItem(atPath: request.path) }
+    if request.code < 0 {
+      liveCaptionError("player cache export failed \(request.code)")
+      fail(message: "Live captions could not read the player cache (\(request.code)).", osd: "player cache failed", terminal: false)
+      return
+    }
+    let size = (try? FileManager.default.attributesOfItem(atPath: request.path)[.size] as? NSNumber)?.intValue ?? 0
+    if size < 1000 {
+      cacheThin = true
+      liveCaptionInfo("player cache export was empty")
+      return
+    }
+    readDump(path: request.path, dumpStart: request.start, dumpEnd: request.end)
+  }
+
+  private func readDump(path: String, dumpStart: Double, dumpEnd: Double) {
+    var error = [CChar](repeating: 0, count: 512)
+    let opened = path.withCString { iina_caption_open($0, &error, Int32(error.count)) }
+    guard let opened else {
+      let message = String(cString: error)
+      liveCaptionError("cache audio open failed: \(message)")
+      if message.contains("no audio") {
+        fail(message: "This item has no audio track, so there is nothing to caption.", osd: "no audio track", terminal: true)
+      } else {
+        fail(message: "Captions could not decode audio from the player (\(message)).", osd: "audio decode failed", terminal: false)
+      }
+      return
+    }
+    decoder = opened
+    let seconds = max(0.5, dumpEnd - dumpStart)
+    readDecoder(start: 0, seconds: min(30, seconds + 0.3), dumpStart: dumpStart)
+    iina_caption_close(opened)
+    if decoder == opened {
+      decoder = nil
+    }
+  }
+
+  private func readDecoder(start: Double, seconds: Double, dumpStart: Double?) {
+    guard let decoder else { return }
+    var error = [CChar](repeating: 0, count: 512)
+    var decoded = IINACaptionPCM()
+    let rc = iina_caption_read(decoder, start, seconds, &decoded, &error, Int32(error.count))
+    defer { iina_caption_pcm_free(&decoded) }
+    guard rc == 0, let pointer = decoded.samples, decoded.count > 0 else {
+      let message = String(cString: error)
+      liveCaptionError("audio read failed \(rc): \(message)")
+      if message.contains("no audio") || rc == 2 {
+        fail(message: "This item has no audio track, so there is nothing to caption.", osd: "no audio track", terminal: true)
+      }
+      return
+    }
+    let samples = Array(UnsafeBufferPointer(start: pointer, count: Int(decoded.count)))
+    let decodedStart = decoded.start
+    let origin: Double
+    if let dumpStart {
+      if abs(decodedStart - dumpStart) < 3 {
+        origin = decodedStart
+      } else {
+        origin = dumpStart + max(0, decodedStart)
+      }
+    } else {
+      origin = decodedStart
+    }
+    let level = captionLevel(samples)
+    liveCaptionInfo("decoded samples \(samples.count) origin \(self.seconds(origin)) rms \(String(format: "%.4f", level)) rate \(decoded.source_rate) ch \(decoded.channels)")
+    clearFailure()
+    pcm.append(samples, at: origin)
+  }
+
+  private func captionLevel(_ samples: [Float]) -> Float {
+    guard !samples.isEmpty else { return 0 }
+    var acc: Float = 0
+    for value in samples {
+      acc += value * value
+    }
+    return sqrt(acc / Float(samples.count))
+  }
+
+  private func fail(message: String, osd: String, terminal: Bool) {
+    failureStatus = message
+    failureOSD = osd
+    if terminal {
+      mode = .failed
+    }
+    if !loggedFailure {
+      loggedFailure = true
+      liveCaptionError(message)
+    }
+  }
+
+  private func clearFailure() {
+    failureStatus = nil
+    failureOSD = nil
+    loggedFailure = false
+    cacheThin = false
   }
 
   private func closeOnQueue() {
     closed = true
     mode = .closed
-    setCapture(live: false, openEnded: false, duration: .infinity)
-    reader?.cancelReading()
-    reader = nil
-    output = nil
-    asset = nil
-    track = nil
-    let player = tap
-    tap = nil
+    setCapture(live: false, openEnded: false, localFile: false, duration: .infinity)
+    if let decoder {
+      iina_caption_close(decoder)
+    }
+    decoder = nil
+    cacheThin = false
+    failureStatus = nil
+    failureOSD = nil
+    loggedFailure = false
     pcm.reset(at: 0, aligned: true)
-    if let player {
-      DispatchQueue.main.async {
-        player.stop()
-      }
-    }
   }
 }
 
-final class MutedAudioTap: NSObject {
-  let pcm: CaptionPCM
-  private let player = AVPlayer()
-  private var item: AVPlayerItem?
-  private var started = false
-  private var stopped = false
-  private var format = AudioStreamBasicDescription()
-  private var mpvAtStart = 0.0
-  private var audioAnchor = 0.0
-  private var anchorReady = false
-  private var runningPTS = 0.0
-
-  init(pcm: CaptionPCM) {
-    self.pcm = pcm
-    super.init()
-  }
-
-  func start(url: URL, userAgent: String?) {
-    guard Thread.isMainThread else {
-      DispatchQueue.main.async { self.start(url: url, userAgent: userAgent) }
-      return
-    }
-    var options: [String: Any] = [:]
-    if let userAgent, !userAgent.isEmpty, !url.isFileURL {
-      options["AVURLAssetHTTPHeaderFieldsKey"] = ["User-Agent": userAgent]
-    }
-    let asset = AVURLAsset(url: url, options: options)
-    let item = AVPlayerItem(asset: asset)
-    self.item = item
-    item.addObserver(self, forKeyPath: "status", options: [.initial, .new], context: nil)
-    player.volume = 0
-    player.isMuted = true
-    if !PlayerCore.playerCores.isEmpty, PlayerCore.active.mpv != nil {
-      let time = PlayerCore.active.mpv.getDouble(MPVProperty.timePos)
-      if time.isFinite { mpvAtStart = time }
-    }
-    player.replaceCurrentItem(with: item)
-    player.play()
-  }
-
-  func stop() {
-    guard Thread.isMainThread else {
-      DispatchQueue.main.async { self.stop() }
-      return
-    }
-    stopped = true
-    if let item {
-      item.removeObserver(self, forKeyPath: "status", context: nil)
-    }
-    player.pause()
-    player.replaceCurrentItem(with: nil)
-    self.item = nil
-  }
-
-  override func observeValue(forKeyPath keyPath: String?, of object: Any?, change: [NSKeyValueChangeKey: Any]?, context: UnsafeMutableRawPointer?) {
-    guard keyPath == "status", !stopped, !started, let item, item.status == .readyToPlay else { return }
-    if Thread.isMainThread {
-      installTap(on: item)
-    } else {
-      DispatchQueue.main.async { [weak self] in
-        guard let self, !self.stopped, !self.started else { return }
-        self.installTap(on: item)
-      }
-    }
-  }
-
-  private func installTap(on item: AVPlayerItem) {
-    guard let track = item.asset.tracks(withMediaType: .audio).first else { return }
-    var callbacks = MTAudioProcessingTapCallbacks(
-      version: Int32(kMTAudioProcessingTapCallbacksVersion_0),
-      clientInfo: Unmanaged.passUnretained(self).toOpaque(),
-      init: captionTapInit,
-      finalize: nil,
-      prepare: captionTapPrepare,
-      unprepare: nil,
-      process: captionTapProcess
-    )
-    var tap: MTAudioProcessingTap?
-    let status = withUnsafePointer(to: &callbacks) { pointer in
-      MTAudioProcessingTapCreate(kCFAllocatorDefault, pointer, kMTAudioProcessingTapCreationFlag_PreEffects, &tap)
-    }
-    guard status == noErr, let tap else { return }
-    let params = AVMutableAudioMixInputParameters(track: track)
-    params.audioTapProcessor = tap
-    let mix = AVMutableAudioMix()
-    mix.inputParameters = [params]
-    item.audioMix = mix
-    for entry in item.tracks where entry.assetTrack?.mediaType == .video {
-      entry.isEnabled = false
-    }
-    started = true
-  }
-
-  fileprivate func prepare(_ format: AudioStreamBasicDescription) {
-    self.format = format
-  }
-
-  fileprivate func process(frames: CMItemCount, list: UnsafeMutablePointer<AudioBufferList>, time: CMTime) {
-    if stopped || frames <= 0 { return }
-    let mono = monoSamples(frames: Int(frames), list: list)
-    guard !mono.isEmpty else { return }
-    let rate = format.mSampleRate > 0 ? format.mSampleRate : 48000
-    let resampled = resample(mono, from: rate, to: 16000)
-    var pts = time.seconds
-    if !pts.isFinite {
-      pts = runningPTS
-      runningPTS += Double(mono.count) / rate
-    } else {
-      runningPTS = pts
-    }
-    let mapped = mappedPlayhead(pts)
-    pcm.append(resampled, at: mapped)
-  }
-
-  /// The tap's clock and mpv's clock both start at whatever packet each reader
-  /// joined on. Keep one mapping so a cue's PTS is a playhead time, including
-  /// while sync mode is holding mpv paused and this tap keeps reading.
-  private func mappedPlayhead(_ pts: Double) -> Double {
-    let sample = pts.isFinite ? pts : audioAnchor
-    if !anchorReady {
-      anchorReady = true
-      audioAnchor = sample
-      pcm.reset(at: mpvAtStart, aligned: false)
-      return mpvAtStart
-    }
-    return mpvAtStart + (sample - audioAnchor)
-  }
-
-  private func monoSamples(frames: Int, list: UnsafeMutablePointer<AudioBufferList>) -> [Float] {
-    let buffers = UnsafeMutableAudioBufferListPointer(list)
-    let channels = max(1, Int(format.mChannelsPerFrame))
-    let isFloat = (format.mFormatFlags & kAudioFormatFlagIsFloat) != 0
-    let nonInterleaved = (format.mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0
-    if nonInterleaved {
-      var mixed = [Float](repeating: 0, count: frames)
-      var used = 0
-      for buffer in buffers {
-        let channel = convert(buffer, frames: frames, channels: 1, isFloat: isFloat)
-        guard channel.count >= frames else { continue }
-        for index in 0..<frames {
-          mixed[index] += channel[index]
-        }
-        used += 1
-      }
-      guard used > 0 else { return [] }
-      if used > 1 {
-        for index in 0..<frames {
-          mixed[index] /= Float(used)
-        }
-      }
-      return mixed
-    }
-    guard let buffer = buffers.first else { return [] }
-    return convert(buffer, frames: frames, channels: channels, isFloat: isFloat)
-  }
-
-  private func convert(_ buffer: AudioBuffer, frames: Int, channels: Int, isFloat: Bool) -> [Float] {
-    guard let data = buffer.mData, frames > 0, channels > 0 else { return [] }
-    if isFloat && format.mBitsPerChannel == 32 {
-      let count = frames * channels
-      guard buffer.mDataByteSize >= UInt32(count * MemoryLayout<Float>.size) else { return [] }
-      var raw = [Float](repeating: 0, count: count)
-      raw.withUnsafeMutableBytes { dest in
-        memcpy(dest.baseAddress, data, count * MemoryLayout<Float>.size)
-      }
-      if channels == 1 { return raw }
-      var mono = [Float](repeating: 0, count: frames)
-      for index in 0..<frames {
-        var sum: Float = 0
-        for channel in 0..<channels {
-          sum += raw[index * channels + channel]
-        }
-        mono[index] = sum / Float(channels)
-      }
-      return mono
-    }
-    if !isFloat && format.mBitsPerChannel == 16 {
-      let count = frames * channels
-      guard buffer.mDataByteSize >= UInt32(count * MemoryLayout<Int16>.size) else { return [] }
-      var raw = [Int16](repeating: 0, count: count)
-      raw.withUnsafeMutableBytes { dest in
-        memcpy(dest.baseAddress, data, count * MemoryLayout<Int16>.size)
-      }
-      var mono = [Float](repeating: 0, count: frames)
-      let scale = Float(1.0 / 32768.0)
-      for index in 0..<frames {
-        var sum: Float = 0
-        for channel in 0..<channels {
-          sum += Float(raw[index * channels + channel]) * scale
-        }
-        mono[index] = sum / Float(channels)
-      }
-      return mono
-    }
-    return []
-  }
-
-  private func resample(_ input: [Float], from inputRate: Double, to outputRate: Double) -> [Float] {
-    guard inputRate > 0, !input.isEmpty else { return [] }
-    if abs(inputRate - outputRate) < 1 { return input }
-    let ratio = inputRate / outputRate
-    let count = Int(Double(input.count) / ratio)
-    guard count > 1 else { return input }
-    var output = [Float](repeating: 0, count: count)
-    let last = input.count - 1
-    for index in 0..<count {
-      let position = Double(index) * ratio
-      let left = min(last, Int(position))
-      let right = min(last, left + 1)
-      let fraction = Float(position - Double(left))
-      output[index] = input[left] * (1 - fraction) + input[right] * fraction
-    }
-    return output
-  }
+private final class CacheDump {
+  var start = 0.0
+  var end = 0.0
+  var span = 0.0
+  var code: Int32 = 0
+  var path = ""
+  var ran = false
+  var usable = false
 }
 
-private func captionTapInit(
-  tap: MTAudioProcessingTap,
-  clientInfo: UnsafeMutableRawPointer?,
-  tapStorageOut: UnsafeMutablePointer<UnsafeMutableRawPointer?>
-) {
-  tapStorageOut.pointee = clientInfo
+private extension NSValueTransformerName {
+  static let liveCaptionDelayText = NSValueTransformerName("LiveCaptionDelayText")
 }
 
-private func captionTapPrepare(
-  tap: MTAudioProcessingTap,
-  maxFrames: CMItemCount,
-  processingFormat: UnsafePointer<AudioStreamBasicDescription>
-) {
-  let me = Unmanaged<MutedAudioTap>.fromOpaque(MTAudioProcessingTapGetStorage(tap)).takeUnretainedValue()
-  me.prepare(processingFormat.pointee)
-}
+/// Slider seconds to a short label such as "5 s". The binding reads this on
+/// every continuous tick, so the number moves with the knob.
+@objc(LiveCaptionDelayText)
+final class LiveCaptionDelayText: ValueTransformer {
+  override class func transformedValueClass() -> AnyClass { NSString.self }
 
-private func captionTapProcess(
-  tap: MTAudioProcessingTap,
-  numberFrames: CMItemCount,
-  flags: MTAudioProcessingTapFlags,
-  bufferList: UnsafeMutablePointer<AudioBufferList>,
-  numberFramesOut: UnsafeMutablePointer<CMItemCount>,
-  flagsOut: UnsafeMutablePointer<MTAudioProcessingTapFlags>
-) {
-  var timeRange = CMTimeRange()
-  let status = MTAudioProcessingTapGetSourceAudio(tap, numberFrames, bufferList, flagsOut, &timeRange, numberFramesOut)
-  guard status == noErr else {
-    numberFramesOut.pointee = 0
-    return
+  override class func allowsReverseTransformation() -> Bool { false }
+
+  override func transformedValue(_ value: Any?) -> Any? {
+    let seconds = (value as? NSNumber)?.doubleValue ?? 0
+    return LiveCaptionDelayText.label(seconds)
   }
-  let me = Unmanaged<MutedAudioTap>.fromOpaque(MTAudioProcessingTapGetStorage(tap)).takeUnretainedValue()
-  me.process(frames: numberFramesOut.pointee, list: bufferList, time: timeRange.start)
+
+  static func label(_ seconds: Double) -> String {
+    let tenths = (min(12, max(2, seconds)) * 10).rounded() / 10
+    if abs(tenths - tenths.rounded()) < 0.05 {
+      return "\(Int(tenths.rounded())) s"
+    }
+    return String(format: "%.1f s", tenths)
+  }
 }
 
 final class LiveCaptionSettingsView: NSView {
@@ -1754,6 +2037,7 @@ final class LiveCaptionSettingsView: NSView {
   private let keyField = NSSecureTextField()
   private var keyDirty = false
   private var delaySlider: NSSlider!
+  private let delayValueLabel = NSTextField(labelWithString: "")
 
   override init(frame frameRect: NSRect) {
     super.init(frame: frameRect)
@@ -1802,7 +2086,18 @@ final class LiveCaptionSettingsView: NSView {
     delaySlider = NSSlider(value: Preference.double(for: .liveCaptionLiveDelay), minValue: 2, maxValue: 12, target: self, action: #selector(delayChanged(_:)))
     delaySlider.isContinuous = true
     delaySlider.translatesAutoresizingMaskIntoConstraints = false
+    delaySlider.setContentHuggingPriority(.defaultLow, for: .horizontal)
     delaySlider.widthAnchor.constraint(equalToConstant: 400).isActive = true
+
+    delayValueLabel.font = .monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .medium)
+    delayValueLabel.alignment = .left
+    delayValueLabel.setContentHuggingPriority(.required, for: .horizontal)
+    delayValueLabel.stringValue = LiveCaptionDelayText.label(delaySlider.doubleValue)
+    ValueTransformer.setValueTransformer(LiveCaptionDelayText(), forName: .liveCaptionDelayText)
+    delayValueLabel.bind(.value, to: delaySlider!, withKeyPath: "doubleValue", options: [
+      .continuouslyUpdatesValue: true,
+      .valueTransformerName: NSValueTransformerName.liveCaptionDelayText
+    ])
 
     let auto = NSButton(checkboxWithTitle: "Auto-tune the live buffer to the measured transcription time", target: self, action: #selector(autoChanged(_:)))
     auto.state = Preference.bool(for: .liveCaptionLiveDelayAuto) ? .on : .off
@@ -1813,14 +2108,14 @@ final class LiveCaptionSettingsView: NSView {
     syncLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
     refreshStatus()
 
-    let note = NSTextField(wrappingLabelWithString: "The player decodes the same URL a second time. libmpv does not provide its PCM, and a lavfi graph cannot export it without replacing playback. With captions on, a file, a movie, or catch-up is read ahead of the playhead, so the line is ready before it is spoken and playback is not delayed. A live channel, or another stream that cannot be seeked, is detected on its own and the picture and sound wait in mpv's cache (about 4–6 seconds unless transcription takes longer). Changing channel detects again. Turning captions off jumps that channel back to live. Delay live TV, above, turns the hold off and leaves the channel at the live edge. The banner shows Subtitles synced, live +Ns while the hold is on. Depth is computed from the frame already on screen, so it waits with that picture. Each line uses the audio time, not the time the text arrived. Base is lighter; Small uses more CPU and GPU on an M2. Whisper translates into English only. Other languages use the macOS 26 system translator when that language is installed, or the API key (caption text only). On earlier macOS, without a key, the line stays in the recognized language. Place ggml-base-encoder.mlmodelc or ggml-small-encoder.mlmodelc next to the ggml file to use the Core ML encoder; otherwise Metal or the CPU runs the model. This was not timed on a Mac.")
+    let note = NSTextField(wrappingLabelWithString: "A local file is decoded ahead of the playhead, and playback is not held back. A network or live stream uses audio the player has already buffered, so the provider is not opened a second time. A live channel holds the picture in mpv's cache (about 4–6 seconds unless transcription takes longer). A file never takes that hold. Changing channel detects again. Turning captions off jumps that channel back to live. Delay live TV, above, turns the hold off and leaves the channel at the live edge. The banner shows Subtitles synced, live +Ns while the hold is on. Depth is computed from the frame already on screen, so it waits with that picture. Each line uses the audio time, not the time the text arrived. Base is lighter; Small uses more CPU and GPU on an M2. Whisper translates into English only. Other languages use the macOS 26 system translator when that language is installed, or the API key (caption text only). On earlier macOS, without a key, the line stays in the recognized language. Place ggml-base-encoder.mlmodelc or ggml-small-encoder.mlmodelc next to the ggml file to use the Core ML encoder; otherwise Metal or the CPU runs the model. This was not timed on a Mac.")
     note.preferredMaxLayoutWidth = 400
     note.textColor = .secondaryLabelColor
     note.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
 
     stack.addArrangedSubview(labeled("Source language", sourcePopup))
     stack.addArrangedSubview(labeled("Target language", targetPopup))
-    stack.addArrangedSubview(labeled("Live buffer (seconds)", delaySlider))
+    stack.addArrangedSubview(liveDelayControl())
     stack.addArrangedSubview(auto)
     stack.addArrangedSubview(syncLabel)
     stack.addArrangedSubview(download)
@@ -1886,8 +2181,25 @@ final class LiveCaptionSettingsView: NSView {
     Preference.set(code, for: .liveCaptionTargetLanguage)
   }
 
+  private func liveDelayControl() -> NSView {
+    let caption = NSTextField(labelWithString: "Live buffer (seconds)")
+    caption.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+    caption.textColor = .secondaryLabelColor
+    let header = NSStackView(views: [caption, delayValueLabel])
+    header.orientation = .horizontal
+    header.alignment = .firstBaseline
+    header.spacing = 8
+    let column = NSStackView(views: [header, delaySlider])
+    column.orientation = .vertical
+    column.alignment = .leading
+    column.spacing = 2
+    return column
+  }
+
   @objc private func delayChanged(_ sender: NSSlider) {
-    Preference.set(sender.doubleValue, for: .liveCaptionLiveDelay)
+    let seconds = min(12, max(2, sender.doubleValue))
+    delayValueLabel.stringValue = LiveCaptionDelayText.label(seconds)
+    Preference.set(seconds, for: .liveCaptionLiveDelay)
   }
 
   @objc private func autoChanged(_ sender: NSButton) {
