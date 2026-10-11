@@ -1,0 +1,44 @@
+IINA Immersive 3D is a fork of IINA.
+
+Upstream project: IINA
+Upstream URL: https://github.com/iina/iina
+Imported tag: v1.5.0 (commit fbcff4df7183b335880396af0655f6bb89d46442)
+Copyright (C) 2017-2026 Collider LI and contributors
+License: GNU General Public License, version 3. See the LICENSE file.
+This fork is also licensed under GPL-3.0-or-later. Immersive 3D additions
+are Copyright (C) 2026 the IINA Immersive 3D contributors.
+
+The player links against mpv and the other libraries fetched by
+other/download_libs.sh. Those binaries are not part of this source tree.
+yt-dlp, used for online playback, is fetched by that same script and remains
+under its own license.
+
+Depth models are not included in this repository.
+
+Depth Anything V2 Small
+  Lihe Yang, Bingyi Kang, Zilong Huang, Zhen Zhao, Xiaogang Xu, Jiashi Feng,
+  and Hengshuang Zhao.
+  License: Apache-2.0
+  https://github.com/DepthAnything/Depth-Anything-V2
+  Apple's Core ML conversion (also Apache-2.0), which this fork downloads
+  but does not vendor:
+  https://huggingface.co/apple/coreml-depth-anything-v2-small
+
+Depth Anything 3 Small
+  Haotong Lin, Sili Chen, Junhao Liew, Donny Y. Chen, Zhenyu Li, Guang Shi,
+  Jiashi Feng, and Bingyi Kang. ByteDance Seed.
+  License: Apache-2.0
+  https://github.com/ByteDance-Seed/depth-anything-3
+  https://huggingface.co/depth-anything/DA3-SMALL
+  No official Core ML build is published. other/convert_depth_anything_3.py
+  is this fork's exporter. It does not copy DA3 source into the tree.
+
+This fork does not contain code, model files, or assets from VITURE SpaceWalk.
+
+The IPTV window (M3U playlists, Xtream Codes player_api.php, XMLTV now/next,
+and catch-up / timeshift URLs) is part of this fork. It does not vendor a
+third-party IPTV client. Catch-up URL shapes follow the public M3U and Xtream
+conventions documented by Kodi's pvr.iptvsimple addon. That addon's source is
+not included here. Optional movie and series gap-fill talks to TMDB's HTTPS
+API with a key the user types in Settings. No TMDB client library and no
+artwork are vendored.
