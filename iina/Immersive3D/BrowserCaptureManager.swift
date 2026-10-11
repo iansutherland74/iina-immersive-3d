@@ -152,8 +152,9 @@ final class BrowserCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
       applyMute()
     }
     if let audioProblem {
-      DispatchQueue.main.async { [weak self] in
-        self?.onNote?(audioProblem)
+      let note = onNote
+      DispatchQueue.main.async {
+        note?(audioProblem)
       }
     }
     log3D("Browser capture started for window \(windowID) at \(size.width)x\(size.height) audio=\(captureAudio)", level: .debug)

@@ -434,7 +434,7 @@ final class BrowserCaptureAudioPlayer {
       mScope: kAudioObjectPropertyScopeGlobal,
       mElement: kAudioObjectPropertyElementMain
     )
-    var name = uid as CFString
+    let name = uid as CFString
     var device = AudioDeviceID(0)
     var size = UInt32(MemoryLayout<AudioDeviceID>.size)
     let status = withUnsafePointer(to: name) { pointer in

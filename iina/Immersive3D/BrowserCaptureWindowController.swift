@@ -582,7 +582,7 @@ final class BrowserCaptureWindowController: NSWindowController, NSTableViewDataS
   }
 
   private func setStatus(_ text: String) {
-    let work = { self.statusLabel?.stringValue = text }
+    let work: () -> Void = { self.statusLabel?.stringValue = text }
     if Thread.isMainThread {
       work()
     } else {
