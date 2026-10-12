@@ -8,14 +8,17 @@
  *  A CoreAudio HAL AudioServerPlugIn. One device, "IINA Capture Audio",
  *  stereo float at 48 kHz. Output clients write a ring. Input clients read
  *  that ring. The clock is the host clock, the same shape as BlackHole
- *  (Existential Audio, 2019, GPLv3). This file is our own driver.
+ *  (Existential Audio, 2019, GPLv3). ReadInput runs before WriteMix, so a
+ *  read at the write head returns the last completed buffer instead of
+ *  silence. The loopback reader's own output is ignored. This file is our
+ *  own driver.
  *
  *  The device is static. CreateDevice is refused. It can be the default
  *  output so a browser plays into it, and it cannot be the default input
  *  so it does not replace the microphone.
  */
 
-#include "ring.h"
+#include "loopback.h"
 
 #include <CoreAudio/AudioServerPlugIn.h>
 #include <CoreFoundation/CoreFoundation.h>
@@ -83,15 +86,14 @@ static AudioServerPlugInDriverInterface *gInterfacePtr = &gInterface;
 static AudioServerPlugInDriverRef gDriverRef = &gInterfacePtr;
 static AudioServerPlugInHostRef gHost = NULL;
 static pthread_mutex_t gMutex = PTHREAD_MUTEX_INITIALIZER;
-static IINARing gRing;
+static IINALoopback gLoop;
 static UInt32 gIOCount = 0;
 static Float64 gTicksPerFrame = 0;
 static UInt64 gAnchorHost = 0;
 static Float64 gPreviousTicks = 0;
 static UInt64 gStampCount = 0;
-static Float64 gLastWriteEnd = 0;
-static bool gHasWritten = false;
-static Float64 gMixSampleTime = -1;
+static UInt32 gReaderClient = 0;
+static bool gReaderKnown = false;
 static Float32 gVolume = 1.0f;
 
 static bool isDriver(AudioServerPlugInDriverRef driver) {
@@ -761,13 +763,12 @@ static OSStatus IINA_StartIO(AudioServerPlugInDriverRef driver, AudioObjectID de
   }
   pthread_mutex_lock(&gMutex);
   if (gIOCount == 0) {
-    IINARing_Clear(&gRing);
+    IINALoopback_Reset(&gLoop);
     gAnchorHost = mach_absolute_time();
     gPreviousTicks = 0;
     gStampCount = 0;
-    gHasWritten = false;
-    gLastWriteEnd = 0;
-    gMixSampleTime = -1;
+    gReaderKnown = false;
+    gReaderClient = 0;
   }
   gIOCount += 1;
   pthread_mutex_unlock(&gMutex);
@@ -850,7 +851,7 @@ static OSStatus IINA_BeginIOOperation(AudioServerPlugInDriverRef driver, AudioOb
 static OSStatus IINA_DoIOOperation(AudioServerPlugInDriverRef driver, AudioObjectID deviceObjectID, AudioObjectID streamObjectID, UInt32 clientID, UInt32 operationID, UInt32 ioBufferFrameSize, const AudioServerPlugInIOCycleInfo *ioCycleInfo, void *ioMainBuffer, void *ioSecondaryBuffer) {
   Float64 sampleTime;
   Float32 volume;
-  (void)clientID;
+  int writer;
   (void)streamObjectID;
   (void)ioSecondaryBuffer;
   if (!isDriver(driver) || deviceObjectID != kObjectID_Device || ioCycleInfo == NULL) {
@@ -861,33 +862,23 @@ static OSStatus IINA_DoIOOperation(AudioServerPlugInDriverRef driver, AudioObjec
   }
   pthread_mutex_lock(&gMutex);
   if (operationID == kAudioServerPlugInIOOperationReadInput) {
+    gReaderClient = clientID;
+    gReaderKnown = true;
     sampleTime = ioCycleInfo->mInputTime.mSampleTime;
     volume = gVolume;
-    if (sampleTime < 0 || !gHasWritten || sampleTime >= gLastWriteEnd) {
-      memset(ioMainBuffer, 0, (size_t)ioBufferFrameSize * IINA_RING_CHANNELS * sizeof(Float32));
-    } else {
-      IINARing_Read(&gRing, (uint64_t)sampleTime, ioMainBuffer, ioBufferFrameSize);
-      if (volume < 0.999f) {
-        Float32 *samples = ioMainBuffer;
-        UInt32 count = ioBufferFrameSize * IINA_RING_CHANNELS;
-        UInt32 index;
-        for (index = 0; index < count; index++) {
-          samples[index] *= volume;
-        }
+    IINALoopback_Read(&gLoop, sampleTime, ioMainBuffer, ioBufferFrameSize);
+    if (volume < 0.999f) {
+      Float32 *samples = ioMainBuffer;
+      UInt32 count = ioBufferFrameSize * IINA_RING_CHANNELS;
+      UInt32 index;
+      for (index = 0; index < count; index++) {
+        samples[index] *= volume;
       }
     }
   } else if (operationID == kAudioServerPlugInIOOperationWriteMix) {
     sampleTime = ioCycleInfo->mOutputTime.mSampleTime;
-    if (sampleTime >= 0) {
-      if (sampleTime != gMixSampleTime) {
-        IINARing_WriteReplace(&gRing, (uint64_t)sampleTime, ioMainBuffer, ioBufferFrameSize);
-        gMixSampleTime = sampleTime;
-      } else {
-        IINARing_WriteAdd(&gRing, (uint64_t)sampleTime, ioMainBuffer, ioBufferFrameSize);
-      }
-      gLastWriteEnd = sampleTime + (Float64)ioBufferFrameSize;
-      gHasWritten = true;
-    }
+    writer = (gReaderKnown && clientID == gReaderClient) ? IINA_LOOPBACK_READER : IINA_LOOPBACK_SOURCE;
+    IINALoopback_Write(&gLoop, sampleTime, ioMainBuffer, ioBufferFrameSize, writer);
   }
   pthread_mutex_unlock(&gMutex);
   return noErr;

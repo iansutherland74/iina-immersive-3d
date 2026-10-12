@@ -28,10 +28,12 @@ final class BrowserCaptureRenderer: NSView {
   private var cropped: MTLTexture?
   private var croppedWidth = 0
   private var croppedHeight = 0
-  private var stageTextures: [MTLTexture?] = [nil, nil]
-  private var stageBusy: [Bool] = [false, false]
-  private var stageBusySince: [CFTimeInterval] = [0, 0]
-  private var stageGeneration: [Int] = [0, 0]
+  private var stageTextures: [MTLTexture?] = [nil, nil, nil]
+  private var stageBusy: [Bool] = [false, false, false]
+  private var stageBusySince: [CFTimeInterval] = [0, 0, 0]
+  private var stageGeneration: [Int] = [0, 0, 0]
+  private var queuedPresent: QueuedPresent?
+  private var presentScheduled = false
   private let stageLock = NSLock()
   private var pixelWidth = 0
   private var pixelHeight = 0
@@ -69,6 +71,14 @@ final class BrowserCaptureRenderer: NSView {
     var y: Float
     var w: Float
     var h: Float
+  }
+
+  private struct QueuedPresent {
+    var texture: MTLTexture
+    var slot: Int
+    var generation: Int
+    var time: CMTime
+    var received: CFTimeInterval
   }
 
   override init(frame frameRect: NSRect) {
@@ -428,12 +438,24 @@ final class BrowserCaptureRenderer: NSView {
   }
 
   /// The stereo pass has finished. Present it unless a newer frame is already waiting and this one is late.
+  /// Only the newest finished frame waits on the main thread. The slot it replaces is freed here, so the next stereo pass is not skipped while that present sits in the queue.
   private func finishPicture(ok: Bool, texture: MTLTexture, slot: Int, generation: Int, time: CMTime, received: CFTimeInterval, done: @escaping () -> Void) {
     let newer = BrowserCaptureManager.shared.hasPendingFrame
     let age = received > 0 ? CACurrentMediaTime() - received : 0
     if ok && CapturePresentBudget.shouldPresent(age: age, newerWaiting: newer) {
-      DispatchQueue.main.async { [weak self] in
-        self?.present(texture, slot: slot, generation: generation, time: time, received: received)
+      stageLock.lock()
+      let replaced = queuedPresent
+      queuedPresent = QueuedPresent(texture: texture, slot: slot, generation: generation, time: time, received: received)
+      let schedule = !presentScheduled
+      presentScheduled = true
+      stageLock.unlock()
+      if let replaced, replaced.slot != slot || replaced.generation != generation {
+        releaseStage(replaced.slot, generation: replaced.generation)
+      }
+      if schedule {
+        DispatchQueue.main.async { [weak self] in
+          self?.drainPresent()
+        }
       }
     } else {
       releaseStage(slot, generation: generation)
@@ -447,6 +469,30 @@ final class BrowserCaptureRenderer: NSView {
       }
     }
     done()
+  }
+
+  private func drainPresent() {
+    stageLock.lock()
+    let queued = queuedPresent
+    queuedPresent = nil
+    if queued == nil {
+      presentScheduled = false
+      stageLock.unlock()
+      return
+    }
+    stageLock.unlock()
+    present(queued.texture, slot: queued.slot, generation: queued.generation, time: queued.time, received: queued.received)
+    stageLock.lock()
+    let more = queuedPresent != nil
+    if !more {
+      presentScheduled = false
+    }
+    stageLock.unlock()
+    if more {
+      DispatchQueue.main.async { [weak self] in
+        self?.drainPresent()
+      }
+    }
   }
 
   private func analyzeIfNeeded(_ pixelBuffer: CVPixelBuffer) {
@@ -688,11 +734,11 @@ final class BrowserCaptureRenderer: NSView {
       return
     }
     buffer.addCompletedHandler { [weak self] commandBuffer in
+      if let slot {
+        self?.releaseStage(slot, generation: generation)
+      }
       DispatchQueue.main.async {
         self?.endPresent()
-        if let slot {
-          self?.releaseStage(slot, generation: generation)
-        }
         if let error = commandBuffer.error {
           browserCaptureLog.error("glasses present failed: \(error.localizedDescription, privacy: .public)")
         }

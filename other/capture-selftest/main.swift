@@ -231,6 +231,11 @@ private func testCoalescer() {
   check(!CapturePresentBudget.shouldPresent(age: 0.213, newerWaiting: true), "a 213 ms frame is dropped when a newer one is waiting")
   check(CapturePresentBudget.shouldPresent(age: 0.012, newerWaiting: true), "a fresh frame is presented")
   check(CapturePresentBudget.shouldPresent(age: 0.575, newerWaiting: false), "the only frame is still presented")
+  var slots = CapturePresentSlots()
+  check(CapturePresentSlots.count >= 3, "a stereo pass, a blit, and a waiting frame each have a slot")
+  check(slots.offer(0) == nil, "the first finished frame waits to present")
+  check(slots.offer(1) == 0, "a newer frame frees the slot that was still waiting")
+  check(slots.pending == 1, "the present keeps the newest frame")
 }
 
 private func testQuitDuringCapture() {
@@ -335,6 +340,9 @@ private func testRoute() {
   check(CaptureLoopbackClock.decide(chunk: chunk, now: 10, delay: 0.08) == .wait, "loopback waits for the picture")
   check(CaptureLoopbackClock.decide(chunk: chunk, now: 10.08, delay: 0.08) == .play, "loopback plays when the picture catches up")
   check(CaptureLoopbackClock.decide(chunk: chunk, now: 10.40, delay: 0.08) == .drop, "late loopback audio is dropped")
+  check(CaptureLoopbackClock.decide(chunk: CaptureLoopbackClock.Chunk(hostTime: 10, duration: 0.02), now: 10, delay: 0) == .play, "loopback plays at once before a picture measurement")
+  check(CaptureLoopbackClock.decide(chunk: CaptureLoopbackClock.Chunk(hostTime: 10, duration: 0.02), now: 11.2, delay: 0) == .drop, "audio buffered before playback started is dropped")
+  check(CaptureLoopbackClock.decide(chunk: CaptureLoopbackClock.Chunk(hostTime: 11.19, duration: 0.02), now: 11.2, delay: 0) == .play, "a new loopback chunk plays without a video measurement")
   check(CaptureSyncOffset.clamp(800) == 500 && CaptureSyncOffset.clamp(-800) == -500, "the sync offset stays inside ±500 ms")
   check(CaptureSyncOffset.label(ms: 40) == "Audio sync +40 ms", "a positive offset shows a plus")
   check(CaptureSyncOffset.label(ms: -15) == "Audio sync -15 ms", "a negative offset shows a minus")

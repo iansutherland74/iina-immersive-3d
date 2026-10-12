@@ -9,8 +9,10 @@
  *  back out unchanged. This is the loopback the HAL plugin uses.
  */
 
+#include "loopback.h"
 #include "ring.h"
 
+#include <math.h>
 #include <stdio.h>
 
 static int fails = 0;
@@ -59,6 +61,66 @@ int main(void) {
   IINARing_Clear(&ring);
   IINARing_Read(&ring, 0, out, 2);
   check(out[0] == 0.0f && out[3] == 0.0f, "a cleared ring reads silence");
+
+  /* Chrome writes a buffer. coreaudiod then asks for the NEXT buffer, which
+     starts where that write ended, before the next WriteMix. That read used
+     to be silence for the whole capture. */
+  {
+    static IINALoopback loop;
+    float tone[512 * 2];
+    float zeros[512 * 2];
+    float heard[512 * 2];
+    double energy = 0;
+    uint32_t i;
+    IINALoopback_Reset(&loop);
+    for (i = 0; i < 512 * 2; i++) {
+      tone[i] = (i % 2 == 0) ? 0.25f : -0.25f;
+      zeros[i] = 0.0f;
+      heard[i] = 0.0f;
+    }
+    IINALoopback_Write(&loop, 1000, tone, 512, IINA_LOOPBACK_SOURCE);
+    IINALoopback_Write(&loop, 1000, zeros, 512, IINA_LOOPBACK_SOURCE);
+    IINALoopback_Read(&loop, 1000, heard, 512);
+    check(heard[0] == 0.25f && heard[1] == -0.25f, "silence mixed at the same time does not erase the tone");
+    for (i = 0; i < 512 * 2; i++) {
+      heard[i] = 0.0f;
+    }
+    IINALoopback_Read(&loop, loop.lastWriteEnd, heard, 512);
+    for (i = 0; i < 512 * 2; i++) {
+      energy += (double)heard[i] * (double)heard[i];
+    }
+    check(sqrt(energy / (512.0 * 2.0)) > 0.05, "a read at the write head is the last tone, not silence");
+
+    IINALoopback_Write(&loop, loop.lastWriteEnd, zeros, 512, IINA_LOOPBACK_READER);
+    for (i = 0; i < 512 * 2; i++) {
+      heard[i] = 0.0f;
+    }
+    energy = 0;
+    IINALoopback_Read(&loop, loop.lastWriteEnd, heard, 512);
+    for (i = 0; i < 512 * 2; i++) {
+      energy += (double)heard[i] * (double)heard[i];
+    }
+    check(sqrt(energy / (512.0 * 2.0)) > 0.05, "the loopback reader's own silence does not erase the tone");
+
+    IINALoopback_Write(&loop, 1000 + 256, zeros, 256, IINA_LOOPBACK_SOURCE);
+    IINALoopback_Read(&loop, 1000, heard, 512);
+    check(heard[0] == 0.25f && heard[511 * 2] == 0.25f, "silence that overlaps the tone does not erase it");
+
+    IINALoopback_Write(&loop, loop.lastWriteEnd, zeros, 512, IINA_LOOPBACK_SOURCE);
+    IINALoopback_Read(&loop, loop.lastWriteEnd, heard, 512);
+    check(heard[0] == 0.0f && heard[511 * 2 + 1] == 0.0f, "a source that goes silent is heard as silence");
+
+    IINALoopback_Reset(&loop);
+    IINALoopback_Write(&loop, 0, tone, 512, IINA_LOOPBACK_SOURCE);
+    IINALoopback_Read(&loop, 512, heard, 512);
+    check(heard[0] == 0.25f, "the next buffer, read before it is written, is the previous tone");
+    for (i = 0; i < 512 * 2; i++) {
+      tone[i] = 0.5f;
+    }
+    IINALoopback_Write(&loop, 512, tone, 512, IINA_LOOPBACK_SOURCE);
+    IINALoopback_Read(&loop, 1024, heard, 512);
+    check(heard[0] == 0.5f, "the buffer after that is the tone just written");
+  }
 
   if (fails != 0) {
     fprintf(stderr, "%d ring checks failed\n", fails);

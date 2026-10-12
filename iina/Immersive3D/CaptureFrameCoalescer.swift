@@ -94,6 +94,24 @@ struct CaptureDrawableGuard {
   }
 }
 
+/// One slot is the blit still on the GPU, one is the newest frame waiting for
+/// the main thread, and one is the stereo pass. A newer finished frame frees
+/// the one that was waiting, so two busy slots do not skip every later frame.
+struct CapturePresentSlots: Equatable {
+  static let count = 3
+  private(set) var pending: Int?
+
+  /// Returns the slot that was waiting and must be released.
+  mutating func offer(_ slot: Int) -> Int? {
+    let replaced = pending
+    pending = slot
+    if replaced == slot {
+      return nil
+    }
+    return replaced
+  }
+}
+
 /// The sample callback copies and returns. A frame that is already late is not
 /// presented when a newer copy is waiting, so one GPU stall does not become the picture.
 enum CapturePresentBudget {

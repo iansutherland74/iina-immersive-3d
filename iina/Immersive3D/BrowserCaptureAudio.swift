@@ -79,6 +79,15 @@ final class BrowserCaptureAudioPlayer {
   private var hostDelay = 0.0
   private var syncOffsetMs = 0
   private var pinnedUID: String?
+  private var announcedDelayMs: Int?
+  private var announcedOffset: Int?
+  private var announcedOutput = false
+  private var loggedConvert = false
+  private var loggedDevice = false
+  private var loggedMute = false
+  private var lastOutLog: CFTimeInterval = 0
+  private var outSum: Float = 0
+  private var outCount = 0
   private let lateWindow = 0.20
   private let lead = 0.050
 
@@ -92,16 +101,26 @@ final class BrowserCaptureAudioPlayer {
     }
   }
 
-  /// Loopback samples are stamped with the host clock and wait for the measured
-  /// picture delay. `pinnedUID` is the real output, never the system default.
+  /// Loopback samples are stamped with the host clock. Playback starts at delay 0
+  /// so a missing video present cannot mute the capture. A later measurement
+  /// tightens that delay. `pinnedUID` is the real output, never the system default.
   func beginHostClock(pinnedUID: String) {
     queue.async { [weak self] in
       guard let self else { return }
       self.startOnQueue()
       self.pinnedUID = pinnedUID
       self.hostMode = true
-      self.haveDelay = false
+      self.haveDelay = true
       self.hostDelay = 0
+      self.announcedDelayMs = nil
+      self.announcedOffset = nil
+      self.announcedOutput = false
+      self.loggedConvert = false
+      self.loggedDevice = false
+      self.loggedMute = false
+      self.lastOutLog = 0
+      self.outSum = 0
+      self.outCount = 0
     }
   }
 
@@ -110,6 +129,7 @@ final class BrowserCaptureAudioPlayer {
       guard let self else { return }
       self.hostDelay = min(max(seconds, 0), 2)
       self.haveDelay = true
+      self.logDelay()
       self.pumpHost()
     }
   }
@@ -119,13 +139,23 @@ final class BrowserCaptureAudioPlayer {
     queue.async { [weak self] in
       guard let self else { return }
       self.syncOffsetMs = CaptureSyncOffset.clamp(ms)
+      if self.hostMode {
+        self.logDelay()
+      }
       self.pumpHost()
     }
   }
 
   func consumeHostClock(_ buffer: AVAudioPCMBuffer, hostTime: Double) {
     queue.async { [weak self] in
-      guard let self, self.started, self.hostMode, let converted = self.convert(buffer) else { return }
+      guard let self, self.started, self.hostMode else { return }
+      guard let converted = self.convert(buffer) else {
+        if !self.loggedConvert {
+          self.loggedConvert = true
+          browserCaptureLog.error("loopback convert failed")
+        }
+        return
+      }
       self.pending.append((hostTime, converted))
       while self.pending.count > 48 {
         self.pending.removeFirst()
@@ -322,7 +352,7 @@ final class BrowserCaptureAudioPlayer {
   }
 
   private func pumpHost() {
-    guard started, hostMode, haveDelay else { return }
+    guard started, hostMode else { return }
     let now = CACurrentMediaTime()
     while let first = pending.first {
       let duration = Double(first.buffer.frameLength) / targetFormat.sampleRate
@@ -337,9 +367,18 @@ final class BrowserCaptureAudioPlayer {
         return
       case .play:
         pending.removeFirst()
+        logDelay()
         schedule(first.buffer)
       }
     }
+  }
+
+  private func logDelay() {
+    let ms = Int((hostDelay * 1000).rounded())
+    if announcedDelayMs == ms && announcedOffset == syncOffsetMs { return }
+    announcedDelayMs = ms
+    announcedOffset = syncOffsetMs
+    browserCaptureLog.info("loopback delay \(ms) ms offset \(self.syncOffsetMs) ms")
   }
 
   private func pump() {
@@ -366,15 +405,48 @@ final class BrowserCaptureAudioPlayer {
 
   private func schedule(_ buffer: AVAudioPCMBuffer) {
     guard ensureEngine() else { return }
+    noteOutputStarted()
+    noteOutputLevel(buffer)
     if !node.isPlaying {
       node.play()
     }
     node.scheduleBuffer(buffer, completionHandler: nil)
   }
 
+  private func noteOutputStarted() {
+    guard hostMode, !announcedOutput else { return }
+    announcedOutput = true
+    let uid = pinnedUID ?? appliedUID ?? "default"
+    browserCaptureLog.info("loopback output started device=\(self.appliedDevice) uid=\(uid, privacy: .public)")
+    let gain = route.muted ? Float(0) : min(max(route.volume, 0), 1)
+    if gain == 0 && !loggedMute {
+      loggedMute = true
+      browserCaptureLog.info("loopback output gain is 0")
+    }
+  }
+
+  private func noteOutputLevel(_ buffer: AVAudioPCMBuffer) {
+    guard hostMode else { return }
+    let level = rms(buffer)
+    outSum += level
+    outCount += 1
+    let now = CACurrentMediaTime()
+    if now - lastOutLog < 1 { return }
+    lastOutLog = now
+    let mean = outSum / Float(max(outCount, 1))
+    outSum = 0
+    outCount = 0
+    let line = String(format: "loopback out rms=%.4f", mean)
+    browserCaptureLog.info("\(line, privacy: .public)")
+  }
+
   @discardableResult
   private func ensureEngine() -> Bool {
     if let pinnedUID, Self.deviceID(forUID: pinnedUID) == nil {
+      if hostMode && !loggedDevice {
+        loggedDevice = true
+        browserCaptureLog.error("loopback output device was not found uid=\(pinnedUID, privacy: .public)")
+      }
       return false
     }
     if !connected {
@@ -442,6 +514,9 @@ final class BrowserCaptureAudioPlayer {
     if status == noErr {
       appliedDevice = device
       appliedUID = uid
+    } else if hostMode && !loggedDevice {
+      loggedDevice = true
+      browserCaptureLog.error("loopback output device was not set status=\(status) device=\(device)")
     }
     if wasRunning {
       try? engine.start()

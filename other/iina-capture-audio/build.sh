@@ -29,7 +29,8 @@ clang -bundle \
   -I "$root" \
   -o "$stage/MacOS/IINACaptureAudio" \
   "$root/IINACaptureAudio.c" \
-  "$root/ring.c"
+  "$root/ring.c" \
+  "$root/loopback.c"
 
 codesign --force --sign - "$root/build/IINACaptureAudio.driver"
 test -x "$stage/MacOS/IINACaptureAudio"

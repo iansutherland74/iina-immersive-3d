@@ -419,6 +419,10 @@ final class CaptureLoopbackReader {
   private var procID: AudioDeviceIOProcID?
   private var timer: DispatchSourceTimer?
   private var running = false
+  private var dropped = 0
+  private var lastLevelLog: CFTimeInterval = 0
+  private var levelSum: Float = 0
+  private var levelCount = 0
   private let format = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 48000, channels: 2, interleaved: true)
 
   private struct Slot {
@@ -429,18 +433,30 @@ final class CaptureLoopbackReader {
   }
 
   func start() -> Bool {
-    guard let id = CaptureSystemOutput.deviceID(forUID: CaptureOutputRoute.virtualUID), let format else { return false }
+    guard let id = CaptureSystemOutput.deviceID(forUID: CaptureOutputRoute.virtualUID), let format else {
+      browserCaptureLog.error("loopback reader did not start device=0")
+      return false
+    }
     stop()
     var created: AudioDeviceIOProcID?
     let status = AudioDeviceCreateIOProcID(id, Self.ioProc, Unmanaged.passUnretained(self).toOpaque(), &created)
-    guard status == noErr, let created else { return false }
-    guard AudioDeviceStart(id, created) == noErr else {
+    guard status == noErr, let created else {
+      browserCaptureLog.error("loopback reader did not start status=\(status) device=\(id)")
+      return false
+    }
+    let started = AudioDeviceStart(id, created)
+    guard started == noErr else {
       AudioDeviceDestroyIOProcID(id, created)
+      browserCaptureLog.error("loopback reader did not start status=\(started) device=\(id)")
       return false
     }
     device = id
     procID = created
     running = true
+    dropped = 0
+    lastLevelLog = 0
+    levelSum = 0
+    levelCount = 0
     let timer = DispatchSource.makeTimerSource(queue: queue)
     timer.schedule(deadline: .now() + 0.01, repeating: 0.01)
     timer.setEventHandler { [weak self] in
@@ -449,6 +465,7 @@ final class CaptureLoopbackReader {
     self.timer = timer
     timer.resume()
     _ = format
+    browserCaptureLog.info("loopback reader started device=\(id) uid=\(CaptureOutputRoute.virtualUID, privacy: .public) format=48000 Hz 2ch float32")
     return true
   }
 
@@ -506,10 +523,18 @@ final class CaptureLoopbackReader {
   }
 
   private func store(frames: Int, write: (UnsafeMutableRawPointer) -> Void) {
-    guard frames > 0, frames <= 4096 else { return }
+    guard frames > 0, frames <= 4096 else {
+      slotLock.lock()
+      dropped += 1
+      slotLock.unlock()
+      return
+    }
     slotLock.lock()
     defer { slotLock.unlock() }
-    guard let index = slots.firstIndex(where: { !$0.full }) else { return }
+    guard let index = slots.firstIndex(where: { !$0.full }) else {
+      dropped += 1
+      return
+    }
     slots[index].samples.withUnsafeMutableBytes { raw in
       guard let base = raw.baseAddress else { return }
       write(base)
@@ -532,7 +557,21 @@ final class CaptureLoopbackReader {
       ))
       slots[index].full = false
     }
+    let missed = dropped
+    dropped = 0
     slotLock.unlock()
+    if missed > 0 {
+      browserCaptureLog.error("loopback reader dropped \(missed) buffers")
+    }
+    if ready.isEmpty {
+      let now = CACurrentMediaTime()
+      if lastLevelLog == 0 || now - lastLevelLog >= 1 {
+        lastLevelLog = now
+        browserCaptureLog.info("loopback in rms=0.0000")
+      }
+    } else {
+      noteInputLevel(ready)
+    }
     for chunk in ready {
       guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(chunk.frames)) else { continue }
       buffer.frameLength = AVAudioFrameCount(chunk.frames)
@@ -544,6 +583,32 @@ final class CaptureLoopbackReader {
       }
       onSamples?(buffer, chunk.host)
     }
+  }
+
+  private func noteInputLevel(_ ready: [(host: Double, samples: [Float], frames: Int)]) {
+    var sum: Float = 0
+    var count = 0
+    for chunk in ready {
+      let step = max(chunk.samples.count / 256, 1)
+      var index = 0
+      while index < chunk.samples.count {
+        let sample = chunk.samples[index]
+        sum += sample * sample
+        count += 1
+        index += step
+      }
+    }
+    let level = sqrt(sum / Float(max(count, 1)))
+    levelSum += level
+    levelCount += 1
+    let now = CACurrentMediaTime()
+    if lastLevelLog != 0 && now - lastLevelLog < 1 { return }
+    lastLevelLog = now
+    let mean = levelSum / Float(max(levelCount, 1))
+    levelSum = 0
+    levelCount = 0
+    let line = String(format: "loopback in rms=%.4f", mean)
+    browserCaptureLog.info("\(line, privacy: .public)")
   }
 }
 
