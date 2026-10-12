@@ -247,6 +247,7 @@ enum CaptureAudioRouteController {
     }
   }
 
+  @available(macOS 12.3, *)
   static func beginIfEnabled() -> CaptureOutputRoute.BeginResult {
     guard BrowserCaptureManager.shared.isRunning else {
       return .refused(.notCapturing)
@@ -279,6 +280,7 @@ enum CaptureAudioRouteController {
     }
   }
 
+  @available(macOS 12.3, *)
   static func end() {
     lock.lock()
     let plan = CaptureOutputRoute.end(state: state)
