@@ -68,6 +68,20 @@ final class BrowserCaptureSettings {
 
   func setPlayAudio(_ on: Bool) {
     UserDefaults.standard.set(on, forKey: CaptureOutputRoute.defaultsKey)
+    NotificationCenter.default.post(name: CaptureSyncOffset.routeChangedNotification, object: nil)
+  }
+
+  func setSyncOffset(ms: Int) {
+    let clamped = CaptureSyncOffset.clamp(ms)
+    UserDefaults.standard.set(clamped, forKey: CaptureSyncOffset.defaultsKey)
+    NotificationCenter.default.post(name: CaptureSyncOffset.changedNotification, object: clamped)
+    if #available(macOS 12.3, *) {
+      BrowserCaptureManager.shared.noteSyncOffset(clamped)
+    }
+  }
+
+  var syncOffsetMs: Int {
+    CaptureSyncOffset.clamp(UserDefaults.standard.integer(forKey: CaptureSyncOffset.defaultsKey))
   }
 
   func setMuteSource(_ on: Bool) {

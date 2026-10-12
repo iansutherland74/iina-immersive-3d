@@ -61,8 +61,12 @@ final class BrowserCaptureWindowController: NSWindowController, NSTableViewDataS
     chooser.title = "Choose Capture Window"
     super.init(window: chooser)
     buildChooser()
-    manager.onFrame = { [weak self] buffer, time, received in
-      self?.renderer.consume(buffer, at: time, received: received)
+    manager.onFrame = { [weak self] buffer, time, received, done in
+      guard let self else {
+        done()
+        return
+      }
+      self.renderer.consume(buffer, at: time, received: received, done: done)
     }
     manager.onIdle = { [weak self] in
       self?.renderer.presentHeld()
@@ -299,7 +303,7 @@ final class BrowserCaptureWindowController: NSWindowController, NSTableViewDataS
 
   private func buildChooser() {
     guard let content = window?.contentView else { return }
-    let scroll = NSScrollView(frame: NSRect(x: 20, y: 356, width: 520, height: 308))
+    let scroll = NSScrollView(frame: NSRect(x: 20, y: 384, width: 520, height: 280))
     let table = NSTableView(frame: scroll.bounds)
     let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("window"))
     column.title = "Window"
@@ -314,14 +318,17 @@ final class BrowserCaptureWindowController: NSWindowController, NSTableViewDataS
     self.table = table
 
     let audio = NSButton(checkboxWithTitle: CaptureOutputRoute.toggleTitle, target: self, action: #selector(audioCheckboxChanged(_:)))
-    audio.frame = NSRect(x: 20, y: 326, width: 520, height: 22)
+    audio.frame = NSRect(x: 20, y: 354, width: 520, height: 22)
     audio.font = .systemFont(ofSize: 12)
     audioCheckbox = audio
+
+    let sync = CaptureSyncOffsetControl(placement: .controls)
+    sync.frame = NSRect(x: 20, y: 324, width: 520, height: 28)
 
     let hint = NSTextField(wrappingLabelWithString: hintText())
     hint.font = .systemFont(ofSize: 11)
     hint.textColor = .secondaryLabelColor
-    hint.frame = NSRect(x: 20, y: 280, width: 520, height: 44)
+    hint.frame = NSRect(x: 20, y: 280, width: 520, height: 40)
     hintLabel = hint
 
     let segments = NSSegmentedControl(labels: ["Crop chrome", "Video area", "Manual"], trackingMode: .selectOne, target: self, action: #selector(cropModeChanged(_:)))
@@ -347,6 +354,7 @@ final class BrowserCaptureWindowController: NSWindowController, NSTableViewDataS
     statusLabel = status
     content.addSubview(scroll)
     content.addSubview(audio)
+    content.addSubview(sync)
     content.addSubview(hint)
     content.addSubview(segments)
     content.addSubview(refresh)

@@ -164,7 +164,8 @@ final class Immersive3DController: NSObject, NSWindowDelegate {
     modelHeight: Int,
     fullSizeEyes: Bool?,
     compositor: Immersive3DCompositor?,
-    whenDepthReady: @escaping () -> Void
+    whenDepthReady: @escaping () -> Void,
+    whenGPUFinished: ((Bool) -> Void)? = nil
   ) -> Bool {
     let pass = compositor ?? captureCompositor
     return pass.submitFrame(
@@ -176,8 +177,17 @@ final class Immersive3DController: NSObject, NSWindowDelegate {
       modelWidth: modelWidth,
       modelHeight: modelHeight,
       fullSizeEyes: fullSizeEyes,
-      whenDepthReady: whenDepthReady
+      whenDepthReady: whenDepthReady,
+      whenGPUFinished: whenGPUFinished
     )
+  }
+
+  func captureEncodeQueue() -> MTLCommandQueue? {
+    captureCompositor.encodeQueue
+  }
+
+  func submitCaptureDepth(_ pixels: [UInt8], width: Int, height: Int, whenReady: @escaping () -> Void) {
+    captureCompositor.submitCaptureDepth(pixels, width: width, height: height, whenReady: whenReady)
   }
 
   /// Puts `window` on the glasses display with the same frame, level, and
@@ -209,7 +219,8 @@ final class Immersive3DController: NSObject, NSWindowDelegate {
     window.aspectRatio = aspect
     window.contentAspectRatio = aspect
     if Self.isUsableWindowFrame(previewFrame) {
-      window.setFrame(previewFrame, display: true, animate: false)
+      // display:true during quit takes a Metal drawable into the Apple Event pool.
+      window.setFrame(previewFrame, display: !shuttingDown, animate: false)
     }
     if !glassesActive {
       stopObservingScreenParameters()
@@ -983,7 +994,7 @@ final class Immersive3DController: NSObject, NSWindowDelegate {
         style.remove(.fullScreen)
         window.styleMask = style
         if let restored {
-          window.setFrame(restored, display: true, animate: false)
+          window.setFrame(restored, display: !shuttingDown, animate: false)
         } else {
           log3D("Skipped restoring the pre-glasses frame; no screen is available", level: .error)
         }
@@ -1037,7 +1048,7 @@ final class Immersive3DController: NSObject, NSWindowDelegate {
 
   private func makePanel() -> NSPanel {
     let panel = NSPanel(
-      contentRect: NSRect(x: 0, y: 0, width: 460, height: 312),
+      contentRect: NSRect(x: 0, y: 0, width: 460, height: 348),
       styleMask: [.titled, .closable, .utilityWindow, .nonactivatingPanel],
       backing: .buffered,
       defer: false
@@ -1053,21 +1064,23 @@ final class Immersive3DController: NSObject, NSWindowDelegate {
     let content = panel.contentView!
     let title = NSTextField(labelWithString: "Play on glasses")
     title.font = .systemFont(ofSize: 15, weight: .semibold)
-    title.frame = NSRect(x: 20, y: 270, width: 420, height: 22)
+    title.frame = NSRect(x: 20, y: 306, width: 420, height: 22)
     let reminder = NSTextField(wrappingLabelWithString: Self.glassesReminder(fullSizeEyes: false))
     reminder.font = .systemFont(ofSize: 13, weight: .medium)
-    reminder.frame = NSRect(x: 18, y: 190, width: 424, height: 72)
+    reminder.frame = NSRect(x: 18, y: 226, width: 424, height: 72)
     panelReminder = reminder
     let status = NSTextField(wrappingLabelWithString: "")
     status.font = .systemFont(ofSize: 12)
     status.textColor = .secondaryLabelColor
-    status.frame = NSRect(x: 18, y: 136, width: 424, height: 48)
+    status.frame = NSRect(x: 18, y: 172, width: 424, height: 48)
     panelStatus = status
     let strengthName = NSTextField(labelWithString: "Depth strength")
-    strengthName.frame = NSRect(x: 20, y: 96, width: 120, height: 18)
+    strengthName.frame = NSRect(x: 20, y: 132, width: 120, height: 18)
     let slider = NSSlider(value: Preference.double(for: .immersive3DStrength), minValue: 0, maxValue: 1, target: self, action: #selector(strengthSliderChanged(_:)))
     slider.isContinuous = true
-    slider.frame = NSRect(x: 140, y: 94, width: 300, height: 24)
+    slider.frame = NSRect(x: 140, y: 130, width: 300, height: 24)
+    let sync = CaptureSyncOffsetControl(placement: .overlay)
+    sync.frame = NSRect(x: 20, y: 96, width: 420, height: 28)
     panelSlider = slider
     let presets = NSPopUpButton(frame: NSRect(x: 18, y: 56, width: 200, height: 26), pullsDown: false)
     presets.addItems(withTitles: ["Soft", "Standard", "Enhanced"])
@@ -1082,7 +1095,7 @@ final class Immersive3DController: NSObject, NSWindowDelegate {
     let exit = NSButton(title: "Exit Glasses", target: self, action: #selector(exitGlassesClicked(_:)))
     exit.bezelStyle = .rounded
     exit.frame = NSRect(x: 320, y: 16, width: 122, height: 30)
-    for view in [title, reminder, status, strengthName, slider, presets, play, exit] {
+    for view in [title, reminder, status, strengthName, slider, sync, presets, play, exit] {
       content.addSubview(view)
     }
     return panel

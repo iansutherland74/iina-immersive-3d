@@ -1,7 +1,9 @@
 #!/bin/bash
 # Headless Browser Capture checks: session, drawable size, window follow, frame
-# coalescing, audio policy, loopback route order, the loopback ring, texture
-# lifetime, and one synthetic side-by-side frame. No display is required.
+# coalescing, the quit-during-capture resize rule, latency smoothing, the sync
+# offset, the default-output read-back, audio policy, loopback route order, the
+# loopback ring, texture lifetime, and one synthetic side-by-side frame. No
+# display is required.
 # AddressSanitizer and a zombie run cover the texture retain path. The HAL
 # plugin is not installed and coreaudiod is not restarted.
 set -euo pipefail

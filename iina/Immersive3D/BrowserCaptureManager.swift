@@ -69,6 +69,7 @@ final class BrowserCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
   private let audioPlayer = BrowserCaptureAudioPlayer()
   private let loopback = CaptureLoopbackReader()
   private var routedAudio = false
+  private var latencySmooth = CaptureLatencySmooth()
   private let sessionLock = NSLock()
   private var stream: SCStream?
   private var configuration: SCStreamConfiguration?
@@ -103,7 +104,7 @@ final class BrowserCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
   private(set) var audioActive = false
 
   /// Called on the draw queue with a pixel buffer this process owns, and the time the copy was made.
-  var onFrame: ((CVPixelBuffer, CMTime, CFTimeInterval) -> Void)?
+  var onFrame: ((CVPixelBuffer, CMTime, CFTimeInterval, @escaping () -> Void) -> Void)?
   /// Called on the capture queue when the source did not send a new picture.
   var onIdle: (() -> Void)?
   var onStatus: ((String?) -> Void)?
@@ -174,7 +175,17 @@ final class BrowserCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
 
   func noteCaptureLatency(_ seconds: Double) {
     guard routedAudio else { return }
-    audioPlayer.setHostDelay(seconds)
+    audioPlayer.setHostDelay(latencySmooth.observe(seconds))
+  }
+
+  func noteSyncOffset(_ ms: Int) {
+    audioPlayer.setSyncOffset(ms: ms)
+  }
+
+  var hasPendingFrame: Bool {
+    frameLock.lock()
+    defer { frameLock.unlock() }
+    return latestOwned != nil
   }
 
   @discardableResult
@@ -182,7 +193,9 @@ final class BrowserCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
     loopback.onSamples = { [weak self] buffer, host in
       self?.audioPlayer.consumeHostClock(buffer, hostTime: host)
     }
+    latencySmooth = CaptureLatencySmooth()
     audioPlayer.beginHostClock(pinnedUID: realUID)
+    audioPlayer.setSyncOffset(ms: BrowserCaptureSettings.shared.syncOffsetMs)
     guard loopback.start() else {
       audioPlayer.stop()
       routedAudio = false
@@ -622,18 +635,25 @@ final class BrowserCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
   }
 
   private func drainFrames() {
-    while true {
-      frameLock.lock()
-      guard let buffer = latestOwned else {
-        drawBusy = false
-        frameLock.unlock()
-        return
-      }
-      let time = latestTime
-      let received = latestReceived
-      latestOwned = nil
+    frameLock.lock()
+    guard let buffer = latestOwned else {
+      drawBusy = false
       frameLock.unlock()
-      onFrame?(buffer, time, received)
+      return
+    }
+    let time = latestTime
+    let received = latestReceived
+    latestOwned = nil
+    frameLock.unlock()
+    let done = { [weak self] in
+      self?.drawQueue.async {
+        self?.drainFrames()
+      }
+    }
+    if let onFrame {
+      onFrame(buffer, time, received, done)
+    } else {
+      done()
     }
   }
 

@@ -158,6 +158,61 @@ enum CaptureOutputRoute {
   }
 }
 
+/// Saved on top of the measured picture delay. Negative plays earlier.
+enum CaptureSyncOffset {
+  static let defaultsKey = "IINACaptureAudioSyncOffsetMS"
+  static let changedNotification = Notification.Name("IINACaptureAudioSyncOffsetChanged")
+  static let routeChangedNotification = Notification.Name("IINACaptureAudioRouteChanged")
+  static let minMs = -500
+  static let maxMs = 500
+
+  static func clamp(_ ms: Int) -> Int {
+    min(max(ms, minMs), maxMs)
+  }
+
+  static func label(ms: Int) -> String {
+    let value = clamp(ms)
+    if value > 0 { return "Audio sync +\(value) ms" }
+    return "Audio sync \(value) ms"
+  }
+
+  static func delay(automatic seconds: Double, offsetMs: Int) -> Double {
+    let automatic = seconds.isFinite ? seconds : 0
+    return automatic + Double(clamp(offsetMs)) / 1000
+  }
+}
+
+/// Both system outputs have to move, and the read-back id has to match, or the
+/// switch did not happen. Logging "restored" without that check was a false success.
+enum CaptureDefaultOutput {
+  static let propertyCount = 2
+
+  struct Write: Equatable {
+    var status: Int32
+    var readBack: UInt32
+  }
+
+  static func accepted(deviceID: UInt32, writes: [Write]) -> Bool {
+    guard deviceID != 0, writes.count == propertyCount else { return false }
+    return writes.allSatisfy { $0.status == 0 && $0.readBack == deviceID }
+  }
+
+  static func statusText(_ status: Int32) -> String {
+    if status == 0 { return "0" }
+    let value = UInt32(bitPattern: status)
+    let bytes = [
+      UInt8((value >> 24) & 0xff),
+      UInt8((value >> 16) & 0xff),
+      UInt8((value >> 8) & 0xff),
+      UInt8(value & 0xff)
+    ]
+    if bytes.allSatisfy({ $0 >= 32 && $0 < 127 }), let text = String(bytes: bytes, encoding: .ascii) {
+      return "\(status) '\(text)'"
+    }
+    return "\(status)"
+  }
+}
+
 enum CaptureLoopbackClock {
   static let lateWindow = 0.20
   static let lead = 0.050

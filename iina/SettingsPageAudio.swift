@@ -30,9 +30,18 @@ class SettingsPageAudio: SettingsPage {
 
   override func content() -> [SettingsSection] {
     return sections {
+      sectionCaptureSync()
       sectionHardware()
       sectionVolume()
       sectionOther()
+    }
+  }
+
+  private func sectionCaptureSync() -> SettingsSection {
+    let control = CaptureSyncOffsetControl(placement: .settings)
+    return section(label: "Browser capture") {
+      SettingsItem.Custom()
+        .view(control)
     }
   }
 

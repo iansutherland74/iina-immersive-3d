@@ -57,17 +57,38 @@ enum CaptureSystemOutput {
     return uid
   }
 
+  /// Sets the default output and the default system output, then reads both back.
+  /// A `noErr` that did not stick is a failure. The OSStatus and the device ids are logged.
   static func setOutputUID(_ uid: String) -> Bool {
-    guard let id = deviceID(forUID: uid), id != 0 else { return false }
-    var address = AudioObjectPropertyAddress(
-      mSelector: kAudioHardwarePropertyDefaultOutputDevice,
-      mScope: kAudioObjectPropertyScopeGlobal,
-      mElement: kAudioObjectPropertyElementMain
-    )
-    var device = id
-    let size = UInt32(MemoryLayout<AudioDeviceID>.size)
-    let status = AudioObjectSetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, size, &device)
-    return status == noErr
+    let translated = translate(uid)
+    let id = translated.id ?? deviceIDByScanning(uid)
+    guard let id, id != 0 else {
+      let status = CaptureDefaultOutput.statusText(translated.status)
+      browserCaptureLog.error("could not change the default output uid=\(uid, privacy: .public) status=\(status, privacy: .public) device=0")
+      return false
+    }
+    if translated.id == nil {
+      browserCaptureLog.error("TranslateUIDToDevice missed \(uid, privacy: .public) status=\(CaptureDefaultOutput.statusText(translated.status), privacy: .public); using device \(id)")
+    }
+    let selectors: [(AudioObjectPropertySelector, String)] = [
+      (kAudioHardwarePropertyDefaultOutputDevice, "DefaultOutputDevice"),
+      (kAudioHardwarePropertyDefaultSystemOutputDevice, "DefaultSystemOutputDevice")
+    ]
+    var writes: [CaptureDefaultOutput.Write] = []
+    for (selector, name) in selectors {
+      let status = writeSystemDevice(selector, id)
+      let readBack = readSystemDevice(selector)
+      writes.append(CaptureDefaultOutput.Write(status: status, readBack: readBack))
+      if status != noErr || readBack != id {
+        let text = CaptureDefaultOutput.statusText(status)
+        browserCaptureLog.error("could not change the default output uid=\(uid, privacy: .public) device=\(id) \(name, privacy: .public) status=\(text, privacy: .public) readBack=\(readBack)")
+      }
+    }
+    let ok = CaptureDefaultOutput.accepted(deviceID: id, writes: writes)
+    if ok {
+      browserCaptureLog.info("default output is \(uid, privacy: .public) device=\(id)")
+    }
+    return ok
   }
 
   static func firstRealOutputUID() -> String? {
@@ -86,31 +107,64 @@ enum CaptureSystemOutput {
   }
 
   static func deviceID(forUID uid: String) -> AudioDeviceID? {
+    if let id = translate(uid).id { return id }
+    return deviceIDByScanning(uid)
+  }
+
+  /// The qualifier is a CFStringRef. Its size is a pointer, not the Swift class layout.
+  private static func translate(_ uid: String) -> (id: AudioDeviceID?, status: OSStatus) {
     var address = AudioObjectPropertyAddress(
       mSelector: kAudioHardwarePropertyTranslateUIDToDevice,
       mScope: kAudioObjectPropertyScopeGlobal,
       mElement: kAudioObjectPropertyElementMain
     )
-    let name = uid as CFString
+    var name = uid as CFString
     var device = AudioDeviceID(0)
     var size = UInt32(MemoryLayout<AudioDeviceID>.size)
-    let status = withUnsafePointer(to: name) { pointer in
-      AudioObjectGetPropertyData(
-        AudioObjectID(kAudioObjectSystemObject),
-        &address,
-        UInt32(MemoryLayout<CFString>.size),
-        pointer,
-        &size,
-        &device
-      )
-    }
-    guard status == noErr, device != 0 else { return nil }
-    return device
+    let status = AudioObjectGetPropertyData(
+      AudioObjectID(kAudioObjectSystemObject),
+      &address,
+      UInt32(MemoryLayout<UnsafeRawPointer>.size),
+      &name,
+      &size,
+      &device
+    )
+    guard status == noErr, device != 0 else { return (nil, status) }
+    return (device, status)
   }
 
-  private static func defaultOutputID() -> AudioDeviceID {
+  private static func deviceIDByScanning(_ uid: String) -> AudioDeviceID? {
     var address = AudioObjectPropertyAddress(
-      mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+      mSelector: kAudioHardwarePropertyDevices,
+      mScope: kAudioObjectPropertyScopeGlobal,
+      mElement: kAudioObjectPropertyElementMain
+    )
+    var dataSize: UInt32 = 0
+    let system = AudioObjectID(kAudioObjectSystemObject)
+    guard AudioObjectGetPropertyDataSize(system, &address, 0, nil, &dataSize) == noErr, dataSize > 0 else { return nil }
+    let count = Int(dataSize) / MemoryLayout<AudioDeviceID>.size
+    var ids = [AudioDeviceID](repeating: 0, count: count)
+    guard AudioObjectGetPropertyData(system, &address, 0, nil, &dataSize, &ids) == noErr else { return nil }
+    for id in ids where copyString(id, selector: kAudioDevicePropertyDeviceUID) == uid {
+      return id
+    }
+    return nil
+  }
+
+  private static func writeSystemDevice(_ selector: AudioObjectPropertySelector, _ device: AudioDeviceID) -> OSStatus {
+    var address = AudioObjectPropertyAddress(
+      mSelector: selector,
+      mScope: kAudioObjectPropertyScopeGlobal,
+      mElement: kAudioObjectPropertyElementMain
+    )
+    var value = device
+    let size = UInt32(MemoryLayout<AudioDeviceID>.size)
+    return AudioObjectSetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, size, &value)
+  }
+
+  private static func readSystemDevice(_ selector: AudioObjectPropertySelector) -> AudioDeviceID {
+    var address = AudioObjectPropertyAddress(
+      mSelector: selector,
       mScope: kAudioObjectPropertyScopeGlobal,
       mElement: kAudioObjectPropertyElementMain
     )
@@ -118,6 +172,10 @@ enum CaptureSystemOutput {
     var size = UInt32(MemoryLayout<AudioDeviceID>.size)
     AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &device)
     return device
+  }
+
+  private static func defaultOutputID() -> AudioDeviceID {
+    readSystemDevice(kAudioHardwarePropertyDefaultOutputDevice)
   }
 
   private static func devices() -> [(name: String, uid: String)] {
@@ -288,8 +346,11 @@ enum CaptureAudioRouteController {
     lock.unlock()
     guard !plan.effects.isEmpty else { return }
     BrowserCaptureManager.shared.stopRoutedAudio()
-    _ = apply(plan.effects)
-    browserCaptureLog.info("restored the default output after browser capture")
+    if apply(plan.effects) {
+      browserCaptureLog.info("restored the default output after browser capture")
+    } else {
+      browserCaptureLog.error("the default output was not restored after browser capture")
+    }
   }
 
   private static func lockedEngage() -> CaptureOutputRoute.Plan {
@@ -328,7 +389,9 @@ enum CaptureAudioRouteController {
       case .writeCrashFile(let uid):
         CaptureOutputRestoreFile.write(uid)
       case .deleteCrashFile:
-        CaptureOutputRestoreFile.delete()
+        if outputOK {
+          CaptureOutputRestoreFile.delete()
+        }
       case .setMPVDevice(let name):
         guard !PlayerCore.playerCores.isEmpty else { continue }
         for core in PlayerCore.playerCores {
@@ -337,7 +400,6 @@ enum CaptureAudioRouteController {
       case .setSystemOutput(let uid):
         if !CaptureSystemOutput.setOutputUID(uid) {
           outputOK = false
-          browserCaptureLog.error("could not change the default output")
         }
       }
     }
@@ -482,5 +544,98 @@ final class CaptureLoopbackReader {
       }
       onSamples?(buffer, chunk.host)
     }
+  }
+}
+
+/// ±500 ms on top of the measured delay. The same control is used in the capture
+/// window, the glasses panel, and Settings.
+final class CaptureSyncOffsetControl: NSView {
+  enum Placement {
+    case controls
+    case overlay
+    case settings
+  }
+
+  private let placement: Placement
+  private let slider = NSSlider()
+  private let label = NSTextField(labelWithString: "")
+  private var observers: [NSObjectProtocol] = []
+
+  init(placement: Placement) {
+    self.placement = placement
+    super.init(frame: NSRect(x: 0, y: 0, width: 420, height: 28))
+    slider.minValue = Double(CaptureSyncOffset.minMs)
+    slider.maxValue = Double(CaptureSyncOffset.maxMs)
+    slider.isContinuous = true
+    slider.target = self
+    slider.action = #selector(sliderChanged(_:))
+    label.font = .systemFont(ofSize: 12)
+    label.lineBreakMode = .byTruncatingTail
+    label.translatesAutoresizingMaskIntoConstraints = false
+    slider.translatesAutoresizingMaskIntoConstraints = false
+    addSubview(label)
+    addSubview(slider)
+    NSLayoutConstraint.activate([
+      label.leadingAnchor.constraint(equalTo: leadingAnchor),
+      label.centerYAnchor.constraint(equalTo: centerYAnchor),
+      label.widthAnchor.constraint(equalToConstant: 150),
+      slider.leadingAnchor.constraint(equalTo: label.trailingAnchor, constant: 8),
+      slider.trailingAnchor.constraint(equalTo: trailingAnchor),
+      slider.centerYAnchor.constraint(equalTo: centerYAnchor),
+      heightAnchor.constraint(equalToConstant: 28)
+    ])
+    show(BrowserCaptureSettings.shared.syncOffsetMs)
+    applyRoute()
+    let center = NotificationCenter.default
+    observers.append(center.addObserver(forName: CaptureSyncOffset.changedNotification, object: nil, queue: .main) { [weak self] _ in
+      self?.show(BrowserCaptureSettings.shared.syncOffsetMs)
+    })
+    observers.append(center.addObserver(forName: CaptureSyncOffset.routeChangedNotification, object: nil, queue: .main) { [weak self] _ in
+      self?.applyRoute()
+    })
+  }
+
+  required init?(coder: NSCoder) {
+    fatalError("init(coder:) has not been implemented")
+  }
+
+  deinit {
+    for observer in observers {
+      NotificationCenter.default.removeObserver(observer)
+    }
+  }
+
+  override var intrinsicContentSize: NSSize {
+    NSSize(width: 420, height: 28)
+  }
+
+  private func show(_ ms: Int) {
+    let clamped = CaptureSyncOffset.clamp(ms)
+    if Int(slider.doubleValue.rounded()) != clamped {
+      slider.doubleValue = Double(clamped)
+    }
+    label.stringValue = CaptureSyncOffset.label(ms: clamped)
+  }
+
+  private func applyRoute() {
+    let on = BrowserCaptureSettings.shared.wantsAudio
+    switch placement {
+    case .controls:
+      isHidden = false
+      slider.isEnabled = on
+      label.textColor = on ? .labelColor : .secondaryLabelColor
+    case .overlay:
+      isHidden = !on
+      slider.isEnabled = on
+      label.textColor = .labelColor
+    case .settings:
+      isHidden = false
+      slider.isEnabled = true
+      label.textColor = .labelColor
+    }
+  }
+
+  @objc private func sliderChanged(_ sender: NSSlider) {
+    BrowserCaptureSettings.shared.setSyncOffset(ms: Int(sender.doubleValue.rounded()))
   }
 }

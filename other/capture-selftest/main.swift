@@ -221,6 +221,33 @@ private func testCoalescer() {
   check(gate.finishDraw() == 5, "the next draw is the newest frame that arrived")
   check(gate.finishDraw() == nil && !gate.drawing, "an idle draw queue waits")
   check(CaptureLatency.milliseconds(received: 10, presented: 10.042) == 42, "capture latency is the present time minus the copy time")
+  var smooth = CaptureLatencySmooth()
+  let normal = smooth.observe(0.012)
+  check(abs(normal - 0.012) < 0.001, "a 12 ms delay is kept")
+  let spike = smooth.observe(0.575)
+  check(abs(spike - normal) < 0.001, "a 575 ms stall does not move the audio delay")
+  check(abs(smooth.observe(0.181) - normal) < 0.001, "a 181 ms stall does not move the audio delay")
+  check(!CapturePresentBudget.shouldPresent(age: 0.575, newerWaiting: true), "a late frame is dropped when a newer one is waiting")
+  check(!CapturePresentBudget.shouldPresent(age: 0.213, newerWaiting: true), "a 213 ms frame is dropped when a newer one is waiting")
+  check(CapturePresentBudget.shouldPresent(age: 0.012, newerWaiting: true), "a fresh frame is presented")
+  check(CapturePresentBudget.shouldPresent(age: 0.575, newerWaiting: false), "the only frame is still presented")
+}
+
+private func testQuitDuringCapture() {
+  var pool = CaptureDrawableGuard()
+  check(pool.requestResize(), "the first drawable size is applied before any drawable exists")
+  pool.noteDrawable()
+  pool.endSameTurn()
+  pool.noteDrawable()
+  check(!pool.requestResize(), "quit does not resize while the Apple Event pool holds a drawable")
+  check(!pool.appliedOnThisTurn, "that resize is not applied in the quit turn")
+  pool.endSameTurn()
+  check(pool.nextTurn(), "the resize runs on the next turn, after the pool pops")
+  var early = CaptureDrawableGuard()
+  early.noteDrawable()
+  early.endSameTurn()
+  check(!early.requestResize(), "ending a present does not resize in that same turn")
+  check(early.nextTurn(), "the deferred resize runs after the pool pops")
 }
 
 private func testAudioPolicy() {
@@ -308,6 +335,31 @@ private func testRoute() {
   check(CaptureLoopbackClock.decide(chunk: chunk, now: 10, delay: 0.08) == .wait, "loopback waits for the picture")
   check(CaptureLoopbackClock.decide(chunk: chunk, now: 10.08, delay: 0.08) == .play, "loopback plays when the picture catches up")
   check(CaptureLoopbackClock.decide(chunk: chunk, now: 10.40, delay: 0.08) == .drop, "late loopback audio is dropped")
+  check(CaptureSyncOffset.clamp(800) == 500 && CaptureSyncOffset.clamp(-800) == -500, "the sync offset stays inside ±500 ms")
+  check(CaptureSyncOffset.label(ms: 40) == "Audio sync +40 ms", "a positive offset shows a plus")
+  check(CaptureSyncOffset.label(ms: -15) == "Audio sync -15 ms", "a negative offset shows a minus")
+  check(CaptureSyncOffset.label(ms: 0) == "Audio sync 0 ms", "zero offset is labeled")
+  check(abs(CaptureSyncOffset.delay(automatic: 0.020, offsetMs: 40) - 0.060) < 0.0001, "the slider adds to the measured delay")
+  check(abs(CaptureSyncOffset.delay(automatic: 0.020, offsetMs: -500) - (-0.480)) < 0.0001, "a negative offset plays earlier than the measured delay")
+  let early = CaptureLoopbackClock.decide(chunk: CaptureLoopbackClock.Chunk(hostTime: 1, duration: 0.01), now: 1, delay: -0.04)
+  check(early == .play, "a negative sync offset can play as soon as the chunk is due")
+  let matched = [
+    CaptureDefaultOutput.Write(status: 0, readBack: 7),
+    CaptureDefaultOutput.Write(status: 0, readBack: 7)
+  ]
+  check(CaptureDefaultOutput.accepted(deviceID: 7, writes: matched), "both default outputs must read back as the device that was set")
+  let missed = [
+    CaptureDefaultOutput.Write(status: 0, readBack: 7),
+    CaptureDefaultOutput.Write(status: 0, readBack: 4)
+  ]
+  check(!CaptureDefaultOutput.accepted(deviceID: 7, writes: missed), "a read-back that does not match is not success")
+  let failed = [
+    CaptureDefaultOutput.Write(status: 1852797029, readBack: 0),
+    CaptureDefaultOutput.Write(status: 0, readBack: 7)
+  ]
+  check(!CaptureDefaultOutput.accepted(deviceID: 7, writes: failed), "a failed OSStatus is not success")
+  check(CaptureDefaultOutput.statusText(0) == "0", "noErr is logged as 0")
+  check(CaptureDefaultOutput.statusText(1852797029) == "1852797029 'nope'", "the OSStatus fourcc is logged")
 }
 
 private func testContentRect() {
@@ -558,6 +610,7 @@ enum CaptureSelfTest {
     testSession()
     testWindowMatch()
     testCoalescer()
+    testQuitDuringCapture()
     testAudioPolicy()
     testRoute()
     testContentRect()

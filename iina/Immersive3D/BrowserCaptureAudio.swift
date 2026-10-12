@@ -77,6 +77,7 @@ final class BrowserCaptureAudioPlayer {
   private var hostMode = false
   private var haveDelay = false
   private var hostDelay = 0.0
+  private var syncOffsetMs = 0
   private var pinnedUID: String?
   private let lateWindow = 0.20
   private let lead = 0.050
@@ -109,6 +110,15 @@ final class BrowserCaptureAudioPlayer {
       guard let self else { return }
       self.hostDelay = min(max(seconds, 0), 2)
       self.haveDelay = true
+      self.pumpHost()
+    }
+  }
+
+  /// User adjustment, added to the measured delay. Negative plays earlier.
+  func setSyncOffset(ms: Int) {
+    queue.async { [weak self] in
+      guard let self else { return }
+      self.syncOffsetMs = CaptureSyncOffset.clamp(ms)
       self.pumpHost()
     }
   }
@@ -319,7 +329,7 @@ final class BrowserCaptureAudioPlayer {
       switch CaptureLoopbackClock.decide(
         chunk: CaptureLoopbackClock.Chunk(hostTime: first.pts, duration: duration),
         now: now,
-        delay: hostDelay
+        delay: CaptureSyncOffset.delay(automatic: hostDelay, offsetMs: syncOffsetMs)
       ) {
       case .drop:
         pending.removeFirst()

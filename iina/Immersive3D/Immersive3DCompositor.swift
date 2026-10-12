@@ -24,6 +24,7 @@ import OpenGL.GL3
 final class Immersive3DCompositor {
   private let device: MTLDevice?
   private let commandQueue: MTLCommandQueue?
+  var encodeQueue: MTLCommandQueue? { commandQueue }
   private var pipeline: MTLComputePipelineState?
   private var pipelineFailed = false
 
@@ -126,7 +127,8 @@ final class Immersive3DCompositor {
     modelWidth: Int,
     modelHeight: Int,
     fullSizeEyes: Bool?,
-    whenDepthReady: @escaping () -> Void
+    whenDepthReady: @escaping () -> Void,
+    whenGPUFinished: ((Bool) -> Void)? = nil
   ) -> Bool {
     guard !DepthEstimator.shared.isStopped, !pipelineFailed else { return false }
     guard let device, let commandQueue else { return false }
@@ -157,7 +159,8 @@ final class Immersive3DCompositor {
       height: output.height,
       contentAspect: contentAspect,
       glOriented: glOriented,
-      colorIsPicture: !colorIsBottomUp
+      colorIsPicture: !colorIsBottomUp,
+      whenGPUFinished: whenGPUFinished
     ) else { return false }
     failureCount = 0
     return true
@@ -183,6 +186,10 @@ final class Immersive3DCompositor {
     guard delta >= changeThreshold || stale || lastSubmit == .distantPast else { return }
     lastSubmit = now
     DepthEstimator.shared.submit(topDownRGBA: pixels, width: modelWidth, height: modelHeight, token: ObjectIdentifier(self), whenReady: whenDepthReady)
+  }
+
+  func submitCaptureDepth(_ pixels: [UInt8], width: Int, height: Int, whenReady: @escaping () -> Void) {
+    considerDepthPixels(pixels, width: width, height: height, whenDepthReady: whenReady)
   }
 
   private func considerDepthPixels(_ pixels: [UInt8], width: Int, height: Int, whenDepthReady: @escaping () -> Void) {
@@ -261,7 +268,8 @@ final class Immersive3DCompositor {
     height: Int,
     contentAspect: Float,
     glOriented: Bool,
-    colorIsPicture: Bool
+    colorIsPicture: Bool,
+    whenGPUFinished: ((Bool) -> Void)? = nil
   ) -> Bool {
     guard let pipeline, let depthTexture else { return false }
     let content = contentRect(fullSizeEyes: snapshot.fullSizeEyes, width: width, height: height, contentAspect: contentAspect, colorIsPicture: colorIsPicture)
@@ -283,7 +291,8 @@ final class Immersive3DCompositor {
       color: color,
       depth: depthTexture,
       output: output,
-      params: params
+      params: params,
+      completion: whenGPUFinished
     )
     if !wrote {
       log3D("Stereo command buffer failed", level: .error)

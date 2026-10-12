@@ -53,13 +53,17 @@ enum StereoOffscreen {
     return Rect(x: (1 - contentW) * 0.5, y: 0, w: contentW, h: 1)
   }
 
+  /// `completion` is the capture path. The command buffer is committed and the
+  /// caller is not blocked. The player path passes nil and waits, because it
+  /// reads the texture immediately afterwards.
   static func encode(
     commandQueue: MTLCommandQueue,
     pipeline: MTLComputePipelineState,
     color: MTLTexture,
     depth: MTLTexture,
     output: MTLTexture,
-    params: Params
+    params: Params,
+    completion: ((Bool) -> Void)? = nil
   ) -> Bool {
     guard let commandBuffer = commandQueue.makeCommandBuffer(),
           let encoder = commandBuffer.makeComputeCommandEncoder() else { return false }
@@ -74,6 +78,13 @@ enum StereoOffscreen {
       threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1)
     )
     encoder.endEncoding()
+    if let completion {
+      commandBuffer.addCompletedHandler { buffer in
+        completion(buffer.error == nil)
+      }
+      commandBuffer.commit()
+      return true
+    }
     commandBuffer.commit()
     commandBuffer.waitUntilCompleted()
     return commandBuffer.error == nil
