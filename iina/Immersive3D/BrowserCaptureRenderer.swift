@@ -473,13 +473,12 @@ final class BrowserCaptureRenderer: NSView {
 
   private func drainPresent() {
     stageLock.lock()
-    let queued = queuedPresent
-    queuedPresent = nil
-    if queued == nil {
+    guard let queued = queuedPresent else {
       presentScheduled = false
       stageLock.unlock()
       return
     }
+    queuedPresent = nil
     stageLock.unlock()
     present(queued.texture, slot: queued.slot, generation: queued.generation, time: queued.time, received: queued.received)
     stageLock.lock()
