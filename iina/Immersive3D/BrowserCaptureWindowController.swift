@@ -42,6 +42,7 @@ final class BrowserCaptureWindowController: NSWindowController, NSTableViewDataS
   private var toggleItem: NSMenuItem?
   private var glassesItem: NSMenuItem?
   private var audioItem: NSMenuItem?
+  private var uninstallAudioItem: NSMenuItem?
   private var chromeItem: NSMenuItem?
   private var videoItem: NSMenuItem?
 
@@ -109,28 +110,28 @@ final class BrowserCaptureWindowController: NSWindowController, NSTableViewDataS
     let glasses = NSMenuItem(title: "Send Capture to Glasses", action: #selector(toggleGlasses(_:)), keyEquivalent: "")
     glasses.target = self
     glassesItem = glasses
-    let audio = NSMenuItem(title: "Play Capture Audio from Virtual Device", action: #selector(toggleAudioMenu(_:)), keyEquivalent: "")
+    let audio = NSMenuItem(title: CaptureOutputRoute.toggleTitle, action: #selector(toggleAudioMenu(_:)), keyEquivalent: "")
     audio.target = self
     audioItem = audio
+    let uninstall = NSMenuItem(title: "Uninstall IINA Capture Audio…", action: #selector(uninstallCaptureAudio(_:)), keyEquivalent: "")
+    uninstall.target = self
+    uninstallAudioItem = uninstall
     let chrome = NSMenuItem(title: "Crop Window Chrome", action: #selector(cropChromeMenu(_:)), keyEquivalent: "")
     chrome.target = self
     chromeItem = chrome
     let video = NSMenuItem(title: "Detect Video Area", action: #selector(detectVideoMenu(_:)), keyEquivalent: "")
     video.target = self
     videoItem = video
-    return [choose, toggle, glasses, audio, chrome, video]
+    return [choose, toggle, glasses, audio, uninstall, chrome, video]
   }
 
   func syncMenu() {
     toggleItem?.title = manager.isRunning ? "Stop Capture" : "Start Capture"
     glassesItem?.title = onGlasses ? "Stop Sending Capture to Glasses" : "Send Capture to Glasses"
     glassesItem?.isEnabled = manager.isRunning || onGlasses
-    let virtual = audioAvailable && VirtualAudioDevices.anyInstalled()
-    audioItem?.state = virtual && settings.wantsAudio ? .on : .off
-    audioItem?.isEnabled = virtual
-    if !virtual && settings.wantsAudio {
-      settings.setPlayAudio(false)
-    }
+    audioItem?.state = audioAvailable && settings.wantsAudio ? .on : .off
+    audioItem?.isEnabled = audioAvailable
+    uninstallAudioItem?.isEnabled = CaptureSystemOutput.ourDeviceInstalled()
     let mode = settings.cropMode
     chromeItem?.state = mode == .autoChrome ? .on : .off
     videoItem?.state = mode == .videoArea ? .on : .off
@@ -236,11 +237,26 @@ final class BrowserCaptureWindowController: NSWindowController, NSTableViewDataS
   }
 
   @objc func toggleAudioMenu(_ sender: Any?) {
-    guard audioAvailable, VirtualAudioDevices.anyInstalled() else { return }
-    settings.setPlayAudio(!settings.wantsAudio)
+    setRouteEnabled(!settings.wantsAudio)
+  }
+
+  @objc func uninstallCaptureAudio(_ sender: Any?) {
+    guard CaptureSystemOutput.ourDeviceInstalled() else {
+      setStatus("IINA Capture Audio is not installed.")
+      return
+    }
+    settings.setPlayAudio(false)
+    if manager.isRunning {
+      manager.stopRoutedAudio()
+      CaptureAudioRouteController.end()
+    }
+    if CaptureAudioInstaller.uninstall() {
+      setStatus("IINA Capture Audio was removed. Sound stays in the other app.")
+    } else {
+      setStatus("IINA Capture Audio was not removed.")
+    }
     reflectSettings()
     syncMenu()
-    restartIfRunning()
   }
 
   @objc func cropChromeMenu(_ sender: Any?) {
@@ -297,14 +313,15 @@ final class BrowserCaptureWindowController: NSWindowController, NSTableViewDataS
     scroll.hasVerticalScroller = true
     self.table = table
 
-    let audio = NSButton(checkboxWithTitle: "Play capture audio from a virtual device", target: self, action: #selector(audioCheckboxChanged(_:)))
+    let audio = NSButton(checkboxWithTitle: CaptureOutputRoute.toggleTitle, target: self, action: #selector(audioCheckboxChanged(_:)))
     audio.frame = NSRect(x: 20, y: 326, width: 520, height: 22)
+    audio.font = .systemFont(ofSize: 12)
     audioCheckbox = audio
 
     let hint = NSTextField(wrappingLabelWithString: hintText())
     hint.font = .systemFont(ofSize: 11)
     hint.textColor = .secondaryLabelColor
-    hint.frame = NSRect(x: 20, y: 284, width: 520, height: 36)
+    hint.frame = NSRect(x: 20, y: 280, width: 520, height: 44)
     hintLabel = hint
 
     let segments = NSSegmentedControl(labels: ["Crop chrome", "Video area", "Manual"], trackingMode: .selectOne, target: self, action: #selector(cropModeChanged(_:)))
@@ -352,14 +369,50 @@ final class BrowserCaptureWindowController: NSWindowController, NSTableViewDataS
   }
 
   @objc private func audioCheckboxChanged(_ sender: NSButton) {
-    guard audioAvailable, VirtualAudioDevices.anyInstalled() else {
-      sender.state = .off
+    setRouteEnabled(sender.state == .on)
+  }
+
+  private func setRouteEnabled(_ on: Bool) {
+    guard audioAvailable else {
       settings.setPlayAudio(false)
+      reflectSettings()
+      syncMenu()
       return
     }
-    settings.setPlayAudio(sender.state == .on)
+    if !on {
+      settings.setPlayAudio(false)
+      manager.stopRoutedAudio()
+      CaptureAudioRouteController.end()
+      reflectSettings()
+      syncMenu()
+      setStatus("Sound stays in the other app.")
+      return
+    }
+    guard ensureCaptureDevice() else {
+      settings.setPlayAudio(false)
+      reflectSettings()
+      syncMenu()
+      setStatus("IINA Capture Audio was not installed. Sound stays in the other app.")
+      return
+    }
+    settings.setPlayAudio(true)
+    reflectSettings()
     syncMenu()
-    restartIfRunning()
+    guard manager.isRunning else { return }
+    switch CaptureAudioRouteController.beginIfEnabled() {
+    case .routed, .already:
+      setStatus("Browser sound is playing through IINA, in time with the picture.")
+    case .refused:
+      settings.setPlayAudio(false)
+      reflectSettings()
+      syncMenu()
+      setStatus("Browser sound stayed in the other app because the previous output could not be saved.")
+    }
+  }
+
+  private func ensureCaptureDevice() -> Bool {
+    if CaptureSystemOutput.ourDeviceInstalled() { return true }
+    return CaptureAudioInstaller.install()
   }
 
   @objc private func cropModeChanged(_ sender: NSSegmentedControl) {
@@ -427,6 +480,15 @@ final class BrowserCaptureWindowController: NSWindowController, NSTableViewDataS
       do {
         try await self?.manager.start(target, excluding: excluded)
         DispatchQueue.main.async {
+          if self?.settings.wantsAudio == true {
+            if self?.ensureCaptureDevice() == true {
+              if case .refused = CaptureAudioRouteController.beginIfEnabled() {
+                self?.settings.setPlayAudio(false)
+              }
+            } else {
+              self?.settings.setPlayAudio(false)
+            }
+          }
           self?.syncMenu()
           self?.setStatus(self?.captureStatus() ?? "Capturing.")
           self?.window?.orderOut(nil)
@@ -453,28 +515,24 @@ final class BrowserCaptureWindowController: NSWindowController, NSTableViewDataS
     if !audioAvailable {
       return "Capturing. Window audio needs macOS 13, so sound stays in the other app."
     }
-    if !settings.wantsAudio || !VirtualAudioDevices.anyInstalled() {
+    if !settings.wantsAudio || !CaptureSystemOutput.ourDeviceInstalled() {
       return "Capturing. Sound stays in the other app."
     }
-    return "Capturing. Playing audio from the virtual device, in time with the picture."
+    return "Capturing. Browser sound is playing through IINA, in time with the picture."
   }
 
   private func hintText() -> String {
     if !audioAvailable {
-      return "Sound stays in the other app. Window audio capture needs macOS 13."
+      return "Sound stays in the other app. Routing it through IINA needs macOS 13."
     }
-    if !VirtualAudioDevices.anyInstalled() {
-      return "Sound stays in the other app. Muting it would also mute the capture, and macOS cannot silence that app's speakers while still capturing its audio."
-    }
-    return "Only if that app's output is a virtual device such as BlackHole. IINA then plays it in time with the picture. Otherwise leave this off and listen to the app itself."
+    return "Plays the browser through IINA, delayed to match the picture. macOS asks once to install IINA Capture Audio. While a capture is running, other apps use that silent device too. Stopping capture puts the previous output back. Leave this off to hear the browser itself."
   }
 
   private func reflectSettings() {
     suppressControls = true
-    let virtual = audioAvailable && VirtualAudioDevices.anyInstalled()
-    audioCheckbox?.state = virtual && settings.wantsAudio ? .on : .off
-    audioCheckbox?.isEnabled = virtual
-    audioCheckbox?.isHidden = !virtual
+    audioCheckbox?.state = audioAvailable && settings.wantsAudio ? .on : .off
+    audioCheckbox?.isEnabled = audioAvailable
+    audioCheckbox?.isHidden = false
     hintLabel?.stringValue = hintText()
     cropSegments?.selectedSegment = settings.cropMode.rawValue
     let insets = settings.appliedInsets()

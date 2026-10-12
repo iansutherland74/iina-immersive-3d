@@ -593,8 +593,9 @@ final class BrowserCaptureRenderer: NSView {
 
   private func reportLatency(_ received: CFTimeInterval) {
     guard received > 0 else { return }
-    let ms = CaptureLatency.milliseconds(received: received, presented: CACurrentMediaTime())
     let now = CACurrentMediaTime()
+    BrowserCaptureManager.shared.noteCaptureLatency(now - received)
+    let ms = CaptureLatency.milliseconds(received: received, presented: now)
     if now - lastLatencyLog < 1 { return }
     lastLatencyLog = now
     browserCaptureLog.info("capture latency \(ms) ms")

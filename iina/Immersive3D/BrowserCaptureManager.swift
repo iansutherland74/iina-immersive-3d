@@ -67,6 +67,8 @@ final class BrowserCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
   private let queue = DispatchQueue(label: "com.colliderli.iina.browser-capture", qos: .userInteractive)
   private let audioQueue = DispatchQueue(label: "com.colliderli.iina.browser-capture-audio-in", qos: .userInteractive)
   private let audioPlayer = BrowserCaptureAudioPlayer()
+  private let loopback = CaptureLoopbackReader()
+  private var routedAudio = false
   private let sessionLock = NSLock()
   private var stream: SCStream?
   private var configuration: SCStreamConfiguration?
@@ -166,8 +168,35 @@ final class BrowserCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
   var isRunning: Bool { running }
 
   func notePresentedVideo(_ time: CMTime) {
-    guard audioActive else { return }
+    guard audioActive, !routedAudio else { return }
     audioPlayer.notePresentedVideo(time)
+  }
+
+  func noteCaptureLatency(_ seconds: Double) {
+    guard routedAudio else { return }
+    audioPlayer.setHostDelay(seconds)
+  }
+
+  @discardableResult
+  func startRoutedAudio(realUID: String) -> Bool {
+    loopback.onSamples = { [weak self] buffer, host in
+      self?.audioPlayer.consumeHostClock(buffer, hostTime: host)
+    }
+    audioPlayer.beginHostClock(pinnedUID: realUID)
+    guard loopback.start() else {
+      audioPlayer.stop()
+      routedAudio = false
+      browserCaptureLog.error("IINA Capture Audio did not start")
+      return false
+    }
+    routedAudio = true
+    return true
+  }
+
+  func stopRoutedAudio() {
+    loopback.stop()
+    audioPlayer.stop()
+    routedAudio = false
   }
 
   func perform(_ block: @escaping () -> Void) {
@@ -243,10 +272,11 @@ final class BrowserCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
     configuration.queueDepth = 3
     var captureAudio = false
     if #available(macOS 13.0, *) {
-      let virtual = VirtualAudioDevices.anyInstalled()
+      // The loopback is the only played copy. ScreenCaptureKit audio would be
+      // a second one, so it stays off while the route is on and while it is off.
       captureAudio = CaptureAudioPolicy.shouldCaptureAudio(
         userEnabled: BrowserCaptureSettings.shared.wantsAudio,
-        virtualDevicePresent: virtual
+        virtualDevicePresent: CaptureSystemOutput.ourDeviceInstalled()
       )
       configuration.capturesAudio = captureAudio
       configuration.minimumFrameInterval = CMTime(value: 1, timescale: 30)
@@ -316,9 +346,6 @@ final class BrowserCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
     audioActive = captureAudio
     armFollow()
     armRedraw()
-    if captureAudio {
-      audioPlayer.start()
-    }
     if let audioProblem {
       let note = onNote
       DispatchQueue.main.async {
@@ -340,7 +367,17 @@ final class BrowserCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
     redrawTimer?.cancel()
     redrawTimer = nil
     audioPlayer.setSourceMuteActive(false)
-    audioPlayer.stop()
+    if clearTarget {
+      let restore = {
+        CaptureAudioRouteController.end()
+      }
+      if Thread.isMainThread {
+        restore()
+      } else {
+        DispatchQueue.main.sync(execute: restore)
+      }
+      stopRoutedAudio()
+    }
     if #available(macOS 14.2, *) {
       BrowserCaptureSourceMute.shared.stop()
     }

@@ -134,6 +134,10 @@ jobs:
         working-directory: iina
         run: bash other/browser-capture-selftest.sh
 
+      - name: Build IINA Capture Audio
+        working-directory: iina
+        run: bash other/iina-capture-audio/build.sh
+
       - name: Download mpv libraries, yt-dlp, and build whisper.cpp
         working-directory: iina
         env:
@@ -180,6 +184,19 @@ jobs:
           set -euo pipefail
           app="build/Build/Products/Release/IINA.app"
           test -d "$app"
+          driver="other/iina-capture-audio/build/IINACaptureAudio.driver"
+          test -d "$driver"
+          rm -rf "$app/Contents/Resources/IINACaptureAudio.driver"
+          cp -R "$driver" "$app/Contents/Resources/IINACaptureAudio.driver"
+          codesign --force --sign - "$app/Contents/Resources/IINACaptureAudio.driver"
+          entitlements="$(mktemp)"
+          if codesign -d --entitlements "$entitlements" --xml "$app" 2>/dev/null && [[ -s "$entitlements" ]]; then
+            codesign --force --sign - --entitlements "$entitlements" "$app"
+          else
+            codesign --force --sign - "$app"
+          fi
+          rm -f "$entitlements"
+          test -d "$app/Contents/Resources/IINACaptureAudio.driver"
           bin="$app/Contents/MacOS/IINA"
           echo "==== codesign ===="
           codesign -dv --verbose=4 "$app" 2>&1 || true

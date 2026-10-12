@@ -733,6 +733,7 @@ final class Immersive3DController: NSObject, NSWindowDelegate {
     pendingDisplayID = nil
     captureWindowPinned = false
     stopObservingScreenParameters()
+    CaptureAudioRouteController.end()
     if #available(macOS 12.3, *) {
       BrowserCaptureWindowController.shared.stopAll()
     }

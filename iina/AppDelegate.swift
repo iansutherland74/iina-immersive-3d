@@ -360,6 +360,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
 
   func applicationDidFinishLaunching(_ aNotification: Notification) {
     Logger.log("App launched")
+    // A capture that died left the system output on IINA Capture Audio.
+    // Put the saved device back before mpv opens anything.
+    CaptureAudioRouteController.recoverIfNeeded()
 
     if !isReady {
       getReady()

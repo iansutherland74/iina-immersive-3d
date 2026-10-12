@@ -13,11 +13,18 @@
 import Foundation
 
 enum CaptureAudioPolicy {
-  /// IINA plays captured audio only when the user asked and a virtual output
-  /// device is installed for the browser to use. Mute is not an input: it would
-  /// remove the same samples the capture needs.
+  /// ScreenCaptureKit hears the same mix the speakers play. Playing it in IINA
+  /// while the browser still plays is an echo, and muting the browser silences
+  /// that capture. The bundled loopback is the copy that gets played, so this
+  /// stays off even when the user asked for sound.
   static func shouldCaptureAudio(userEnabled: Bool, virtualDevicePresent: Bool) -> Bool {
-    userEnabled && virtualDevicePresent
+    _ = userEnabled
+    _ = virtualDevicePresent
+    return false
+  }
+
+  static func shouldRouteLoopback(userEnabled: Bool, deviceInstalled: Bool) -> Bool {
+    userEnabled && deviceInstalled
   }
 
   static func looksVirtual(name: String, uid: String) -> Bool {
@@ -30,7 +37,9 @@ enum CaptureAudioPolicy {
       "vb-cable",
       "vbcable",
       "zoom audio",
-      "background music"
+      "background music",
+      "iina capture audio",
+      "iinacaptureaudio"
     ]
     return markers.contains { haystack.contains($0) }
   }

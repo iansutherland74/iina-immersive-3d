@@ -6,13 +6,11 @@
 //  Based on IINA, Copyright (C) 2017-2026 Collider LI and contributors.
 //  Licensed under the GNU General Public License, version 3.
 //
-//  Plays ScreenCaptureKit audio through AVAudioEngine on the player's Core Audio
-//  device, following mpv volume and mute. Video is late because of the depth
-//  pass, so samples wait until the picture on screen reaches their timestamp.
-//
-//  This stays off unless a virtual output device is installed and the user opts
-//  in. Muting Chrome silences the samples ScreenCaptureKit can read, and macOS 13
-//  cannot capture another app's audio while also silencing that app's speakers.
+//  Plays loopback samples through AVAudioEngine on the real Core Audio device,
+//  following mpv volume and mute. The samples wait for the measured capture
+//  latency so they line up with the picture. ScreenCaptureKit audio stays off:
+//  muting the browser silences that capture, and playing it while the browser
+//  still speaks is an echo.
 
 import AVFoundation
 import AudioToolbox
@@ -49,57 +47,6 @@ enum BrowserCaptureAudioRouteReader {
   }
 }
 
-enum VirtualAudioDevices {
-  static func anyInstalled() -> Bool {
-    outputDevices().contains { CaptureAudioPolicy.looksVirtual(name: $0.name, uid: $0.uid) }
-  }
-
-  private static func outputDevices() -> [(name: String, uid: String)] {
-    var address = AudioObjectPropertyAddress(
-      mSelector: kAudioHardwarePropertyDevices,
-      mScope: kAudioObjectPropertyScopeGlobal,
-      mElement: kAudioObjectPropertyElementMain
-    )
-    var dataSize: UInt32 = 0
-    let system = AudioObjectID(kAudioObjectSystemObject)
-    guard AudioObjectGetPropertyDataSize(system, &address, 0, nil, &dataSize) == noErr, dataSize > 0 else { return [] }
-    let count = Int(dataSize) / MemoryLayout<AudioDeviceID>.size
-    var devices = [AudioDeviceID](repeating: 0, count: count)
-    guard AudioObjectGetPropertyData(system, &address, 0, nil, &dataSize, &devices) == noErr else { return [] }
-    return devices.compactMap { device in
-      guard hasOutputStream(device),
-            let name = copyString(device, selector: kAudioDevicePropertyDeviceNameCFString),
-            let uid = copyString(device, selector: kAudioDevicePropertyDeviceUID) else { return nil }
-      return (name, uid)
-    }
-  }
-
-  private static func hasOutputStream(_ device: AudioDeviceID) -> Bool {
-    var address = AudioObjectPropertyAddress(
-      mSelector: kAudioDevicePropertyStreams,
-      mScope: kAudioDevicePropertyScopeOutput,
-      mElement: kAudioObjectPropertyElementMain
-    )
-    var size: UInt32 = 0
-    guard AudioObjectGetPropertyDataSize(device, &address, 0, nil, &size) == noErr else { return false }
-    return size >= UInt32(MemoryLayout<AudioStreamID>.size)
-  }
-
-  /// Device name and UID are +1 CFStrings. The buffer is one pointer, matching `uid(of:)`.
-  private static func copyString(_ device: AudioDeviceID, selector: AudioObjectPropertySelector) -> String? {
-    var address = AudioObjectPropertyAddress(
-      mSelector: selector,
-      mScope: kAudioObjectPropertyScopeGlobal,
-      mElement: kAudioObjectPropertyElementMain
-    )
-    var name: Unmanaged<CFString>?
-    var size = UInt32(MemoryLayout<UnsafeRawPointer?>.size)
-    let status = AudioObjectGetPropertyData(device, &address, 0, nil, &size, &name)
-    guard status == noErr, let name else { return nil }
-    return name.takeRetainedValue() as String
-  }
-}
-
 /// PCM playback synced to the captured picture.
 final class BrowserCaptureAudioPlayer {
   var onNote: ((String) -> Void)?
@@ -127,6 +74,10 @@ final class BrowserCaptureAudioPlayer {
   private var announcedTap = false
   private var announcedSilence = false
   private var muteActive = false
+  private var hostMode = false
+  private var haveDelay = false
+  private var hostDelay = 0.0
+  private var pinnedUID: String?
   private let lateWindow = 0.20
   private let lead = 0.050
 
@@ -140,16 +91,52 @@ final class BrowserCaptureAudioPlayer {
     }
   }
 
+  /// Loopback samples are stamped with the host clock and wait for the measured
+  /// picture delay. `pinnedUID` is the real output, never the system default.
+  func beginHostClock(pinnedUID: String) {
+    queue.async { [weak self] in
+      guard let self else { return }
+      self.startOnQueue()
+      self.pinnedUID = pinnedUID
+      self.hostMode = true
+      self.haveDelay = false
+      self.hostDelay = 0
+    }
+  }
+
+  func setHostDelay(_ seconds: Double) {
+    queue.async { [weak self] in
+      guard let self else { return }
+      self.hostDelay = min(max(seconds, 0), 2)
+      self.haveDelay = true
+      self.pumpHost()
+    }
+  }
+
+  func consumeHostClock(_ buffer: AVAudioPCMBuffer, hostTime: Double) {
+    queue.async { [weak self] in
+      guard let self, self.started, self.hostMode, let converted = self.convert(buffer) else { return }
+      self.pending.append((hostTime, converted))
+      while self.pending.count > 48 {
+        self.pending.removeFirst()
+      }
+      self.pumpHost()
+    }
+  }
+
   func stop() {
     // queue.sync from the main thread blocks the run loop for the whole audio teardown.
+    let work = { [weak self] in
+      guard let self else { return }
+      self.hostMode = false
+      self.pinnedUID = nil
+      self.haveDelay = false
+      self.stopOnQueue()
+    }
     if Thread.isMainThread {
-      queue.async { [weak self] in
-        self?.stopOnQueue()
-      }
+      queue.async(execute: work)
     } else {
-      queue.sync { [weak self] in
-        self?.stopOnQueue()
-      }
+      queue.sync(execute: work)
     }
   }
 
@@ -187,6 +174,9 @@ final class BrowserCaptureAudioPlayer {
 
   private func startOnQueue() {
     stopOnQueue()
+    hostMode = false
+    haveDelay = false
+    pinnedUID = nil
     started = true
     playingTap = false
     announcedTap = false
@@ -235,13 +225,16 @@ final class BrowserCaptureAudioPlayer {
     timer.schedule(deadline: .now() + 0.02, repeating: 0.02)
     timer.setEventHandler { [weak self] in
       self?.drainTap()
+      if self?.hostMode == true {
+        self?.pumpHost()
+      }
     }
     drainTimer = timer
     timer.resume()
   }
 
   private func noteVideo(_ seconds: Double) {
-    guard started else { return }
+    guard started, !hostMode else { return }
     if let videoPTS, seconds + 0.5 < videoPTS {
       pending.removeAll()
       queuedUntil = 0
@@ -318,6 +311,27 @@ final class BrowserCaptureAudioPlayer {
     return CACurrentMediaTime() - captureSilentSince > 0.8
   }
 
+  private func pumpHost() {
+    guard started, hostMode, haveDelay else { return }
+    let now = CACurrentMediaTime()
+    while let first = pending.first {
+      let duration = Double(first.buffer.frameLength) / targetFormat.sampleRate
+      switch CaptureLoopbackClock.decide(
+        chunk: CaptureLoopbackClock.Chunk(hostTime: first.pts, duration: duration),
+        now: now,
+        delay: hostDelay
+      ) {
+      case .drop:
+        pending.removeFirst()
+      case .wait:
+        return
+      case .play:
+        pending.removeFirst()
+        schedule(first.buffer)
+      }
+    }
+  }
+
   private func pump() {
     guard let videoPTS else { return }
     let horizon = videoPTS + lead
@@ -350,11 +364,18 @@ final class BrowserCaptureAudioPlayer {
 
   @discardableResult
   private func ensureEngine() -> Bool {
+    if let pinnedUID, Self.deviceID(forUID: pinnedUID) == nil {
+      return false
+    }
     if !connected {
       engine.attach(node)
       engine.connect(node, to: engine.mainMixerNode, format: targetFormat)
       connected = true
       applyDevice(force: true)
+    }
+    if let pinnedUID, appliedUID != pinnedUID {
+      applyDevice(force: true)
+      guard appliedUID == pinnedUID else { return false }
     }
     let gain = route.muted ? Float(0) : min(max(route.volume, 0), 1)
     engine.mainMixerNode.outputVolume = gain
@@ -380,8 +401,17 @@ final class BrowserCaptureAudioPlayer {
   }
 
   private func applyDevice(force: Bool) {
-    let uid = route.deviceUID
-    let device = uid.flatMap { Self.deviceID(forUID: $0) } ?? Self.defaultOutputDevice()
+    let uid = pinnedUID ?? route.deviceUID
+    let device: AudioDeviceID
+    if let uid, let id = Self.deviceID(forUID: uid) {
+      device = id
+    } else if pinnedUID != nil {
+      // The system default is the loopback while a capture is routed. Playing
+      // there would feed IINA back into the buffer it is reading.
+      return
+    } else {
+      device = Self.defaultOutputDevice()
+    }
     if !force && device == appliedDevice && uid == appliedUID { return }
     let wasRunning = engine.isRunning
     if wasRunning {

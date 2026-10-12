@@ -58,7 +58,6 @@ final class BrowserCaptureSettings {
   var onDetected: ((BrowserCaptureInsets) -> Void)?
 
   private let lock = NSLock()
-  private var playAudio = false
   private var muteSource = false
   private var mode: BrowserCaptureCropMode = .autoChrome
   private var manual = BrowserCaptureInsets.zero
@@ -68,9 +67,7 @@ final class BrowserCaptureSettings {
   private init() {}
 
   func setPlayAudio(_ on: Bool) {
-    lock.lock()
-    playAudio = on
-    lock.unlock()
+    UserDefaults.standard.set(on, forKey: CaptureOutputRoute.defaultsKey)
   }
 
   func setMuteSource(_ on: Bool) {
@@ -96,9 +93,7 @@ final class BrowserCaptureSettings {
   }
 
   var wantsAudio: Bool {
-    lock.lock()
-    defer { lock.unlock() }
-    return playAudio
+    UserDefaults.standard.bool(forKey: CaptureOutputRoute.defaultsKey)
   }
 
   var wantsMute: Bool {

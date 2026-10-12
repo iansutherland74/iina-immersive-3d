@@ -224,11 +224,90 @@ private func testCoalescer() {
 }
 
 private func testAudioPolicy() {
-  check(!CaptureAudioPolicy.shouldCaptureAudio(userEnabled: false, virtualDevicePresent: true), "captured audio stays off unless the user asks")
-  check(!CaptureAudioPolicy.shouldCaptureAudio(userEnabled: true, virtualDevicePresent: false), "captured audio stays off without a virtual device")
-  check(CaptureAudioPolicy.shouldCaptureAudio(userEnabled: true, virtualDevicePresent: true), "a virtual device can play captured audio")
+  check(!CaptureAudioPolicy.shouldCaptureAudio(userEnabled: false, virtualDevicePresent: true), "ScreenCaptureKit audio stays off")
+  check(!CaptureAudioPolicy.shouldCaptureAudio(userEnabled: true, virtualDevicePresent: true), "ScreenCaptureKit audio stays off so the loopback is the only copy")
+  check(!CaptureAudioPolicy.shouldRouteLoopback(userEnabled: false, deviceInstalled: true), "the loopback stays off when the toggle is off")
+  check(!CaptureAudioPolicy.shouldRouteLoopback(userEnabled: true, deviceInstalled: false), "the loopback stays off until the device is installed")
+  check(CaptureAudioPolicy.shouldRouteLoopback(userEnabled: true, deviceInstalled: true), "the loopback runs when the toggle is on and the device is installed")
   check(CaptureAudioPolicy.looksVirtual(name: "BlackHole 2ch", uid: "BlackHole2ch_UID"), "BlackHole is a virtual device")
+  check(CaptureAudioPolicy.looksVirtual(name: "IINA Capture Audio", uid: "IINACaptureAudio_UID"), "the bundled device is virtual")
   check(!CaptureAudioPolicy.looksVirtual(name: "MacBook Pro Speakers", uid: "BuiltInSpeakerDevice"), "the built-in speakers are not a virtual device")
+}
+
+private func testRoute() {
+  let speakers = CaptureOutputRoute.Snapshot(outputUID: "BuiltInSpeakerDevice", mpvDevice: "auto")
+  var state = CaptureOutputRoute.State()
+  let off = CaptureOutputRoute.engage(state: state, capturing: true, enabled: false, installed: true, current: speakers, fallbackRealUID: nil)
+  check(off.effects.isEmpty && off.state.phase == .idle, "the toggle off does not change the output")
+  let idle = CaptureOutputRoute.engage(state: state, capturing: false, enabled: true, installed: true, current: speakers, fallbackRealUID: nil)
+  check(idle.effects.isEmpty, "the toggle does nothing until a capture is running")
+  let missing = CaptureOutputRoute.engage(state: state, capturing: true, enabled: true, installed: false, current: speakers, fallbackRealUID: nil)
+  check(missing.effects.isEmpty, "a missing device does not change the output")
+  let on = CaptureOutputRoute.engage(state: state, capturing: true, enabled: true, installed: true, current: speakers, fallbackRealUID: nil)
+  check(on.began == .routed, "capture routes the browser")
+  check(on.effects == [
+    .writeCrashFile("BuiltInSpeakerDevice"),
+    .setMPVDevice("coreaudio/BuiltInSpeakerDevice"),
+    .setSystemOutput(CaptureOutputRoute.virtualUID)
+  ], "the player is pinned before the system output changes")
+  state = on.state
+  let again = CaptureOutputRoute.engage(state: state, capturing: true, enabled: true, installed: true, current: speakers, fallbackRealUID: nil)
+  check(again.effects.isEmpty && again.began == .already, "a second start does not forget the saved output")
+  let stopped = CaptureOutputRoute.end(state: state)
+  check(stopped.effects == [
+    .setSystemOutput("BuiltInSpeakerDevice"),
+    .setMPVDevice("auto"),
+    .deleteCrashFile
+  ], "stopping restores the output and the player device")
+  check(stopped.state.crashUID == nil, "the route is idle after restore")
+  let recovered = CaptureOutputRoute.recover(state: CaptureOutputRoute.State(crashUID: "BuiltInSpeakerDevice"))
+  check(recovered.effects == [
+    .setSystemOutput("BuiltInSpeakerDevice"),
+    .deleteCrashFile
+  ], "launch restores the output saved before a crash")
+  let virtualNow = CaptureOutputRoute.Snapshot(outputUID: CaptureOutputRoute.virtualUID, mpvDevice: "auto")
+  let resume = CaptureOutputRoute.engage(
+    state: CaptureOutputRoute.State(crashUID: "BuiltInSpeakerDevice"),
+    capturing: true,
+    enabled: true,
+    installed: true,
+    current: virtualNow,
+    fallbackRealUID: "Headphones"
+  )
+  if case .routed(let saved, _) = resume.state.phase {
+    check(saved.outputUID == "BuiltInSpeakerDevice", "the saved speakers are kept, not the virtual device")
+  } else {
+    check(false, "the saved speakers are kept, not the virtual device")
+  }
+  check(resume.effects.first == .writeCrashFile("BuiltInSpeakerDevice"), "the crash file is written before the switch")
+  let fallback = CaptureOutputRoute.engage(
+    state: CaptureOutputRoute.State(),
+    capturing: true,
+    enabled: true,
+    installed: true,
+    current: virtualNow,
+    fallbackRealUID: "Headphones"
+  )
+  if case .routed(let saved, _) = fallback.state.phase {
+    check(saved.outputUID == "Headphones", "a real device is used when the default is already virtual")
+  } else {
+    check(false, "a real device is used when the default is already virtual")
+  }
+  let stuck = CaptureOutputRoute.engage(
+    state: CaptureOutputRoute.State(),
+    capturing: true,
+    enabled: true,
+    installed: true,
+    current: virtualNow,
+    fallbackRealUID: nil
+  )
+  check(stuck.effects.isEmpty, "there is no switch when every device is the virtual one")
+  let quiet = CaptureOutputRoute.end(state: CaptureOutputRoute.State())
+  check(quiet.effects.isEmpty, "stopping when nothing was routed does not touch the output")
+  let chunk = CaptureLoopbackClock.Chunk(hostTime: 10, duration: 0.02)
+  check(CaptureLoopbackClock.decide(chunk: chunk, now: 10, delay: 0.08) == .wait, "loopback waits for the picture")
+  check(CaptureLoopbackClock.decide(chunk: chunk, now: 10.08, delay: 0.08) == .play, "loopback plays when the picture catches up")
+  check(CaptureLoopbackClock.decide(chunk: chunk, now: 10.40, delay: 0.08) == .drop, "late loopback audio is dropped")
 }
 
 private func testContentRect() {
@@ -480,6 +559,7 @@ enum CaptureSelfTest {
     testWindowMatch()
     testCoalescer()
     testAudioPolicy()
+    testRoute()
     testContentRect()
     let zombies = ProcessInfo.processInfo.environment["CAPTURE_ZOMBIES"] == "1"
     if !zombies {
