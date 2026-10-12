@@ -645,9 +645,10 @@ final class BrowserCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
     let received = latestReceived
     latestOwned = nil
     frameLock.unlock()
-    let done = { [weak self] in
-      self?.drawQueue.async {
-        self?.drainFrames()
+    let done: () -> Void = { [weak self] in
+      guard let self else { return }
+      self.drawQueue.async {
+        self.drainFrames()
       }
     }
     if let onFrame {
