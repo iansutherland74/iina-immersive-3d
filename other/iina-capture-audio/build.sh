@@ -11,11 +11,18 @@ rm -rf "$root/build"
 mkdir -p "$stage/MacOS"
 cp "$root/Info.plist" "$stage/Info.plist"
 
+# Minimum OS is 12.0, which is <= 13.0. macOS 13.7.8 loads that binary.
+# unguarded-availability is an error so a newer SDK cannot slip in an
+# API that Ventura's coreaudiod does not have.
 clang -bundle \
   -arch arm64 \
   -isysroot "$sdk" \
   -mmacosx-version-min=12.0 \
   -fvisibility=hidden \
+  -Wall -Wextra -Werror \
+  -Werror=unguarded-availability \
+  -Werror=unguarded-availability-new \
+  -Werror=deprecated-declarations \
   -Wl,-exported_symbol,_IINACaptureAudio_Create \
   -framework CoreAudio \
   -framework CoreFoundation \

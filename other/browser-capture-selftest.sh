@@ -16,6 +16,7 @@ cc -Wall -Wextra -Werror -I "$root/other/iina-capture-audio" \
   "$root/other/iina-capture-audio/ring.c" \
   "$root/other/iina-capture-audio/ring-selftest.c"
 "$work/ring-selftest"
+bash "$root/other/check-macho-minos.sh" --self-test
 
 xcrun -sdk macosx metal -c "$root/iina/Immersive3D/Immersive3D.metal" -o "$work/immersive.air"
 xcrun -sdk macosx metallib "$work/immersive.air" -o "$work/immersive.metallib"

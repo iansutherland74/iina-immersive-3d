@@ -22,8 +22,25 @@
 #include <mach/mach_time.h>
 #include <math.h>
 #include <pthread.h>
+#include <stddef.h>
 #include <stdbool.h>
 #include <string.h>
+
+/* coreaudiod on macOS 13.7 uses the AudioServerPlugIn from the 13.3 SDK.
+   These sizes and offsets were measured there and are unchanged in the
+   26.5 and 27.0 SDKs. A newer SDK that moves this layout must not ship. */
+_Static_assert(sizeof(AudioServerPlugInDriverInterface) == 184,
+               "AudioServerPlugIn vtable does not match macOS 13.7");
+_Static_assert(offsetof(AudioServerPlugInDriverInterface, QueryInterface) == sizeof(void *),
+               "driver vtable does not start with the macOS 13.7 IUnknown slot");
+_Static_assert(sizeof(AudioServerPlugInIOCycleInfo) == 224,
+               "AudioServerPlugInIOCycleInfo does not match macOS 13.7");
+_Static_assert(offsetof(AudioServerPlugInIOCycleInfo, mOutputTime) == 144,
+               "mOutputTime moved; macOS 13.7 coreaudiod would be misread");
+_Static_assert(offsetof(AudioServerPlugInIOCycleInfo, mDeviceHostTicksPerFrame) == 216,
+               "IO cycle tail does not match macOS 13.7");
+_Static_assert(sizeof(AudioServerPlugInClientInfo) == 24,
+               "AudioServerPlugInClientInfo does not match macOS 13.7");
 
 #define kDevice_UID "IINACaptureAudio_UID"
 #define kDevice_ModelUID "IINACaptureAudio_ModelUID"
@@ -193,6 +210,7 @@ static OSStatus IINA_Initialize(AudioServerPlugInDriverRef driver, AudioServerPl
     return kAudioHardwareBadObjectError;
   }
   gHost = host;
+  (void)gHost;
   mach_timebase_info(&info);
   if (info.numer == 0) {
     info.numer = 1;

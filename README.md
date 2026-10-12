@@ -28,7 +28,7 @@ xattr -dr com.apple.quarantine /path/to/IINA.app
 
 ### macOS 13.7
 
-`Configs/Deployment.xcconfig` sets `MACOSX_DEPLOYMENT_TARGET` to 12, and `Info.plist` publishes that as `LSMinimumSystemVersion`. macOS 13.7.8 is above 12, so the system allows the app to start. The arm64 `libmpv` that `other/download_libs.sh` fetches from iina.io declares a minimum of macOS 11.0, so dyld will load it on 13.7. A float16 model converted for macOS 13 (the 364×280 package) loads on 13.7. Apple's published Depth Anything package is an ios17 specialization and needs macOS 14 or later. Compiling with the Xcode 26 SDK does not raise the deployment target. Each run prints `vtool -show-build` for `IINA` and the bundled libraries.
+`Configs/Deployment.xcconfig` sets `MACOSX_DEPLOYMENT_TARGET` to 12, and `Info.plist` publishes that as `LSMinimumSystemVersion`. macOS 13.7.8 is above 12, so the system allows the app to start. The arm64 `libmpv` that `other/download_libs.sh` fetches from iina.io declares a minimum of macOS 11.0, so dyld will load it on 13.7. A float16 model converted for macOS 13 (the 364×280 package) loads on 13.7. Apple's published Depth Anything package is an ios17 specialization and needs macOS 14 or later. Compiling with a newer SDK does not raise the deployment target. CI runs `otool -l` on every Mach-O in `IINA.app` (the app, the HAL plugin, mpv, and `libiina_whisper.dylib`) and fails if any `LC_BUILD_VERSION` minos is newer than 13.0.
 
 ## Build and run on an M2 Mac
 

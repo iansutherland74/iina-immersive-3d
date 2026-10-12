@@ -169,6 +169,14 @@ jobs:
             exit "$status"
           fi
 
+      - name: Require macOS 13.0 or older on every Mach-O
+        working-directory: iina
+        run: |
+          set -euo pipefail
+          bash other/check-macho-minos.sh \
+            build/Build/Products/Release/IINA.app \
+            other/iina-capture-audio/build/IINACaptureAudio.driver
+
       - name: Upload compiler errors
         if: failure()
         uses: actions/upload-artifact@v7
@@ -197,6 +205,7 @@ jobs:
           fi
           rm -f "$entitlements"
           test -d "$app/Contents/Resources/IINACaptureAudio.driver"
+          bash other/check-macho-minos.sh "$app"
           bin="$app/Contents/MacOS/IINA"
           echo "==== codesign ===="
           codesign -dv --verbose=4 "$app" 2>&1 || true
