@@ -31,6 +31,27 @@
 #define kDevice_Name "IINA Capture Audio"
 #define kDevice_SampleRate 48000.0
 
+/* These selectors moved out of the headers AudioServerPlugIn.h includes.
+   The four-character codes are the ones Core Audio still sends. */
+#ifndef kAudioObjectSystemObject
+#define kAudioObjectSystemObject 0
+#endif
+#ifndef kAudioDevicePropertyDeviceIsRunningSomewhere
+#define kAudioDevicePropertyDeviceIsRunningSomewhere 'gone'
+#endif
+#ifndef kAudioDevicePropertyBufferFrameSize
+#define kAudioDevicePropertyBufferFrameSize 'fsiz'
+#endif
+#ifndef kAudioDevicePropertyBufferFrameSizeRange
+#define kAudioDevicePropertyBufferFrameSizeRange 'fsz#'
+#endif
+#ifndef kAudioDevicePropertyUsesVariableBufferFrameSizes
+#define kAudioDevicePropertyUsesVariableBufferFrameSizes 'vfsz'
+#endif
+#ifndef kAudioDevicePropertyStreamConfiguration
+#define kAudioDevicePropertyStreamConfiguration 'slay'
+#endif
+
 enum {
   kObjectID_PlugIn = kAudioObjectPlugInObject,
   kObjectID_Box = 2,
@@ -138,13 +159,17 @@ static AudioBufferList stereoBuffers(void) {
   return list;
 }
 
+static bool sameUUID(REFIID uuid, CFUUIDRef reference) {
+  CFUUIDBytes expected = CFUUIDGetUUIDBytes(reference);
+  return memcmp(&uuid, &expected, sizeof(expected)) == 0;
+}
+
 static HRESULT IINA_QueryInterface(void *driver, REFIID uuid, LPVOID *outInterface) {
-  CFUUIDRef interfaceUUID = kAudioServerPlugInDriverInterfaceUUID;
   CFUUIDRef unknownUUID = CFUUIDGetConstantUUIDWithBytes(NULL, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46);
-  if (outInterface == NULL || uuid == NULL) {
+  if (outInterface == NULL) {
     return E_NOINTERFACE;
   }
-  if (CFEqual(uuid, interfaceUUID) || CFEqual(uuid, unknownUUID)) {
+  if (sameUUID(uuid, kAudioServerPlugInDriverInterfaceUUID) || sameUUID(uuid, unknownUUID)) {
     *outInterface = driver;
     return S_OK;
   }
@@ -252,8 +277,7 @@ static bool selectorKnown(AudioObjectID objectID, AudioObjectPropertySelector se
         selector == kAudioDevicePropertyIsHidden || selector == kAudioDevicePropertyPreferredChannelsForStereo ||
         selector == kAudioDevicePropertyPreferredChannelLayout || selector == kAudioDevicePropertyZeroTimeStampPeriod ||
         selector == kAudioDevicePropertyBufferFrameSize || selector == kAudioDevicePropertyBufferFrameSizeRange ||
-        selector == kAudioDevicePropertyUsesVariableBufferFrameSizes || selector == kAudioDevicePropertyStreamConfiguration ||
-        selector == kAudioDevicePropertyDeviceNameCFString;
+        selector == kAudioDevicePropertyUsesVariableBufferFrameSizes || selector == kAudioDevicePropertyStreamConfiguration;
     case kObjectID_Stream_Input:
     case kObjectID_Stream_Output:
       return selector == kAudioObjectPropertyBaseClass || selector == kAudioObjectPropertyClass || selector == kAudioObjectPropertyOwner ||
@@ -348,7 +372,6 @@ static UInt32 propertySize(AudioObjectID objectID, const AudioObjectPropertyAddr
     case kAudioObjectPropertyManufacturer:
     case kAudioDevicePropertyDeviceUID:
     case kAudioDevicePropertyModelUID:
-    case kAudioDevicePropertyDeviceNameCFString:
     case kAudioBoxPropertyBoxUID:
     case kAudioPlugInPropertyResourceBundle:
       return sizeof(CFStringRef);
@@ -453,7 +476,6 @@ static OSStatus getDeviceProperty(const AudioObjectPropertyAddress *address, UIn
     case kAudioObjectPropertyOwner:
       return writeID(kObjectID_Box, inSize, outSize, out);
     case kAudioObjectPropertyName:
-    case kAudioDevicePropertyDeviceNameCFString:
       return writeString(kDevice_Name, inSize, outSize, out);
     case kAudioObjectPropertyManufacturer:
       return writeString("IINA", inSize, outSize, out);
