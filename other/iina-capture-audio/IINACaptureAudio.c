@@ -673,15 +673,15 @@ static OSStatus IINA_GetPropertyData(AudioServerPlugInDriverRef driver, AudioObj
   }
 }
 
-static OSStatus IINA_SetPropertyData(AudioServerPlugInDriverRef driver, AudioObjectID objectID, pid_t clientPID, const AudioObjectPropertyAddress *address, UInt32 qualifierSize, const void *qualifier, UInt32 inDataSize, const void *inData, UInt32 *outNumberPropertiesChanged, AudioObjectPropertyAddress outChangedAddresses[2]) {
+/* The MacOSX26 SDK dropped the change-list out-parameters. On arm64 the
+   older coreaudiod still passes them; this callee simply ignores the extras. */
+static OSStatus IINA_SetPropertyData(AudioServerPlugInDriverRef driver, AudioObjectID objectID, pid_t clientPID, const AudioObjectPropertyAddress *address, UInt32 qualifierSize, const void *qualifier, UInt32 inDataSize, const void *inData) {
   (void)clientPID;
   (void)qualifierSize;
   (void)qualifier;
-  (void)outChangedAddresses;
-  if (!isDriver(driver) || address == NULL || outNumberPropertiesChanged == NULL) {
+  if (!isDriver(driver) || address == NULL) {
     return kAudioHardwareIllegalOperationError;
   }
-  *outNumberPropertiesChanged = 0;
   if (!selectorKnown(objectID, address->mSelector, address->mScope)) {
     return kAudioHardwareUnknownPropertyError;
   }
