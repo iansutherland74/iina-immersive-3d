@@ -40,6 +40,7 @@ compile() {
   local output="$1"
   shift
   swiftc -parse-as-library \
+    -swift-version 5 \
     -sdk "$sdk" \
     -framework Metal \
     -framework CoreVideo \

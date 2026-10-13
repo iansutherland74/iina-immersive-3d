@@ -608,11 +608,11 @@ private func testCaptureSend() {
   fill(pixelBuffer, width: 320, height: 180)
   var cache: CVMetalTextureCache?
   guard CVMetalTextureCacheCreate(kCFAllocatorDefault, nil, device, nil, &cache) == kCVReturnSuccess, let cache,
-        let made = CaptureTextureLifetime.make(cache: cache, pixelBuffer: pixelBuffer, width: 320, height: 180),
-        let color = made.texture else {
+        let made = CaptureTextureLifetime.make(cache: cache, pixelBuffer: pixelBuffer, width: 320, height: 180) else {
     check(false, "fake capture frame became a texture")
     return
   }
+  let color = made.texture
   var holder: CVMetalTexture? = made.holder
   var colorTexture: MTLTexture? = color
   defer { CaptureTextureLifetime.recycle(holder: &holder, texture: &colorTexture, cache: cache, flush: true) }

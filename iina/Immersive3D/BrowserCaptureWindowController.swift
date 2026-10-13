@@ -508,7 +508,7 @@ final class BrowserCaptureWindowController: NSWindowController, NSTableViewDataS
       do {
         try await self?.manager.start(target, excluding: excluded)
         DispatchQueue.main.async {
-          let offer = self?.startRoutingIfEnabled() ?? .toggleOff
+          let offer = self?.startRoutingIfEnabled() ?? CaptureAudioPolicy.Offer.toggleOff
           self?.logRoute(offer)
           self?.showRoutePanel()
           self?.syncMenu()
