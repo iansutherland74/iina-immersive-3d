@@ -28,10 +28,8 @@ final class BrowserCaptureRenderer: NSView {
   private var cropped: MTLTexture?
   private var croppedWidth = 0
   private var croppedHeight = 0
-  private var stageTextures: [MTLTexture?] = [nil, nil, nil]
-  private var stageBusy: [Bool] = [false, false, false]
-  private var stageBusySince: [CFTimeInterval] = [0, 0, 0]
-  private var stageGeneration: [Int] = [0, 0, 0]
+  private var stageTextures: [MTLTexture?] = Array(repeating: nil, count: CaptureStagePool.count)
+  private var stagePool = CaptureStagePool()
   private var queuedPresent: QueuedPresent?
   private var presentScheduled = false
   private let stageLock = NSLock()
@@ -414,8 +412,8 @@ final class BrowserCaptureRenderer: NSView {
         }
       }
     )
-    guard wrote else {
-      browserCaptureLog.error("glasses send failed")
+    guard wrote.ok else {
+      browserCaptureLog.error("glasses send failed: \(wrote.reason, privacy: .public)")
       releaseStage(slot, generation: generation)
       latencyPending = false
       if depthQueued {
@@ -444,13 +442,13 @@ final class BrowserCaptureRenderer: NSView {
     let age = received > 0 ? CACurrentMediaTime() - received : 0
     if ok && CapturePresentBudget.shouldPresent(age: age, newerWaiting: newer) {
       stageLock.lock()
-      let replaced = queuedPresent
       queuedPresent = QueuedPresent(texture: texture, slot: slot, generation: generation, time: time, received: received)
+      let replaced = stagePool.enqueue(CaptureStagePool.Claim(index: slot, generation: generation))
       let schedule = !presentScheduled
       presentScheduled = true
       stageLock.unlock()
-      if let replaced, replaced.slot != slot || replaced.generation != generation {
-        releaseStage(replaced.slot, generation: replaced.generation)
+      if let replaced {
+        releaseStage(replaced.index, generation: replaced.generation)
       }
       if schedule {
         DispatchQueue.main.async { [weak self] in
@@ -479,6 +477,7 @@ final class BrowserCaptureRenderer: NSView {
       return
     }
     queuedPresent = nil
+    _ = stagePool.takeForPresent()
     stageLock.unlock()
     present(queued.texture, slot: queued.slot, generation: queued.generation, time: queued.time, received: queued.received)
     stageLock.lock()
@@ -535,9 +534,10 @@ final class BrowserCaptureRenderer: NSView {
     encoder.setTexture(color, index: 0)
     encoder.setTexture(destination, index: 1)
     encoder.setBytes(&rect, length: MemoryLayout<CropUniform>.stride, index: 0)
+    let group = StereoOffscreen.threadgroupSize(maxThreads: pipeline.maxTotalThreadsPerThreadgroup, width: cropWidth, height: cropHeight)
     encoder.dispatchThreads(
       MTLSize(width: cropWidth, height: cropHeight, depth: 1),
-      threadsPerThreadgroup: MTLSize(width: min(16, cropWidth), height: min(16, cropHeight), depth: 1)
+      threadsPerThreadgroup: group
     )
     encoder.endEncoding()
     commandBuffer.commit()
@@ -560,7 +560,8 @@ final class BrowserCaptureRenderer: NSView {
     encoder.setTexture(color, index: 0)
     encoder.setTexture(texture, index: 1)
     encoder.setBytes(&oriented, length: MemoryLayout<Float>.size, index: 0)
-    encoder.dispatchThreads(MTLSize(width: size.width, height: size.height, depth: 1), threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1))
+    let group = StereoOffscreen.threadgroupSize(maxThreads: pipeline.maxTotalThreadsPerThreadgroup, width: size.width, height: size.height)
+    encoder.dispatchThreads(MTLSize(width: size.width, height: size.height, depth: 1), threadsPerThreadgroup: group)
     encoder.endEncoding()
     commandBuffer.commit()
     depthReadbackBusy = true
@@ -608,41 +609,29 @@ final class BrowserCaptureRenderer: NSView {
     stageLock.lock()
     defer { stageLock.unlock() }
     guard width >= 32, height >= 32 else { return nil }
-    let now = CACurrentMediaTime()
-    for index in 0..<stageTextures.count where stageBusy[index] && now - stageBusySince[index] > 1 {
-      stageGeneration[index] += 1
-      stageBusy[index] = false
-      browserCaptureLog.error("released stuck frame slot \(index)")
-    }
-    for index in 0..<stageTextures.count {
-      if stageBusy[index] { continue }
-      stageGeneration[index] += 1
-      let generation = stageGeneration[index]
-      if let existing = stageTextures[index], existing.width == width, existing.height == height {
-        stageBusy[index] = true
-        stageBusySince[index] = now
-        return (index, generation, existing)
+    var failed: [CaptureStagePool.Claim] = []
+    while let claim = stagePool.acquire(now: CACurrentMediaTime()) {
+      if let existing = stageTextures[claim.index], existing.width == width, existing.height == height {
+        for item in failed { stagePool.release(item) }
+        return (claim.index, claim.generation, existing)
       }
       let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm, width: width, height: height, mipmapped: false)
       desc.usage = [.shaderWrite, .shaderRead]
       desc.storageMode = .private
-      guard let texture = device.makeTexture(descriptor: desc) else {
-        stageGeneration[index] -= 1
-        continue
+      if let texture = device.makeTexture(descriptor: desc) {
+        for item in failed { stagePool.release(item) }
+        stageTextures[claim.index] = texture
+        return (claim.index, claim.generation, texture)
       }
-      stageTextures[index] = texture
-      stageBusy[index] = true
-      stageBusySince[index] = now
-      return (index, generation, texture)
+      failed.append(claim)
     }
+    for item in failed { stagePool.release(item) }
     return nil
   }
 
   private func releaseStage(_ index: Int, generation: Int) {
     stageLock.lock()
-    if stageTextures.indices.contains(index), stageGeneration[index] == generation {
-      stageBusy[index] = false
-    }
+    stagePool.release(CaptureStagePool.Claim(index: index, generation: generation))
     stageLock.unlock()
   }
 
@@ -661,16 +650,17 @@ final class BrowserCaptureRenderer: NSView {
     if texture.width != pixelWidth || texture.height != pixelHeight { return .redraw }
     guard stageTextures.indices.contains(lastSlot),
           let current = stageTextures[lastSlot], current === texture else { return .redraw }
-    if stageBusy[lastSlot] { return .wait }
-    stageGeneration[lastSlot] += 1
-    let generation = stageGeneration[lastSlot]
-    stageBusy[lastSlot] = true
-    stageBusySince[lastSlot] = CACurrentMediaTime()
-    return .present(texture, lastSlot, generation)
+    guard let claim = stagePool.claimExisting(index: lastSlot, now: CACurrentMediaTime()) else { return .wait }
+    return .present(texture, claim.index, claim.generation)
   }
 
   /// Drawable acquisition stays on the main thread and does not wait for the GPU. `allowsNextDrawableTimeout` makes `nextDrawable` return instead of blocking the run loop. The slot is released here if the present is not committed, and in the command-buffer completion otherwise. The drawable size is not changed while this present holds a drawable.
   private func present(_ texture: MTLTexture, slot: Int?, generation: Int, time: CMTime, received: CFTimeInterval = 0) {
+    if let slot {
+      stageLock.lock()
+      stagePool.notePresenting(index: slot, generation: generation)
+      stageLock.unlock()
+    }
     if presentCount == 0 && !tookDrawable {
       applyDrawableSizeNow()
     }
@@ -764,9 +754,10 @@ final class BrowserCaptureRenderer: NSView {
     encoder.setTexture(texture, index: 0)
     encoder.setTexture(destination, index: 1)
     encoder.setBytes(&oriented, length: MemoryLayout<Float>.stride, index: 0)
+    let group = StereoOffscreen.threadgroupSize(maxThreads: pipeline.maxTotalThreadsPerThreadgroup, width: destination.width, height: destination.height)
     encoder.dispatchThreads(
       MTLSize(width: destination.width, height: destination.height, depth: 1),
-      threadsPerThreadgroup: MTLSize(width: min(16, destination.width), height: min(16, destination.height), depth: 1)
+      threadsPerThreadgroup: group
     )
     encoder.endEncoding()
     return true

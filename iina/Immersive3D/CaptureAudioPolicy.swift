@@ -27,6 +27,60 @@ enum CaptureAudioPolicy {
     userEnabled && deviceInstalled
   }
 
+  /// Why the loopback was or was not started. Logged when a capture starts and
+  /// when the toggle changes. The chooser closes as soon as capture starts, so
+  /// this is the record of a toggle that was never shown.
+  enum Offer: Equatable {
+    case needsMacOS13
+    case toggleOff
+    case deviceMissing
+    case previousOutputNotSaved
+    case notCapturing
+    case started
+
+    var logLine: String {
+      switch self {
+      case .needsMacOS13:
+        return "routing not started: needs macOS 13. Sound stays in the other app."
+      case .toggleOff:
+        return "routing not started: the toggle is off. Sound stays in the other app."
+      case .deviceMissing:
+        return "routing not started: IINA Capture Audio was not found. Sound stays in the other app."
+      case .previousOutputNotSaved:
+        return "routing not started: the previous output could not be saved. Sound stays in the other app."
+      case .notCapturing:
+        return "routing not started: a capture is not running. Sound stays in the other app."
+      case .started:
+        return "routing started: IINA Capture Audio is installed and the toggle is on."
+      }
+    }
+  }
+
+  static func deviceLine(installed: Bool) -> String {
+    if installed {
+      return "IINA Capture Audio: found (IINACaptureAudio_UID)."
+    }
+    return "IINA Capture Audio: not found. Turning the toggle on asks to install it."
+  }
+
+  /// The sentence under the toggle. Routing off leaves the browser's own sound playing.
+  static func statusLine(systemSupportsRouting: Bool, userEnabled: Bool, deviceInstalled: Bool, capturing: Bool) -> String {
+    let device = deviceLine(installed: deviceInstalled)
+    if !systemSupportsRouting {
+      return device + " Sound stays in the other app. Routing needs macOS 13."
+    }
+    if !userEnabled {
+      return device + " Sound stays in the other app."
+    }
+    if !deviceInstalled {
+      return device + " Sound stays in the other app."
+    }
+    if !capturing {
+      return device + " The toggle is on. Sound moves when a capture is running."
+    }
+    return device + " Browser sound is playing through IINA, in time with the picture."
+  }
+
   static func looksVirtual(name: String, uid: String) -> Bool {
     let haystack = (name + " " + uid).lowercased()
     let markers = [

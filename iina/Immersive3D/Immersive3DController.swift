@@ -166,7 +166,7 @@ final class Immersive3DController: NSObject, NSWindowDelegate {
     compositor: Immersive3DCompositor?,
     whenDepthReady: @escaping () -> Void,
     whenGPUFinished: ((Bool) -> Void)? = nil
-  ) -> Bool {
+  ) -> StereoOffscreen.EncodeResult {
     let pass = compositor ?? captureCompositor
     return pass.submitFrame(
       color: color,

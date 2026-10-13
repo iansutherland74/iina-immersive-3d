@@ -236,6 +236,45 @@ private func testCoalescer() {
   check(slots.offer(0) == nil, "the first finished frame waits to present")
   check(slots.offer(1) == 0, "a newer frame frees the slot that was still waiting")
   check(slots.pending == 1, "the present keeps the newest frame")
+  let group = StereoOffscreen.threadgroupSize(maxThreads: 32, width: 3840, height: 1080)
+  check(group.width * group.height <= 32 && group.width >= 1 && group.height >= 1, "the stereo threadgroup fits a 32-thread pipeline")
+  let wide = StereoOffscreen.threadgroupSize(maxThreads: 1024, width: 3840, height: 1080)
+  check(wide.width == 16 && wide.height == 16, "a 1024-thread pipeline keeps a 16 by 16 threadgroup")
+}
+
+private func testStagePool() {
+  var pool = CaptureStagePool()
+  guard let first = pool.acquire(now: 0) else {
+    check(false, "the first stage slot is free")
+    return
+  }
+  _ = pool.enqueue(first)
+  guard let second = pool.acquire(now: 0.2) else {
+    check(false, "a second slot is free while one frame is queued")
+    return
+  }
+  check(second.index != first.index, "a queued frame is not handed out again")
+  let waiting = pool.takeForPresent()
+  check(waiting == first, "the queued frame is the one that presents")
+  guard let third = pool.acquire(now: 0.4) else {
+    check(false, "the third slot is free while one frame is presenting")
+    return
+  }
+  check(third.index != first.index && third.index != second.index, "the presenting frame keeps its own slot")
+  check(pool.age(of: first.index, now: 5) > 1, "the presenting slot has been held for more than a second")
+  check(pool.acquire(now: 5) == nil, "a presenting slot is not reclaimed after one second")
+  check(pool.release(second), "the stereo slot is released when that pass finishes")
+  guard let reused = pool.acquire(now: 5.1) else {
+    check(false, "a released slot can be used for the next frame")
+    return
+  }
+  check(reused.index == second.index, "the finished slot is the one that is reused")
+  check(pool.release(first), "the present releases its slot when the blit finishes")
+  guard let afterPresent = pool.acquire(now: 6) else {
+    check(false, "a presented slot can be used again")
+    return
+  }
+  check(afterPresent.index == first.index, "the presented slot is reused only after the blit finishes")
 }
 
 private func testQuitDuringCapture() {
@@ -264,6 +303,15 @@ private func testAudioPolicy() {
   check(CaptureAudioPolicy.looksVirtual(name: "BlackHole 2ch", uid: "BlackHole2ch_UID"), "BlackHole is a virtual device")
   check(CaptureAudioPolicy.looksVirtual(name: "IINA Capture Audio", uid: "IINACaptureAudio_UID"), "the bundled device is virtual")
   check(!CaptureAudioPolicy.looksVirtual(name: "MacBook Pro Speakers", uid: "BuiltInSpeakerDevice"), "the built-in speakers are not a virtual device")
+  check(CaptureAudioPolicy.Offer.toggleOff.logLine == "routing not started: the toggle is off. Sound stays in the other app.", "the toggle off is logged")
+  check(CaptureAudioPolicy.Offer.needsMacOS13.logLine == "routing not started: needs macOS 13. Sound stays in the other app.", "an older system is logged")
+  check(CaptureAudioPolicy.Offer.deviceMissing.logLine == "routing not started: IINA Capture Audio was not found. Sound stays in the other app.", "a missing device is logged")
+  check(CaptureAudioPolicy.Offer.previousOutputNotSaved.logLine == "routing not started: the previous output could not be saved. Sound stays in the other app.", "a refused switch is logged")
+  check(CaptureAudioPolicy.Offer.started.logLine == "routing started: IINA Capture Audio is installed and the toggle is on.", "a started route is logged")
+  check(CaptureAudioPolicy.deviceLine(installed: true) == "IINA Capture Audio: found (IINACaptureAudio_UID).", "an installed device is named")
+  check(CaptureAudioPolicy.deviceLine(installed: false) == "IINA Capture Audio: not found. Turning the toggle on asks to install it.", "a missing device is named")
+  let quiet = CaptureAudioPolicy.statusLine(systemSupportsRouting: true, userEnabled: false, deviceInstalled: true, capturing: true)
+  check(quiet.contains("found (IINACaptureAudio_UID)") && quiet.contains("Sound stays in the other app."), "the toggle off still says the device was found and the sound stayed put")
 }
 
 private func testRoute() {
@@ -476,8 +524,8 @@ private func testStereoPipeline() {
     contentH: rect.h
   )
   let encoded = StereoOffscreen.encode(commandQueue: queue, pipeline: pipeline, color: color, depth: depth, output: output, params: params)
-  check(encoded, "stereo encode of a synthetic frame")
-  guard encoded else { return }
+  check(encoded.ok, "stereo encode of a synthetic frame")
+  guard encoded.ok else { return }
 
   var bytes = [UInt8](repeating: 0, count: 3840 * 1080 * 4)
   bytes.withUnsafeMutableBytes { raw in
@@ -534,6 +582,114 @@ private func makeBuffer(width: Int, height: Int) -> CVPixelBuffer? {
   )
   guard created == kCVReturnSuccess else { return nil }
   return pixelBuffer
+}
+
+private final class CaptureSendFlag {
+  var ok = false
+}
+
+/// The capture send path: a private stage texture, the async completion, then the same texture again.
+private func testCaptureSend() {
+  guard let device = MTLCreateSystemDefaultDevice(), let queue = device.makeCommandQueue() else {
+    check(false, "Metal device is available for the capture send")
+    return
+  }
+  let libraryURL = URL(fileURLWithPath: ProcessInfo.processInfo.environment["CAPTURE_METALLIB"] ?? "")
+  guard let library = try? device.makeLibrary(URL: libraryURL),
+        let function = library.makeFunction(name: "immersiveStereo"),
+        let pipeline = try? device.makeComputePipelineState(function: function) else {
+    check(false, "immersiveStereo loaded for the capture send")
+    return
+  }
+  guard let pixelBuffer = makeBuffer(width: 320, height: 180) else {
+    check(false, "fake capture frame")
+    return
+  }
+  fill(pixelBuffer, width: 320, height: 180)
+  var cache: CVMetalTextureCache?
+  guard CVMetalTextureCacheCreate(kCFAllocatorDefault, nil, device, nil, &cache) == kCVReturnSuccess, let cache,
+        let made = CaptureTextureLifetime.make(cache: cache, pixelBuffer: pixelBuffer, width: 320, height: 180),
+        let color = made.texture else {
+    check(false, "fake capture frame became a texture")
+    return
+  }
+  var holder: CVMetalTexture? = made.holder
+  var colorTexture: MTLTexture? = color
+  defer { CaptureTextureLifetime.recycle(holder: &holder, texture: &colorTexture, cache: cache, flush: true) }
+  guard let depth = texture(device, width: 2, height: 2, format: .r32Float, usage: [.shaderRead], shared: true),
+        let stage = texture(device, width: 3840, height: 1080, format: .bgra8Unorm, usage: [.shaderWrite, .shaderRead], shared: false),
+        let readback = texture(device, width: 3840, height: 1080, format: .bgra8Unorm, usage: [.shaderWrite, .shaderRead], shared: true) else {
+    check(false, "private stage texture")
+    return
+  }
+  let flat = [Float](repeating: 0.5, count: 4)
+  flat.withUnsafeBytes { raw in
+    depth.replace(region: MTLRegionMake2D(0, 0, 2, 2), mipmapLevel: 0, withBytes: raw.baseAddress!, bytesPerRow: 8)
+  }
+  let rect = StereoOffscreen.contentRect(outputWidth: 3840, outputHeight: 1080, contentAspect: 16.0 / 9.0, fullSizeEyes: true, colorIsPicture: true)
+  let params = StereoOffscreen.Params(
+    maxShift: 0.03,
+    convergence: 0.5,
+    holeThreshold: 0.08,
+    invertDepth: 0,
+    glOriented: 0,
+    searchPixels: 18,
+    contentX: rect.x,
+    contentY: rect.y,
+    contentW: rect.w,
+    contentH: rect.h
+  )
+  let done = DispatchSemaphore(value: 0)
+  let flag = CaptureSendFlag()
+  let sent = StereoOffscreen.encode(
+    commandQueue: queue,
+    pipeline: pipeline,
+    color: color,
+    depth: depth,
+    output: stage,
+    params: params,
+    completion: { ok in
+      flag.ok = ok
+      done.signal()
+    }
+  )
+  check(sent.ok, "renderer send path accepts a fake frame (\(sent.reason))")
+  guard sent.ok else { return }
+  let waited = done.wait(timeout: .now() + 5)
+  check(waited == .success && flag.ok, "renderer send path finishes the fake frame")
+  guard waited == .success, flag.ok else { return }
+  let again = StereoOffscreen.encode(commandQueue: queue, pipeline: pipeline, color: color, depth: depth, output: stage, params: params)
+  check(again.ok, "the same stage texture sends again after the first frame finishes (\(again.reason))")
+  guard again.ok else { return }
+  guard let buffer = queue.makeCommandBuffer(), let blit = buffer.makeBlitCommandEncoder() else {
+    check(false, "stage readback blit")
+    return
+  }
+  blit.copy(
+    from: stage,
+    sourceSlice: 0,
+    sourceLevel: 0,
+    sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+    sourceSize: MTLSize(width: stage.width, height: stage.height, depth: 1),
+    to: readback,
+    destinationSlice: 0,
+    destinationLevel: 0,
+    destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0)
+  )
+  blit.endEncoding()
+  buffer.commit()
+  buffer.waitUntilCompleted()
+  check(buffer.error == nil, "stage readback blit succeeded")
+  var pixel = [UInt8](repeating: 0, count: 4)
+  func read(_ x: Int) -> (b: Int, r: Int) {
+    pixel.withUnsafeMutableBytes { raw in
+      readback.getBytes(raw.baseAddress!, bytesPerRow: 4, from: MTLRegionMake2D(x, 540, 1, 1), mipmapLevel: 0)
+    }
+    return (Int(pixel[0]), Int(pixel[2]))
+  }
+  let left = read(480)
+  let right = read(3360)
+  check(left.r > 200 && left.b < 40 && right.b > 200 && right.r < 40, "the fake frame is non-black in both eyes")
 }
 
 private func testTextureLifetime() {
@@ -618,6 +774,7 @@ enum CaptureSelfTest {
     testSession()
     testWindowMatch()
     testCoalescer()
+    testStagePool()
     testQuitDuringCapture()
     testAudioPolicy()
     testRoute()
@@ -625,6 +782,7 @@ enum CaptureSelfTest {
     let zombies = ProcessInfo.processInfo.environment["CAPTURE_ZOMBIES"] == "1"
     if !zombies {
       testStereoPipeline()
+      testCaptureSend()
       testScale()
     }
     testTextureLifetime()

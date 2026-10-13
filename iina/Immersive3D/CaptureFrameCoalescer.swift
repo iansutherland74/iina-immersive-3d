@@ -112,6 +112,94 @@ struct CapturePresentSlots: Equatable {
   }
 }
 
+/// The three capture frame textures. A slot that is busy, queued, or being
+/// presented is never handed out again. Reusing that texture while a blit still
+/// reads it faults the GPU, and every later `submitFrame` then fails.
+struct CaptureStagePool: Equatable {
+  static let count = 3
+
+  struct Claim: Equatable {
+    var index: Int
+    var generation: Int
+  }
+
+  private var busy: [Bool]
+  private var generation: [Int]
+  private var acquiredAt: [Double]
+  private(set) var queued: Claim?
+  private(set) var presenting: Claim?
+
+  init(count: Int = CaptureStagePool.count) {
+    busy = Array(repeating: false, count: count)
+    generation = Array(repeating: 0, count: count)
+    acquiredAt = Array(repeating: 0, count: count)
+  }
+
+  /// `now` is recorded and then ignored. Age is not a reason to reuse a texture.
+  mutating func acquire(now: Double) -> Claim? {
+    for index in busy.indices {
+      if busy[index] || isHeld(index) { continue }
+      generation[index] += 1
+      busy[index] = true
+      acquiredAt[index] = now
+      return Claim(index: index, generation: generation[index])
+    }
+    return nil
+  }
+
+  /// The idle redraw presents the last texture again. A busy or held slot is left alone.
+  mutating func claimExisting(index: Int, now: Double) -> Claim? {
+    guard busy.indices.contains(index), !busy[index], !isHeld(index) else { return nil }
+    generation[index] += 1
+    busy[index] = true
+    acquiredAt[index] = now
+    return Claim(index: index, generation: generation[index])
+  }
+
+  func age(of index: Int, now: Double) -> Double {
+    guard acquiredAt.indices.contains(index) else { return 0 }
+    return now - acquiredAt[index]
+  }
+
+  func isHeld(_ index: Int) -> Bool {
+    if let queued, queued.index == index { return true }
+    if let presenting, presenting.index == index { return true }
+    return false
+  }
+
+  /// The newest finished frame replaces the one still waiting. The caller releases the returned slot.
+  mutating func enqueue(_ claim: Claim) -> Claim? {
+    let replaced = queued
+    queued = claim
+    if let replaced, replaced.index == claim.index, replaced.generation == claim.generation {
+      return nil
+    }
+    return replaced
+  }
+
+  /// The main thread took the waiting frame. It stays held until `release`.
+  mutating func takeForPresent() -> Claim? {
+    guard let waiting = queued else { return nil }
+    queued = nil
+    presenting = waiting
+    return waiting
+  }
+
+  mutating func notePresenting(index: Int, generation: Int) {
+    guard self.generation.indices.contains(index), self.generation[index] == generation else { return }
+    presenting = Claim(index: index, generation: generation)
+  }
+
+  @discardableResult
+  mutating func release(_ claim: Claim) -> Bool {
+    guard generation.indices.contains(claim.index), generation[claim.index] == claim.generation else { return false }
+    busy[claim.index] = false
+    if queued == claim { queued = nil }
+    if presenting == claim { presenting = nil }
+    return true
+  }
+}
+
 /// The sample callback copies and returns. A frame that is already late is not
 /// presented when a newer copy is waiting, so one GPU stall does not become the picture.
 enum CapturePresentBudget {

@@ -26,6 +26,9 @@ final class BrowserCaptureWindowController: NSWindowController, NSTableViewDataS
   private var statusLabel: NSTextField?
   private var outputMessage: NSTextField?
   private var audioCheckbox: NSButton?
+  private var routePanel: NSPanel?
+  private var routePanelCheckbox: NSButton?
+  private var routePanelStatus: NSTextField?
   private var hintLabel: NSTextField?
   private var cropSegments: NSSegmentedControl?
   private var topSlider: NSSlider?
@@ -84,9 +87,10 @@ final class BrowserCaptureWindowController: NSWindowController, NSTableViewDataS
         self?.showOutputMessage(text)
       }
     }
-    manager.onStopped = {
+    manager.onStopped = { [weak self] in
       DispatchQueue.main.async {
         Immersive3DController.shared.captureDidStop()
+        self?.hideRoutePanel()
       }
     }
     settings.onDetected = { [weak self] insets in
@@ -145,6 +149,7 @@ final class BrowserCaptureWindowController: NSWindowController, NSTableViewDataS
     Immersive3DController.shared.captureDidStop()
     onGlasses = false
     outputWindow?.orderOut(nil)
+    hideRoutePanel()
     Task { await manager.stop() }
     syncMenu()
   }
@@ -385,6 +390,7 @@ final class BrowserCaptureWindowController: NSWindowController, NSTableViewDataS
       settings.setPlayAudio(false)
       reflectSettings()
       syncMenu()
+      logRoute(.needsMacOS13)
       return
     }
     if !on {
@@ -394,6 +400,7 @@ final class BrowserCaptureWindowController: NSWindowController, NSTableViewDataS
       reflectSettings()
       syncMenu()
       setStatus("Sound stays in the other app.")
+      logRoute(.toggleOff)
       return
     }
     guard ensureCaptureDevice() else {
@@ -401,21 +408,34 @@ final class BrowserCaptureWindowController: NSWindowController, NSTableViewDataS
       reflectSettings()
       syncMenu()
       setStatus("IINA Capture Audio was not installed. Sound stays in the other app.")
+      logRoute(.deviceMissing)
       return
     }
     settings.setPlayAudio(true)
     reflectSettings()
     syncMenu()
-    guard manager.isRunning else { return }
+    guard manager.isRunning else {
+      logRoute(.notCapturing)
+      return
+    }
     switch CaptureAudioRouteController.beginIfEnabled() {
     case .routed, .already:
       setStatus("Browser sound is playing through IINA, in time with the picture.")
+      logRoute(.started)
     case .refused:
       settings.setPlayAudio(false)
       reflectSettings()
       syncMenu()
       setStatus("Browser sound stayed in the other app because the previous output could not be saved.")
+      logRoute(.previousOutputNotSaved)
     }
+  }
+
+  private func logRoute(_ offer: CaptureAudioPolicy.Offer) {
+    let installed = CaptureSystemOutput.ourDeviceInstalled()
+    browserCaptureLog.info("\(CaptureAudioPolicy.deviceLine(installed: installed), privacy: .public)")
+    browserCaptureLog.info("\(offer.logLine, privacy: .public)")
+    updateRoutePanel()
   }
 
   private func ensureCaptureDevice() -> Bool {
@@ -488,15 +508,9 @@ final class BrowserCaptureWindowController: NSWindowController, NSTableViewDataS
       do {
         try await self?.manager.start(target, excluding: excluded)
         DispatchQueue.main.async {
-          if self?.settings.wantsAudio == true {
-            if self?.ensureCaptureDevice() == true {
-              if case .refused = CaptureAudioRouteController.beginIfEnabled() {
-                self?.settings.setPlayAudio(false)
-              }
-            } else {
-              self?.settings.setPlayAudio(false)
-            }
-          }
+          let offer = self?.startRoutingIfEnabled() ?? .toggleOff
+          self?.logRoute(offer)
+          self?.showRoutePanel()
           self?.syncMenu()
           self?.setStatus(self?.captureStatus() ?? "Capturing.")
           self?.window?.orderOut(nil)
@@ -508,6 +522,23 @@ final class BrowserCaptureWindowController: NSWindowController, NSTableViewDataS
           self?.syncMenu()
         }
       }
+    }
+  }
+
+  /// The chooser is about to close. Start the loopback only when the toggle is already on, and always say why.
+  private func startRoutingIfEnabled() -> CaptureAudioPolicy.Offer {
+    guard audioAvailable else { return .needsMacOS13 }
+    guard settings.wantsAudio else { return .toggleOff }
+    guard ensureCaptureDevice() else {
+      settings.setPlayAudio(false)
+      return .deviceMissing
+    }
+    switch CaptureAudioRouteController.beginIfEnabled() {
+    case .routed, .already:
+      return .started
+    case .refused:
+      settings.setPlayAudio(false)
+      return .previousOutputNotSaved
     }
   }
 
@@ -538,9 +569,13 @@ final class BrowserCaptureWindowController: NSWindowController, NSTableViewDataS
 
   private func reflectSettings() {
     suppressControls = true
-    audioCheckbox?.state = audioAvailable && settings.wantsAudio ? .on : .off
+    let routed = audioAvailable && settings.wantsAudio
+    audioCheckbox?.state = routed ? .on : .off
     audioCheckbox?.isEnabled = audioAvailable
     audioCheckbox?.isHidden = false
+    routePanelCheckbox?.state = routed ? .on : .off
+    routePanelCheckbox?.isEnabled = audioAvailable
+    updateRoutePanel()
     hintLabel?.stringValue = hintText()
     cropSegments?.selectedSegment = settings.cropMode.rawValue
     let insets = settings.appliedInsets()
@@ -581,6 +616,62 @@ final class BrowserCaptureWindowController: NSWindowController, NSTableViewDataS
 
   private func percent(_ value: Double) -> String {
     "\(Int((value * 100).rounded()))%"
+  }
+
+  private func makeRoutePanel() -> NSPanel {
+    let panel = NSPanel(
+      contentRect: NSRect(x: 0, y: 0, width: 560, height: 150),
+      styleMask: [.titled, .closable, .utilityWindow, .nonactivatingPanel],
+      backing: .buffered,
+      defer: false
+    )
+    panel.title = "Browser Capture"
+    panel.isFloatingPanel = true
+    panel.level = .floating
+    panel.isReleasedWhenClosed = false
+    panel.hidesOnDeactivate = false
+    let audio = NSButton(checkboxWithTitle: CaptureOutputRoute.toggleTitle, target: self, action: #selector(audioCheckboxChanged(_:)))
+    audio.frame = NSRect(x: 16, y: 108, width: 528, height: 22)
+    audio.font = .systemFont(ofSize: 12)
+    routePanelCheckbox = audio
+    let status = NSTextField(wrappingLabelWithString: "")
+    status.font = .systemFont(ofSize: 12)
+    status.frame = NSRect(x: 16, y: 16, width: 528, height: 84)
+    routePanelStatus = status
+    panel.contentView?.addSubview(audio)
+    panel.contentView?.addSubview(status)
+    return panel
+  }
+
+  /// The chooser closes when capture starts, and the picture may be on the glasses.
+  /// This panel stays on the built-in display for the whole capture.
+  private func showRoutePanel() {
+    let panel = routePanel ?? makeRoutePanel()
+    routePanel = panel
+    updateRoutePanel()
+    let screen = NSScreen.screens.first { Immersive3DController.isBuiltIn($0) } ?? NSScreen.main
+    let visible = screen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1280, height: 800)
+    var frame = panel.frame
+    frame.origin.x = visible.minX + 24
+    frame.origin.y = visible.minY + 24
+    panel.setFrame(frame, display: true)
+    panel.orderFront(nil)
+  }
+
+  private func hideRoutePanel() {
+    routePanel?.orderOut(nil)
+  }
+
+  private func updateRoutePanel() {
+    let routed = audioAvailable && settings.wantsAudio
+    routePanelCheckbox?.state = routed ? .on : .off
+    routePanelCheckbox?.isEnabled = audioAvailable
+    routePanelStatus?.stringValue = CaptureAudioPolicy.statusLine(
+      systemSupportsRouting: audioAvailable,
+      userEnabled: settings.wantsAudio,
+      deviceInstalled: CaptureSystemOutput.ourDeviceInstalled(),
+      capturing: manager.isRunning
+    )
   }
 
   private func ensurePermission() -> Bool {

@@ -23,7 +23,7 @@ import OpenGL.GL3
 
 final class Immersive3DCompositor {
   private let device: MTLDevice?
-  private let commandQueue: MTLCommandQueue?
+  private var commandQueue: MTLCommandQueue?
   var encodeQueue: MTLCommandQueue? { commandQueue }
   private var pipeline: MTLComputePipelineState?
   private var pipelineFailed = false
@@ -94,7 +94,7 @@ final class Immersive3DCompositor {
     glBindFramebuffer(GLenum(GL_FRAMEBUFFER), 0)
     glFinish()
 
-    guard Immersive3DController.shared.submitFrame(
+    let submitted = Immersive3DController.shared.submitFrame(
       color: surfaces.colorMetal,
       output: surfaces.outputMetal,
       contentAspect: 0,
@@ -105,8 +105,9 @@ final class Immersive3DCompositor {
       fullSizeEyes: nil,
       compositor: self,
       whenDepthReady: whenDepthReady
-    ) else {
-      noteFailure("Metal encode")
+    )
+    guard submitted.ok else {
+      noteFailure(submitted.reason)
       return
     }
     present(surfaces: surfaces, layerFBO: layerFBO, width: width, height: height)
@@ -129,17 +130,19 @@ final class Immersive3DCompositor {
     fullSizeEyes: Bool?,
     whenDepthReady: @escaping () -> Void,
     whenGPUFinished: ((Bool) -> Void)? = nil
-  ) -> Bool {
-    guard !DepthEstimator.shared.isStopped, !pipelineFailed else { return false }
-    guard let device, let commandQueue else { return false }
-    guard ensurePipeline(device: device) else { return false }
+  ) -> StereoOffscreen.EncodeResult {
+    if DepthEstimator.shared.isStopped { return .failed("depth estimator is stopped") }
+    if pipelineFailed { return .failed("stereo pipeline failed earlier") }
+    guard let device else { return .failed("metal device is missing") }
+    guard commandQueue != nil else { return .failed("command queue is missing") }
+    guard ensurePipeline(device: device) else { return .failed("stereo pipeline was not created") }
     if let depthRGBA, modelWidth > 1, modelHeight > 1 {
       if DepthEstimator.shared.inputSize() == nil {
         DepthEstimator.shared.ensureLoaded()
       }
       considerDepthPixels(depthRGBA, width: modelWidth, height: modelHeight, whenDepthReady: whenDepthReady)
     }
-    guard uploadDepthIfNeeded(device: device) != nil else { return false }
+    guard uploadDepthIfNeeded(device: device) != nil else { return .failed("depth texture was not created") }
     var snapshot = Immersive3DController.shared.currentSnapshot()
     if let fullSizeEyes {
       snapshot.fullSizeEyes = fullSizeEyes
@@ -148,10 +151,9 @@ final class Immersive3DCompositor {
       snapshot.enabled = true
       snapshot.passThroughSBS = false
     }
-    guard snapshot.shouldProcess else { return false }
+    guard snapshot.shouldProcess else { return .failed("immersive 3d is off") }
     let glOriented = colorIsBottomUp ? !snapshot.verticalFlip : snapshot.verticalFlip
-    guard encode(
-      commandQueue: commandQueue,
+    let encoded = encode(
       color: color,
       output: output,
       snapshot: snapshot,
@@ -161,9 +163,11 @@ final class Immersive3DCompositor {
       glOriented: glOriented,
       colorIsPicture: !colorIsBottomUp,
       whenGPUFinished: whenGPUFinished
-    ) else { return false }
-    failureCount = 0
-    return true
+    )
+    if encoded.ok {
+      failureCount = 0
+    }
+    return encoded
   }
 
   // MARK: - Depth
@@ -260,7 +264,6 @@ final class Immersive3DCompositor {
   }
 
   private func encode(
-    commandQueue: MTLCommandQueue,
     color: MTLTexture,
     output: MTLTexture,
     snapshot: Immersive3DController.Snapshot,
@@ -270,8 +273,10 @@ final class Immersive3DCompositor {
     glOriented: Bool,
     colorIsPicture: Bool,
     whenGPUFinished: ((Bool) -> Void)? = nil
-  ) -> Bool {
-    guard let pipeline, let depthTexture else { return false }
+  ) -> StereoOffscreen.EncodeResult {
+    guard let pipeline else { return .failed("stereo pipeline is missing") }
+    guard let depthTexture else { return .failed("depth texture is missing") }
+    guard let commandQueue else { return .failed("command queue is missing") }
     let content = contentRect(fullSizeEyes: snapshot.fullSizeEyes, width: width, height: height, contentAspect: contentAspect, colorIsPicture: colorIsPicture)
     let params = StereoOffscreen.Params(
       maxShift: snapshot.maxShift,
@@ -285,7 +290,31 @@ final class Immersive3DCompositor {
       contentW: content.w,
       contentH: content.h
     )
-    let wrote = StereoOffscreen.encode(
+    let wrote = commitStereo(commandQueue: commandQueue, color: color, output: output, params: params, whenGPUFinished: whenGPUFinished)
+    if wrote.ok { return wrote }
+    let retryable = wrote.reason == "command buffer was not created" || wrote.reason == "compute encoder was not created"
+    guard retryable, let device, let rebuilt = device.makeCommandQueue() else {
+      log3D("Stereo command buffer failed: \(wrote.reason)", level: .error)
+      return wrote
+    }
+    self.commandQueue = rebuilt
+    log3D("Stereo command queue was recreated after \(wrote.reason)", level: .error)
+    let retried = commitStereo(commandQueue: rebuilt, color: color, output: output, params: params, whenGPUFinished: whenGPUFinished)
+    if !retried.ok {
+      log3D("Stereo command buffer failed: \(retried.reason)", level: .error)
+    }
+    return retried
+  }
+
+  private func commitStereo(
+    commandQueue: MTLCommandQueue,
+    color: MTLTexture,
+    output: MTLTexture,
+    params: StereoOffscreen.Params,
+    whenGPUFinished: ((Bool) -> Void)?
+  ) -> StereoOffscreen.EncodeResult {
+    guard let pipeline, let depthTexture else { return .failed("stereo pipeline is missing") }
+    return StereoOffscreen.encode(
       commandQueue: commandQueue,
       pipeline: pipeline,
       color: color,
@@ -294,10 +323,6 @@ final class Immersive3DCompositor {
       params: params,
       completion: whenGPUFinished
     )
-    if !wrote {
-      log3D("Stereo command buffer failed", level: .error)
-    }
-    return wrote
   }
 
   /// Normalized top-down rect of the picture inside the color texture.

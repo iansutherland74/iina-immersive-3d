@@ -36,6 +36,32 @@ enum StereoOffscreen {
 
   static let fullPicture = Rect(x: 0, y: 0, w: 1, h: 1)
 
+  struct EncodeResult: Equatable {
+    var ok: Bool
+    var reason: String
+
+    static let sent = EncodeResult(ok: true, reason: "")
+
+    static func failed(_ reason: String) -> EncodeResult {
+      EncodeResult(ok: false, reason: reason)
+    }
+  }
+
+  /// 16×16 is 256 threads. A pipeline whose limit is smaller rejects the dispatch,
+  /// and that fault makes later command buffers fail as well. The size stays inside the limit.
+  static func threadgroupSize(maxThreads: Int, width: Int, height: Int) -> MTLSize {
+    let limit = max(maxThreads, 1)
+    var threadsWide = min(16, max(width, 1))
+    var threadsHigh = min(16, max(height, 1))
+    while threadsWide * threadsHigh > limit && threadsHigh > 1 {
+      threadsHigh /= 2
+    }
+    while threadsWide * threadsHigh > limit && threadsWide > 1 {
+      threadsWide /= 2
+    }
+    return MTLSize(width: max(threadsWide, 1), height: max(threadsHigh, 1), depth: 1)
+  }
+
   /// Where the picture sits inside the color texture, top-down and normalized.
   /// `colorIsPicture` means the texture is the captured window, so each eye samples all of it.
   /// Otherwise a 3840×1080 framebuffer pillarboxes a narrower picture and each eye samples that band.
@@ -64,18 +90,23 @@ enum StereoOffscreen {
     output: MTLTexture,
     params: Params,
     completion: ((Bool) -> Void)? = nil
-  ) -> Bool {
-    guard let commandBuffer = commandQueue.makeCommandBuffer(),
-          let encoder = commandBuffer.makeComputeCommandEncoder() else { return false }
+  ) -> EncodeResult {
+    guard let commandBuffer = commandQueue.makeCommandBuffer() else {
+      return .failed("command buffer was not created")
+    }
+    guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
+      return .failed("compute encoder was not created")
+    }
     var params = params
     encoder.setComputePipelineState(pipeline)
     encoder.setTexture(color, index: 0)
     encoder.setTexture(depth, index: 1)
     encoder.setTexture(output, index: 2)
     encoder.setBytes(&params, length: MemoryLayout<Params>.stride, index: 0)
+    let group = threadgroupSize(maxThreads: pipeline.maxTotalThreadsPerThreadgroup, width: output.width, height: output.height)
     encoder.dispatchThreads(
       MTLSize(width: output.width, height: output.height, depth: 1),
-      threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1)
+      threadsPerThreadgroup: group
     )
     encoder.endEncoding()
     if let completion {
@@ -83,11 +114,14 @@ enum StereoOffscreen {
         completion(buffer.error == nil)
       }
       commandBuffer.commit()
-      return true
+      return .sent
     }
     commandBuffer.commit()
     commandBuffer.waitUntilCompleted()
-    return commandBuffer.error == nil
+    if let error = commandBuffer.error {
+      return .failed(error.localizedDescription)
+    }
+    return .sent
   }
 
   /// Scales a BGRA picture onto a drawable of a different size. Same kernel the
@@ -107,9 +141,10 @@ enum StereoOffscreen {
     encoder.setBytes(&oriented, length: MemoryLayout<Float>.stride, index: 0)
     let width = destination.width
     let height = destination.height
+    let group = threadgroupSize(maxThreads: pipeline.maxTotalThreadsPerThreadgroup, width: width, height: height)
     encoder.dispatchThreads(
       MTLSize(width: width, height: height, depth: 1),
-      threadsPerThreadgroup: MTLSize(width: min(16, width), height: min(16, height), depth: 1)
+      threadsPerThreadgroup: group
     )
     encoder.endEncoding()
     commandBuffer.commit()
