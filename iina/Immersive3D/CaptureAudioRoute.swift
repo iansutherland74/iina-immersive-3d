@@ -64,11 +64,11 @@ enum CaptureSystemOutput {
     let id = translated.id ?? deviceIDByScanning(uid)
     guard let id, id != 0 else {
       let status = CaptureDefaultOutput.statusText(translated.status)
-      browserCaptureLog.error("could not change the default output uid=\(uid, privacy: .public) status=\(status, privacy: .public) device=0")
+      captureAudioNote("could not change the default output uid=\(uid) status=\(status) device=0", error: true)
       return false
     }
     if translated.id == nil {
-      browserCaptureLog.error("TranslateUIDToDevice missed \(uid, privacy: .public) status=\(CaptureDefaultOutput.statusText(translated.status), privacy: .public); using device \(id)")
+      captureAudioNote("TranslateUIDToDevice missed \(uid) status=\(CaptureDefaultOutput.statusText(translated.status)); using device \(id)", error: true)
     }
     let selectors: [(AudioObjectPropertySelector, String)] = [
       (kAudioHardwarePropertyDefaultOutputDevice, "DefaultOutputDevice"),
@@ -81,14 +81,139 @@ enum CaptureSystemOutput {
       writes.append(CaptureDefaultOutput.Write(status: status, readBack: readBack))
       if status != noErr || readBack != id {
         let text = CaptureDefaultOutput.statusText(status)
-        browserCaptureLog.error("could not change the default output uid=\(uid, privacy: .public) device=\(id) \(name, privacy: .public) status=\(text, privacy: .public) readBack=\(readBack)")
+        captureAudioNote("could not change the default output uid=\(uid) device=\(id) \(name) status=\(text) readBack=\(readBack)", error: true)
       }
     }
     let ok = CaptureDefaultOutput.accepted(deviceID: id, writes: writes)
     if ok {
-      browserCaptureLog.info("default output is \(uid, privacy: .public) device=\(id)")
+      captureAudioNote("default output is \(uid) device=\(id) status=0")
     }
     return ok
+  }
+
+  /// IINA Capture Audio's output scalar and mute. A scalar of 0 makes every
+  /// ReadInput silent, so the glasses play nothing even when the browser is loud.
+  static func ensureLoopbackAudible(device: AudioDeviceID) -> String {
+    guard device != 0 else { return "loopback device volume=none" }
+    let controls = outputControls(device)
+    var scalar: Float?
+    var mute: UInt32?
+    var volumeControl: AudioObjectID?
+    var muteControl: AudioObjectID?
+    for control in controls {
+      let kind = classID(control)
+      if kind == kAudioVolumeControlClassID, scalar == nil, let value = scalarVolume(of: control) {
+        scalar = value
+        volumeControl = control
+      } else if kind == kAudioMuteControlClassID, mute == nil, let value = muteValue(of: control) {
+        mute = value
+        muteControl = control
+      }
+    }
+    guard scalar != nil || mute != nil else { return "loopback device volume=none" }
+    let shown = scalar ?? 1
+    let muted = (mute ?? 0) != 0
+    var line = String(format: "loopback device volume=%.4f mute=%d", shown, muted ? 1 : 0)
+    if let volumeControl, let restored = CaptureDeviceGain.restoredScalar(shown) {
+      let status = setScalarVolume(of: volumeControl, scalar: restored)
+      line += " set to 1 status=\(CaptureDefaultOutput.statusText(status))"
+    }
+    if let muteControl, CaptureDeviceGain.shouldClearMute(muted) {
+      let status = setMute(of: muteControl, muted: false)
+      line += " cleared mute status=\(CaptureDefaultOutput.statusText(status))"
+    }
+    return line
+  }
+
+  private static func outputControls(_ device: AudioDeviceID) -> [AudioObjectID] {
+    var address = AudioObjectPropertyAddress(
+      mSelector: kAudioObjectPropertyControlList,
+      mScope: kAudioObjectPropertyScopeOutput,
+      mElement: kAudioObjectPropertyElementMain
+    )
+    var size: UInt32 = 0
+    guard AudioObjectGetPropertyDataSize(device, &address, 0, nil, &size) == noErr, size > 0 else { return [] }
+    let count = Int(size) / MemoryLayout<AudioObjectID>.size
+    var ids = [AudioObjectID](repeating: 0, count: count)
+    guard AudioObjectGetPropertyData(device, &address, 0, nil, &size, &ids) == noErr else { return [] }
+    return ids
+  }
+
+  private static func classID(_ object: AudioObjectID) -> AudioClassID {
+    var address = AudioObjectPropertyAddress(
+      mSelector: kAudioObjectPropertyClass,
+      mScope: kAudioObjectPropertyScopeGlobal,
+      mElement: kAudioObjectPropertyElementMain
+    )
+    var value = AudioClassID(0)
+    var size = UInt32(MemoryLayout<AudioClassID>.size)
+    AudioObjectGetPropertyData(object, &address, 0, nil, &size, &value)
+    return value
+  }
+
+  private static func scalarVolume(of control: AudioObjectID) -> Float? {
+    readFloat(control, selector: kAudioLevelControlPropertyScalarValue)
+  }
+
+  private static func setScalarVolume(of control: AudioObjectID, scalar: Float) -> OSStatus {
+    writeValue(control, selector: kAudioLevelControlPropertyScalarValue, value: scalar)
+  }
+
+  private static func muteValue(of control: AudioObjectID) -> UInt32? {
+    readUInt32(control, selector: kAudioBooleanControlPropertyValue)
+  }
+
+  private static func setMute(of control: AudioObjectID, muted: Bool) -> OSStatus {
+    writeValue(control, selector: kAudioBooleanControlPropertyValue, value: muted ? UInt32(1) : UInt32(0))
+  }
+
+  private static func readFloat(_ object: AudioObjectID, selector: AudioObjectPropertySelector) -> Float? {
+    for scope in [kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyScopeOutput] {
+      var address = AudioObjectPropertyAddress(
+        mSelector: selector,
+        mScope: scope,
+        mElement: kAudioObjectPropertyElementMain
+      )
+      var value: Float32 = 0
+      var size = UInt32(MemoryLayout<Float32>.size)
+      if AudioObjectGetPropertyData(object, &address, 0, nil, &size, &value) == noErr {
+        return value
+      }
+    }
+    return nil
+  }
+
+  private static func readUInt32(_ object: AudioObjectID, selector: AudioObjectPropertySelector) -> UInt32? {
+    for scope in [kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyScopeOutput] {
+      var address = AudioObjectPropertyAddress(
+        mSelector: selector,
+        mScope: scope,
+        mElement: kAudioObjectPropertyElementMain
+      )
+      var value: UInt32 = 0
+      var size = UInt32(MemoryLayout<UInt32>.size)
+      if AudioObjectGetPropertyData(object, &address, 0, nil, &size, &value) == noErr {
+        return value
+      }
+    }
+    return nil
+  }
+
+  private static func writeValue<T>(_ object: AudioObjectID, selector: AudioObjectPropertySelector, value: T) -> OSStatus {
+    var value = value
+    var last = kAudioHardwareUnknownPropertyError
+    for scope in [kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyScopeOutput] {
+      var address = AudioObjectPropertyAddress(
+        mSelector: selector,
+        mScope: scope,
+        mElement: kAudioObjectPropertyElementMain
+      )
+      last = withUnsafePointer(to: &value) { pointer in
+        AudioObjectSetPropertyData(object, &address, 0, nil, UInt32(MemoryLayout<T>.size), pointer)
+      }
+      if last == noErr { return last }
+    }
+    return last
   }
 
   static func firstRealOutputUID() -> String? {
@@ -224,6 +349,15 @@ enum CaptureSystemOutput {
   }
 }
 
+func captureAudioNote(_ line: String, error: Bool = false) {
+  CaptureAudioFileLog.append(line)
+  if error {
+    browserCaptureLog.error("\(line, privacy: .public)")
+  } else {
+    browserCaptureLog.info("\(line, privacy: .public)")
+  }
+}
+
 enum CaptureAudioInstaller {
   static let installedPath = "/Library/Audio/Plug-Ins/HAL/IINACaptureAudio.driver"
 
@@ -301,7 +435,7 @@ enum CaptureAudioRouteController {
       lock.lock()
       state = CaptureOutputRoute.State()
       lock.unlock()
-      browserCaptureLog.info("restored the default output after a capture crash")
+      captureAudioNote("restored the default output after a capture crash status=0")
     }
   }
 
@@ -323,7 +457,7 @@ enum CaptureAudioRouteController {
           return .refused(.missingDevice)
         }
       }
-      browserCaptureLog.info("routed browser audio through IINA Capture Audio")
+      captureAudioNote("routed browser audio through IINA Capture Audio")
       return .routed
     case .already:
       lock.lock()
@@ -347,9 +481,9 @@ enum CaptureAudioRouteController {
     guard !plan.effects.isEmpty else { return }
     BrowserCaptureManager.shared.stopRoutedAudio()
     if apply(plan.effects) {
-      browserCaptureLog.info("restored the default output after browser capture")
+      captureAudioNote("restored the default output after browser capture status=0")
     } else {
-      browserCaptureLog.error("the default output was not restored after browser capture")
+      captureAudioNote("the default output was not restored after browser capture", error: true)
     }
   }
 
@@ -414,6 +548,7 @@ final class CaptureLoopbackReader {
 
   private let queue = DispatchQueue(label: "com.colliderli.iina.capture-loopback", qos: .userInteractive)
   private let slotLock = NSLock()
+  private let ioLock = NSLock()
   private var slots: [Slot] = (0..<16).map { _ in Slot() }
   private var device = AudioDeviceID(0)
   private var procID: AudioDeviceIOProcID?
@@ -423,6 +558,8 @@ final class CaptureLoopbackReader {
   private var lastLevelLog: CFTimeInterval = 0
   private var levelSum: Float = 0
   private var levelCount = 0
+  private var loggedSignal = false
+  private var startGeneration = 0
   private let format = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 48000, channels: 2, interleaved: true)
 
   private struct Slot {
@@ -433,22 +570,93 @@ final class CaptureLoopbackReader {
   }
 
   func start() -> Bool {
-    guard let id = CaptureSystemOutput.deviceID(forUID: CaptureOutputRoute.virtualUID), let format else {
-      browserCaptureLog.error("loopback reader did not start device=0")
+    guard CaptureSystemOutput.deviceID(forUID: CaptureOutputRoute.virtualUID) != nil, format != nil else {
+      captureAudioNote("loopback reader did not start device=0 status=\(CaptureDefaultOutput.statusText(kAudioHardwareBadDeviceError))", error: true)
       return false
     }
     stop()
+    ioLock.lock()
+    startGeneration += 1
+    let generation = startGeneration
+    ioLock.unlock()
+    let described = CaptureMicAccess.usageDescriptionPresent(Bundle.main.infoDictionary)
+    let authorization = Self.microphoneAuthorization()
+    captureAudioNote(
+      CaptureMicAccess.logLine(status: authorization, usageDescriptionPresent: described),
+      error: CaptureMicAccess.inputWillBeSilence(authorization)
+    )
+    if CaptureMicAccess.waitForDecision(authorization) {
+      guard described else {
+        captureAudioNote("loopback mic authorization not requested usageDescription=missing", error: true)
+        return startIO(generation: generation)
+      }
+      captureAudioNote("loopback mic authorization requesting")
+      AVCaptureDevice.requestAccess(for: .audio) { [weak self] granted in
+        let after: CaptureMicAuthorization = granted ? .authorized : .denied
+        captureAudioNote(CaptureMicAccess.logLine(status: after, usageDescriptionPresent: true), error: !granted)
+        self?.queue.async {
+          guard let self else { return }
+          if !self.startIO(generation: generation) {
+            captureAudioNote("loopback reader did not start after mic authorization", error: true)
+          }
+        }
+      }
+      return true
+    }
+    return startIO(generation: generation)
+  }
+
+  private static func microphoneAuthorization() -> CaptureMicAuthorization {
+    switch AVCaptureDevice.authorizationStatus(for: .audio) {
+    case .authorized:
+      return .authorized
+    case .denied:
+      return .denied
+    case .restricted:
+      return .restricted
+    case .notDetermined:
+      return .notDetermined
+    @unknown default:
+      return .notDetermined
+    }
+  }
+
+  /// `false` only when this generation is still current and the device did not
+  /// start. A stop that landed during the microphone prompt is not a failure.
+  private func startIO(generation: Int) -> Bool {
+    ioLock.lock()
+    let current = startGeneration == generation
+    ioLock.unlock()
+    guard current else { return true }
+    guard let id = CaptureSystemOutput.deviceID(forUID: CaptureOutputRoute.virtualUID), format != nil else {
+      captureAudioNote("loopback reader did not start device=0 status=\(CaptureDefaultOutput.statusText(kAudioHardwareBadDeviceError))", error: true)
+      return false
+    }
     var created: AudioDeviceIOProcID?
     let status = AudioDeviceCreateIOProcID(id, Self.ioProc, Unmanaged.passUnretained(self).toOpaque(), &created)
     guard status == noErr, let created else {
-      browserCaptureLog.error("loopback reader did not start status=\(status) device=\(id)")
+      captureAudioNote("loopback reader did not start status=\(CaptureDefaultOutput.statusText(status)) device=\(id)", error: true)
       return false
     }
     let started = AudioDeviceStart(id, created)
     guard started == noErr else {
       AudioDeviceDestroyIOProcID(id, created)
-      browserCaptureLog.error("loopback reader did not start status=\(started) device=\(id)")
+      captureAudioNote("loopback reader did not start status=\(CaptureDefaultOutput.statusText(started)) device=\(id)", error: true)
       return false
+    }
+    let timer = DispatchSource.makeTimerSource(queue: queue)
+    timer.schedule(deadline: .now() + 0.01, repeating: 0.01)
+    timer.setEventHandler { [weak self] in
+      self?.drain()
+    }
+    ioLock.lock()
+    if startGeneration != generation {
+      ioLock.unlock()
+      timer.cancel()
+      timer.resume()
+      AudioDeviceStop(id, created)
+      AudioDeviceDestroyIOProcID(id, created)
+      return true
     }
     device = id
     procID = created
@@ -457,26 +665,29 @@ final class CaptureLoopbackReader {
     lastLevelLog = 0
     levelSum = 0
     levelCount = 0
-    let timer = DispatchSource.makeTimerSource(queue: queue)
-    timer.schedule(deadline: .now() + 0.01, repeating: 0.01)
-    timer.setEventHandler { [weak self] in
-      self?.drain()
-    }
+    loggedSignal = false
     self.timer = timer
     timer.resume()
-    _ = format
-    browserCaptureLog.info("loopback reader started device=\(id) uid=\(CaptureOutputRoute.virtualUID, privacy: .public) format=48000 Hz 2ch float32")
+    ioLock.unlock()
+    captureAudioNote("loopback reader started device=\(id) uid=\(CaptureOutputRoute.virtualUID) format=48000 Hz 2ch float32")
+    captureAudioNote(CaptureSystemOutput.ensureLoopbackAudible(device: id))
     return true
   }
 
   func stop() {
-    timer?.cancel()
-    timer = nil
+    ioLock.lock()
+    startGeneration += 1
+    let proc = procID
+    let dev = device
+    procID = nil
     running = false
-    if let procID {
-      AudioDeviceStop(device, procID)
-      AudioDeviceDestroyIOProcID(device, procID)
-      self.procID = nil
+    let pending = timer
+    timer = nil
+    ioLock.unlock()
+    pending?.cancel()
+    if let proc {
+      AudioDeviceStop(dev, proc)
+      AudioDeviceDestroyIOProcID(dev, proc)
     }
     slotLock.lock()
     for index in slots.indices {
@@ -561,13 +772,13 @@ final class CaptureLoopbackReader {
     dropped = 0
     slotLock.unlock()
     if missed > 0 {
-      browserCaptureLog.error("loopback reader dropped \(missed) buffers")
+      captureAudioNote("loopback reader dropped \(missed) buffers", error: true)
     }
     if ready.isEmpty {
       let now = CACurrentMediaTime()
       if lastLevelLog == 0 || now - lastLevelLog >= 1 {
         lastLevelLog = now
-        browserCaptureLog.info("loopback in rms=0.0000")
+        captureAudioNote("loopback in rms=0.0000 samples=none")
       }
     } else {
       noteInputLevel(ready)
@@ -607,8 +818,320 @@ final class CaptureLoopbackReader {
     let mean = levelSum / Float(max(levelCount, 1))
     levelSum = 0
     levelCount = 0
-    let line = String(format: "loopback in rms=%.4f", mean)
-    browserCaptureLog.info("\(line, privacy: .public)")
+    if mean > 0.0001 {
+      if !loggedSignal {
+        loggedSignal = true
+        captureAudioNote(String(format: "loopback in signal rms=%.4f", mean))
+      }
+      captureAudioNote(String(format: "loopback in rms=%.4f", mean))
+    } else {
+      captureAudioNote(String(format: "loopback in rms=%.4f samples=silence", mean))
+    }
+  }
+}
+
+/// Plays loopback samples on the real output named in the restore file.
+/// AVAudioEngine stays at 48 kHz and does not follow a DisplayPort device that
+/// is 44.1 kHz, which is why the glasses were silent.
+final class CaptureLoopbackOutput {
+  struct Outcome {
+    enum Kind {
+      case started
+      case already
+      case failed
+    }
+
+    var kind: Kind
+    var device: AudioDeviceID
+    var status: OSStatus
+    var rate: Double
+    var channels: Int
+    var uid: String
+  }
+
+  private let lock = NSLock()
+  private var device = AudioDeviceID(0)
+  private var procID: AudioDeviceIOProcID?
+  private var plan = CapturePlaybackRoute.plan(sampleRate: 48000, channels: 2, bits: 32, isFloat: true, interleaved: true)
+  private var ring = [Float](repeating: 0, count: 48000 * 2)
+  private var readFrame = 0
+  private var writeFrame = 0
+  private var storedFrames = 0
+  private var resampler = CaptureRateConvert.Stream(fromRate: 48000, toRate: 48000, channels: 2)
+  private var gain: Float = 1
+  private var activeUID = ""
+  private var scratch = [Float](repeating: 0, count: 4096 * 2)
+
+  func setGain(_ value: Float) {
+    lock.lock()
+    gain = min(max(value, 0), 1)
+    lock.unlock()
+  }
+
+  func start(uid: String, force: Bool = false) -> Outcome {
+    let playback = CapturePlaybackRoute.uid(restore: CaptureOutputRestoreFile.read(), pinned: uid) ?? ""
+    guard !playback.isEmpty, let id = CaptureSystemOutput.deviceID(forUID: playback), id != 0 else {
+      return Outcome(kind: .failed, device: 0, status: kAudioHardwareBadDeviceError, rate: 0, channels: 0, uid: playback)
+    }
+    guard var format = Self.outputFormat(of: id) else {
+      return Outcome(kind: .failed, device: id, status: kAudioHardwareIllegalOperationError, rate: 0, channels: 0, uid: playback)
+    }
+    var next = CapturePlaybackRoute.plan(
+      sampleRate: format.mSampleRate,
+      channels: Int(format.mChannelsPerFrame),
+      bits: Int(format.mBitsPerChannel),
+      isFloat: format.mFormatFlags & kAudioFormatFlagIsFloat != 0,
+      interleaved: format.mFormatFlags & kAudioFormatFlagIsNonInterleaved == 0
+    )
+    if next.encoding == .unsupported {
+      let channels = min(max(Int(format.mChannelsPerFrame), 2), 2)
+      let status = Self.setFloatFormat(of: id, rate: format.mSampleRate > 0 ? format.mSampleRate : 48000, channels: channels)
+      guard status == noErr, let updated = Self.outputFormat(of: id) else {
+        return Outcome(kind: .failed, device: id, status: status, rate: format.mSampleRate, channels: Int(format.mChannelsPerFrame), uid: playback)
+      }
+      format = updated
+      next = CapturePlaybackRoute.plan(
+        sampleRate: format.mSampleRate,
+        channels: Int(format.mChannelsPerFrame),
+        bits: Int(format.mBitsPerChannel),
+        isFloat: format.mFormatFlags & kAudioFormatFlagIsFloat != 0,
+        interleaved: format.mFormatFlags & kAudioFormatFlagIsNonInterleaved == 0
+      )
+      guard next.encoding != .unsupported else {
+        return Outcome(kind: .failed, device: id, status: kAudioHardwareIllegalOperationError, rate: next.sampleRate, channels: next.channels, uid: playback)
+      }
+    }
+    if !force && procID != nil && device == id && plan == next && activeUID == playback {
+      return Outcome(kind: .already, device: id, status: noErr, rate: next.sampleRate, channels: next.channels, uid: playback)
+    }
+    stopProc()
+    if plan.sampleRate != next.sampleRate {
+      lock.lock()
+      storedFrames = 0
+      readFrame = 0
+      writeFrame = 0
+      lock.unlock()
+    }
+    plan = next
+    resampler.reset(fromRate: 48000, toRate: next.sampleRate, channels: 2)
+    var created: AudioDeviceIOProcID?
+    let createdStatus = AudioDeviceCreateIOProcID(id, Self.ioProc, Unmanaged.passUnretained(self).toOpaque(), &created)
+    guard createdStatus == noErr, let created else {
+      return Outcome(kind: .failed, device: id, status: createdStatus, rate: next.sampleRate, channels: next.channels, uid: playback)
+    }
+    let started = AudioDeviceStart(id, created)
+    guard started == noErr else {
+      AudioDeviceDestroyIOProcID(id, created)
+      return Outcome(kind: .failed, device: id, status: started, rate: next.sampleRate, channels: next.channels, uid: playback)
+    }
+    device = id
+    procID = created
+    activeUID = playback
+    return Outcome(kind: .started, device: id, status: started, rate: next.sampleRate, channels: next.channels, uid: playback)
+  }
+
+  func stop() {
+    stopProc()
+    lock.lock()
+    storedFrames = 0
+    readFrame = 0
+    writeFrame = 0
+    lock.unlock()
+    resampler.reset(fromRate: 48000, toRate: plan.sampleRate, channels: 2)
+  }
+
+  func enqueue(_ buffer: AVAudioPCMBuffer) {
+    let frames = Int(buffer.frameLength)
+    guard frames > 0 else { return }
+    var interleaved: [Float]
+    if let channels = buffer.floatChannelData, !buffer.format.isInterleaved {
+      let count = min(Int(buffer.format.channelCount), 2)
+      interleaved = [Float](repeating: 0, count: frames * 2)
+      let left = channels[0]
+      let right = count > 1 ? channels[1] : channels[0]
+      for frame in 0..<frames {
+        interleaved[frame * 2] = left[frame]
+        interleaved[frame * 2 + 1] = right[frame]
+      }
+    } else if let data = buffer.audioBufferList.pointee.mBuffers.mData {
+      interleaved = [Float](repeating: 0, count: frames * 2)
+      let source = data.assumingMemoryBound(to: Float.self)
+      let channels = max(Int(buffer.format.channelCount), 1)
+      for frame in 0..<frames {
+        interleaved[frame * 2] = source[frame * channels]
+        interleaved[frame * 2 + 1] = channels > 1 ? source[frame * channels + 1] : source[frame * channels]
+      }
+    } else {
+      return
+    }
+    let converted = resampler.process(interleaved)
+    guard converted.count >= 2 else { return }
+    lock.lock()
+    push(converted)
+    lock.unlock()
+  }
+
+  private func stopProc() {
+    if let procID {
+      AudioDeviceStop(device, procID)
+      AudioDeviceDestroyIOProcID(device, procID)
+      self.procID = nil
+    }
+  }
+
+  private static let ioProc: AudioDeviceIOProc = { _, _, _, _, output, _, client in
+    guard let client else { return noErr }
+    let outputDevice = Unmanaged<CaptureLoopbackOutput>.fromOpaque(client).takeUnretainedValue()
+    outputDevice.render(output)
+    return noErr
+  }
+
+  private func render(_ output: UnsafeMutablePointer<AudioBufferList>) {
+    let buffers = UnsafeMutableAudioBufferListPointer(output)
+    guard let first = buffers.first, let data = first.mData, first.mDataByteSize > 0 else { return }
+    let encoding = plan.encoding
+    let frames: Int
+    switch encoding {
+    case .float32Interleaved:
+      let channels = max(Int(first.mNumberChannels), 1)
+      frames = Int(first.mDataByteSize) / (MemoryLayout<Float>.size * channels)
+    case .float32Planar:
+      frames = Int(first.mDataByteSize) / MemoryLayout<Float>.size
+    case .int16Interleaved:
+      let channels = max(Int(first.mNumberChannels), 1)
+      frames = Int(first.mDataByteSize) / (MemoryLayout<Int16>.size * channels)
+    case .unsupported:
+      return
+    }
+    guard frames > 0 else { return }
+    let chunk = scratch.count / 2
+    var done = 0
+    while done < frames {
+      let count = min(chunk, frames - done)
+      fillScratch(count)
+      switch encoding {
+      case .float32Interleaved:
+        writeInterleavedFloat(data, frames: count, channels: max(Int(first.mNumberChannels), 1), offset: done)
+      case .int16Interleaved:
+        writeInterleavedInt16(data, frames: count, channels: max(Int(first.mNumberChannels), 1), offset: done)
+      case .float32Planar:
+        writePlanarFloat(buffers, frames: count, offset: done)
+      case .unsupported:
+        return
+      }
+      done += count
+    }
+  }
+
+  private func fillScratch(_ frames: Int) {
+    lock.lock()
+    let gained = gain
+    let count = min(frames, storedFrames)
+    for index in 0..<count {
+      let source = readFrame * 2
+      scratch[index * 2] = ring[source] * gained
+      scratch[index * 2 + 1] = ring[source + 1] * gained
+      readFrame = (readFrame + 1) % (ring.count / 2)
+    }
+    storedFrames -= count
+    lock.unlock()
+    if count < frames {
+      for index in count..<frames {
+        scratch[index * 2] = 0
+        scratch[index * 2 + 1] = 0
+      }
+    }
+  }
+
+  private func writeInterleavedFloat(_ data: UnsafeMutableRawPointer, frames: Int, channels: Int, offset: Int) {
+    let destination = data.assumingMemoryBound(to: Float.self)
+    for frame in 0..<frames {
+      let at = offset + frame
+      destination[at * channels] = scratch[frame * 2]
+      if channels > 1 {
+        destination[at * channels + 1] = scratch[frame * 2 + 1]
+      }
+      if channels > 2 {
+        for channel in 2..<channels {
+          destination[at * channels + channel] = 0
+        }
+      }
+    }
+  }
+
+  private func writeInterleavedInt16(_ data: UnsafeMutableRawPointer, frames: Int, channels: Int, offset: Int) {
+    let destination = data.assumingMemoryBound(to: Int16.self)
+    for frame in 0..<frames {
+      let at = offset + frame
+      destination[at * channels] = CaptureRateConvert.int16(scratch[frame * 2])
+      if channels > 1 {
+        destination[at * channels + 1] = CaptureRateConvert.int16(scratch[frame * 2 + 1])
+      }
+      if channels > 2 {
+        for channel in 2..<channels {
+          destination[at * channels + channel] = 0
+        }
+      }
+    }
+  }
+
+  private func writePlanarFloat(_ buffers: UnsafeMutableAudioBufferListPointer, frames: Int, offset: Int) {
+    guard let left = buffers.first?.mData?.assumingMemoryBound(to: Float.self) else { return }
+    let right = buffers.count > 1 ? buffers[1].mData?.assumingMemoryBound(to: Float.self) : nil
+    for frame in 0..<frames {
+      left[offset + frame] = scratch[frame * 2]
+      right?[offset + frame] = scratch[frame * 2 + 1]
+    }
+  }
+
+  private func push(_ interleaved: [Float]) {
+    let frames = interleaved.count / 2
+    guard frames > 0 else { return }
+    let capacity = ring.count / 2
+    let incoming = min(frames, capacity)
+    let start = (frames - incoming) * 2
+    while storedFrames + incoming > capacity {
+      readFrame = (readFrame + 1) % capacity
+      storedFrames -= 1
+    }
+    for index in 0..<incoming {
+      let destination = writeFrame * 2
+      ring[destination] = interleaved[start + index * 2]
+      ring[destination + 1] = interleaved[start + index * 2 + 1]
+      writeFrame = (writeFrame + 1) % capacity
+    }
+    storedFrames += incoming
+  }
+
+  private static func outputFormat(of device: AudioDeviceID) -> AudioStreamBasicDescription? {
+    var address = AudioObjectPropertyAddress(
+      mSelector: kAudioDevicePropertyStreamFormat,
+      mScope: kAudioDevicePropertyScopeOutput,
+      mElement: kAudioObjectPropertyElementMain
+    )
+    var format = AudioStreamBasicDescription()
+    var size = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+    let status = AudioObjectGetPropertyData(device, &address, 0, nil, &size, &format)
+    guard status == noErr, format.mSampleRate > 0, format.mChannelsPerFrame > 0 else { return nil }
+    return format
+  }
+
+  private static func setFloatFormat(of device: AudioDeviceID, rate: Double, channels: Int) -> OSStatus {
+    var format = AudioStreamBasicDescription()
+    format.mSampleRate = rate
+    format.mFormatID = kAudioFormatLinearPCM
+    format.mFormatFlags = kAudioFormatFlagsNativeFloatPacked
+    format.mBytesPerPacket = UInt32(channels * MemoryLayout<Float>.size)
+    format.mFramesPerPacket = 1
+    format.mBytesPerFrame = format.mBytesPerPacket
+    format.mChannelsPerFrame = UInt32(channels)
+    format.mBitsPerChannel = 32
+    var address = AudioObjectPropertyAddress(
+      mSelector: kAudioDevicePropertyStreamFormat,
+      mScope: kAudioDevicePropertyScopeOutput,
+      mElement: kAudioObjectPropertyElementMain
+    )
+    return AudioObjectSetPropertyData(device, &address, 0, nil, UInt32(MemoryLayout<AudioStreamBasicDescription>.size), &format)
   }
 }
 

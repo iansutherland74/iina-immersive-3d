@@ -418,6 +418,86 @@ private func testRoute() {
   check(CaptureDefaultOutput.statusText(1852797029) == "1852797029 'nope'", "the OSStatus fourcc is logged")
 }
 
+private func testLoopbackPlayback() {
+  check(CapturePlaybackRoute.uid(restore: "SmartGlasses-DP", pinned: "BuiltInSpeakerDevice") == "SmartGlasses-DP", "playback uses the glasses uid from the restore file")
+  check(CapturePlaybackRoute.uid(restore: "  SmartGlasses-DP\n", pinned: nil) == "SmartGlasses-DP", "the restore file uid is trimmed")
+  check(CapturePlaybackRoute.uid(restore: "IINACaptureAudio_UID", pinned: "SmartGlasses-DP") == "SmartGlasses-DP", "playback does not target the virtual device")
+  check(CapturePlaybackRoute.uid(restore: nil, pinned: "SmartGlasses-DP") == "SmartGlasses-DP", "the pinned uid is used when the restore file is empty")
+  check(CapturePlaybackRoute.uid(restore: "", pinned: "IINACaptureAudio_UID") == nil, "there is no playback device when every uid is virtual")
+
+  let glasses441 = CapturePlaybackRoute.plan(sampleRate: 44100, channels: 2, bits: 32, isFloat: true, interleaved: true)
+  check(glasses441.resample && glasses441.sampleRate == 44100 && glasses441.channels == 2 && glasses441.encoding == .float32Interleaved, "44.1 kHz glasses are resampled from the 48 kHz loopback")
+  let glasses48 = CapturePlaybackRoute.plan(sampleRate: 48000, channels: 2, bits: 32, isFloat: true, interleaved: true)
+  check(!glasses48.resample && glasses48.encoding == .float32Interleaved, "48 kHz glasses play the loopback rate directly")
+  let int16 = CapturePlaybackRoute.plan(sampleRate: 48000, channels: 2, bits: 16, isFloat: false, interleaved: true)
+  check(int16.encoding == .int16Interleaved, "16-bit glasses are converted from float")
+  let planar = CapturePlaybackRoute.plan(sampleRate: 48000, channels: 2, bits: 32, isFloat: true, interleaved: false)
+  check(planar.encoding == .float32Planar, "planar float glasses stay planar")
+  check(CaptureRateConvert.int16(0.5) == 16384 && CaptureRateConvert.int16(-1) == -32767, "float samples convert to 16-bit")
+
+  let same = CaptureRateConvert.convert([0.25, -0.25, 0.5, -0.5], channels: 2, fromRate: 48000, toRate: 48000)
+  check(same.count == 4 && abs(same[0] - 0.25) < 0.0001 && abs(same[1] + 0.25) < 0.0001, "a matching rate is copied")
+  var tone = [Float](repeating: 0, count: 480 * 2)
+  for index in 0..<480 {
+    let sample = Float(sin(2 * Double.pi * Double(index) / 48))
+    tone[index * 2] = sample
+    tone[index * 2 + 1] = sample * 0.5
+  }
+  let converted = CaptureRateConvert.convert(tone, channels: 2, fromRate: 48000, toRate: 44100)
+  var energy = 0.0
+  for sample in converted {
+    energy += Double(sample * sample)
+  }
+  let mean = energy / Double(max(converted.count, 1))
+  check(converted.count > 400 && converted.count < 960 && mean > 0.05, "a 48 kHz tone resampled to 44.1 kHz is not silence")
+
+  check(CaptureDeviceGain.restoredScalar(0) == 1 && CaptureDeviceGain.restoredScalar(0.0001) == 1, "a zero loopback volume is raised to 1")
+  check(CaptureDeviceGain.restoredScalar(0.4) == nil, "a non-zero loopback volume is left alone")
+  check(CaptureDeviceGain.shouldClearMute(true) && !CaptureDeviceGain.shouldClearMute(false), "a muted loopback device is cleared")
+  let handoff = CaptureGlassesAudioHandoff.afterPin(readerRunning: true)
+  check(!handoff.stopReader && handoff.reopenOutput, "taking the glasses keeps the reader running and reopens the output")
+  let idle = CaptureGlassesAudioHandoff.afterPin(readerRunning: false)
+  check(!idle.stopReader && !idle.reopenOutput, "taking the glasses does not start a reader that is not running")
+
+  let home = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("iina-capture-log-\(UUID().uuidString)", isDirectory: true)
+  defer { try? FileManager.default.removeItem(at: home) }
+  CaptureAudioFileLog.append("loopback reader started device=7 uid=IINACaptureAudio_UID format=48000 Hz 2ch float32", home: home, maxBytes: 120)
+  CaptureAudioFileLog.append("loopback in rms=0.2500", home: home, maxBytes: 120)
+  let log = CaptureAudioFileLog.fileURL(home: home)
+  let first = (try? String(contentsOf: log, encoding: .utf8)) ?? ""
+  check(first.contains("loopback reader started") && first.contains("loopback in rms=0.2500"), "loopback lines are written to capture-audio.log")
+  for index in 0..<30 {
+    CaptureAudioFileLog.append("loopback out rms=0.2500 \(index)", home: home, maxBytes: 120)
+  }
+  let live = (try? String(contentsOf: log, encoding: .utf8)) ?? ""
+  let backupURL = URL(fileURLWithPath: log.path + ".1")
+  let backup = (try? String(contentsOf: backupURL, encoding: .utf8)) ?? ""
+  let attrs = try? FileManager.default.attributesOfItem(atPath: log.path)
+  let liveSize = (attrs?[.size] as? NSNumber)?.intValue ?? (attrs?[.size] as? Int) ?? Int.max
+  check(liveSize <= 200 && !backup.isEmpty && (live.contains("loopback out rms=") || backup.contains("loopback reader started")), "capture-audio.log rotates and stays small")
+
+  check(CaptureMicAccess.usageDescriptionPresent(["NSMicrophoneUsageDescription": "IINA reads the loopback"]), "the microphone usage description is present")
+  check(!CaptureMicAccess.usageDescriptionPresent(nil) && !CaptureMicAccess.usageDescriptionPresent([:]), "a missing microphone usage description is reported")
+  check(!CaptureMicAccess.usageDescriptionPresent(["NSMicrophoneUsageDescription": "  "]), "a blank microphone usage description is missing")
+  check(CaptureMicAccess.waitForDecision(.notDetermined), "microphone access is requested before the reader starts")
+  check(!CaptureMicAccess.waitForDecision(.authorized) && !CaptureMicAccess.waitForDecision(.denied), "a decided microphone starts the reader without another prompt")
+  check(CaptureMicAccess.inputWillBeSilence(.notDetermined) && CaptureMicAccess.inputWillBeSilence(.denied) && CaptureMicAccess.inputWillBeSilence(.restricted), "TCC delivers silence until the microphone is authorized")
+  check(!CaptureMicAccess.inputWillBeSilence(.authorized), "an authorized microphone can deliver samples")
+  let denied = CaptureMicAccess.logLine(status: .denied, usageDescriptionPresent: true)
+  check(denied.contains("loopback mic authorization denied") && denied.contains("usageDescription=present") && denied.contains("input=silence"), "a denied microphone is logged as silence")
+  let granted = CaptureMicAccess.logLine(status: .authorized, usageDescriptionPresent: true)
+  check(granted.contains("loopback mic authorization authorized") && granted.contains("input=live"), "an authorized microphone is logged as live")
+  let missing = CaptureMicAccess.logLine(status: .notDetermined, usageDescriptionPresent: false)
+  check(missing.contains("usageDescription=missing") && missing.contains("input=silence"), "a missing usage description is logged as silence")
+  if let plistPath = ProcessInfo.processInfo.environment["CAPTURE_INFO_PLIST"],
+     let plist = NSDictionary(contentsOfFile: plistPath),
+     let text = plist["NSMicrophoneUsageDescription"] as? String {
+    check(CaptureMicAccess.usageDescriptionPresent(["NSMicrophoneUsageDescription": text]), "Info.plist has NSMicrophoneUsageDescription")
+  } else {
+    check(false, "Info.plist has NSMicrophoneUsageDescription")
+  }
+}
+
 private func testContentRect() {
   let player = StereoOffscreen.contentRect(outputWidth: 3840, outputHeight: 1080, contentAspect: 16.0 / 9.0, fullSizeEyes: true, colorIsPicture: false)
   check(abs(player.x - 0.25) < 0.001 && abs(player.w - 0.5) < 0.001, "player 16:9 sits in the center of 3840x1080")
@@ -778,6 +858,7 @@ enum CaptureSelfTest {
     testQuitDuringCapture()
     testAudioPolicy()
     testRoute()
+    testLoopbackPlayback()
     testContentRect()
     let zombies = ProcessInfo.processInfo.environment["CAPTURE_ZOMBIES"] == "1"
     if !zombies {

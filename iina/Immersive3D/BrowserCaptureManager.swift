@@ -212,6 +212,15 @@ final class BrowserCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
     routedAudio = false
   }
 
+  /// The capture window moved onto the glasses. Keep reading the loopback and
+  /// open the output again on the device saved before the switch.
+  func reopenLoopbackOutput() {
+    guard routedAudio else { return }
+    audioPlayer.reopenOutput()
+  }
+
+  var routedAudioIsRunning: Bool { routedAudio }
+
   func perform(_ block: @escaping () -> Void) {
     queue.async(execute: block)
   }

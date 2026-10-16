@@ -53,8 +53,8 @@ compile() {
 
 compile "$work/capture-selftest" -sanitize=address
 echo "AddressSanitizer + MallocScribble"
-MallocScribble=1 MallocPreScribble=1 CAPTURE_METALLIB="$work/immersive.metallib" "$work/capture-selftest"
+MallocScribble=1 MallocPreScribble=1 CAPTURE_METALLIB="$work/immersive.metallib" CAPTURE_INFO_PLIST="$root/iina/Info.plist" "$work/capture-selftest"
 
 compile "$work/capture-selftest-zombies"
 echo "NSZombieEnabled + MallocScribble"
-NSZombieEnabled=YES MallocScribble=1 CAPTURE_ZOMBIES=1 CAPTURE_METALLIB="$work/immersive.metallib" "$work/capture-selftest-zombies"
+NSZombieEnabled=YES MallocScribble=1 CAPTURE_ZOMBIES=1 CAPTURE_METALLIB="$work/immersive.metallib" CAPTURE_INFO_PLIST="$root/iina/Info.plist" "$work/capture-selftest-zombies"
