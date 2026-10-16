@@ -210,7 +210,7 @@ enum CaptureSystemOutput {
   }
 
   /// Device name and UID are +1 CFStrings. The buffer is one pointer.
-  private static func copyString(_ device: AudioDeviceID, selector: AudioObjectPropertySelector) -> String? {
+  static func copyString(_ device: AudioDeviceID, selector: AudioObjectPropertySelector) -> String? {
     var address = AudioObjectPropertyAddress(
       mSelector: selector,
       mScope: kAudioObjectPropertyScopeGlobal,
@@ -376,6 +376,13 @@ enum CaptureAudioRouteController {
     return plan
   }
 
+  static func isRouted() -> Bool {
+    lock.lock()
+    defer { lock.unlock() }
+    if case .routed = state.phase { return true }
+    return false
+  }
+
   private static func currentMPVDevice() -> String {
     guard !PlayerCore.playerCores.isEmpty else { return "auto" }
     return PlayerCore.active.mpv.getString(MPVProperty.audioDevice) ?? "auto"
@@ -434,20 +441,20 @@ final class CaptureLoopbackReader {
 
   func start() -> Bool {
     guard let id = CaptureSystemOutput.deviceID(forUID: CaptureOutputRoute.virtualUID), let format else {
-      browserCaptureLog.error("loopback reader did not start device=0")
+      CaptureAudioFileLog.error("loopback reader did not start device=0")
       return false
     }
     stop()
     var created: AudioDeviceIOProcID?
     let status = AudioDeviceCreateIOProcID(id, Self.ioProc, Unmanaged.passUnretained(self).toOpaque(), &created)
     guard status == noErr, let created else {
-      browserCaptureLog.error("loopback reader did not start status=\(status) device=\(id)")
+      CaptureAudioFileLog.error("loopback reader did not start status=\(status) device=\(id)")
       return false
     }
     let started = AudioDeviceStart(id, created)
     guard started == noErr else {
       AudioDeviceDestroyIOProcID(id, created)
-      browserCaptureLog.error("loopback reader did not start status=\(started) device=\(id)")
+      CaptureAudioFileLog.error("loopback reader did not start status=\(started) device=\(id)")
       return false
     }
     device = id
@@ -465,7 +472,7 @@ final class CaptureLoopbackReader {
     self.timer = timer
     timer.resume()
     _ = format
-    browserCaptureLog.info("loopback reader started device=\(id) uid=\(CaptureOutputRoute.virtualUID, privacy: .public) format=48000 Hz 2ch float32")
+    CaptureAudioFileLog.info("loopback reader started device=\(id) uid=\(CaptureOutputRoute.virtualUID) format=48000 Hz 2ch float32")
     return true
   }
 
@@ -561,13 +568,13 @@ final class CaptureLoopbackReader {
     dropped = 0
     slotLock.unlock()
     if missed > 0 {
-      browserCaptureLog.error("loopback reader dropped \(missed) buffers")
+      CaptureAudioFileLog.error("loopback reader dropped \(missed) buffers")
     }
     if ready.isEmpty {
       let now = CACurrentMediaTime()
       if lastLevelLog == 0 || now - lastLevelLog >= 1 {
         lastLevelLog = now
-        browserCaptureLog.info("loopback in rms=0.0000")
+        CaptureAudioFileLog.info("loopback in rms=0.0000")
       }
     } else {
       noteInputLevel(ready)
@@ -608,7 +615,7 @@ final class CaptureLoopbackReader {
     levelSum = 0
     levelCount = 0
     let line = String(format: "loopback in rms=%.4f", mean)
-    browserCaptureLog.info("\(line, privacy: .public)")
+    CaptureAudioFileLog.info(line)
   }
 }
 

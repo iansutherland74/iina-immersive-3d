@@ -418,6 +418,170 @@ private func testRoute() {
   check(CaptureDefaultOutput.statusText(1852797029) == "1852797029 'nope'", "the OSStatus fourcc is logged")
 }
 
+private func testLoopbackOutput() {
+  let actions: [CaptureGlassesAudio.Action] = [.playOnGlasses, .exitGlasses, .immersive3DToggle, .screenParameters]
+  for action in actions {
+    check(CaptureGlassesAudio.routeEffects(for: action).isEmpty, "glasses action \(action) does not move the audio route")
+  }
+  check(CapturePinnedDeviceHold.keepMPVDevice(routed: true, deviceStillListed: false), "a missing device during capture keeps the mpv pin")
+  check(!CapturePinnedDeviceHold.keepMPVDevice(routed: true, deviceStillListed: true), "a device that is still listed is not a hold")
+  check(!CapturePinnedDeviceHold.keepMPVDevice(routed: false, deviceStillListed: false), "outside a capture a missing device can fall back to auto")
+
+  let notices: [CaptureOutputWatch.Notice] = [
+    .running(false),
+    .alive(false),
+    .nominalSampleRate(44100),
+    .streamFormat(sampleRate: 44100, channels: 8),
+    .devicesChanged,
+    .defaultOutputChanged,
+    .defaultSystemOutputChanged
+  ]
+  for notice in notices {
+    check(CaptureOutputWatch.routeEffects(for: notice).isEmpty, "\(notice.name) does not change the system output or mpv")
+  }
+  check(CaptureOutputWatch.Notice.devicesChanged.name == "Devices", "device list events are named")
+  check(CaptureOutputWatch.Notice.defaultOutputChanged.name == "DefaultOutputDevice", "default output events are named")
+  check(CaptureOutputWatch.Notice.streamFormat(sampleRate: 48000, channels: 2).name == "StreamFormat", "format events are named")
+
+  let before = CaptureOutputWatch.Snapshot(deviceID: 4, alive: true, running: true, sampleRate: 48000, channels: 2)
+  let stopped = CaptureOutputWatch.Snapshot(deviceID: 4, alive: true, running: false, sampleRate: 48000, channels: 2)
+  check(
+    CaptureOutputWatch.step(notice: .running(false), applied: before, resolved: stopped, rebuiltRecently: false) == .restart("DeviceIsRunning"),
+    "the output proc restarts when the device stops"
+  )
+  let reappeared = CaptureOutputWatch.Snapshot(deviceID: 11, alive: true, running: false, sampleRate: 44100, channels: 8)
+  check(
+    CaptureOutputWatch.step(notice: .devicesChanged, applied: before, resolved: reappeared, rebuiltRecently: false) == .restart("Devices"),
+    "re-enumeration restarts the output proc on the saved device"
+  )
+  check(
+    CaptureOutputWatch.step(notice: .defaultOutputChanged, applied: before, resolved: reappeared, rebuiltRecently: false) == .restart("DefaultOutputDevice"),
+    "a default-device change restarts the saved device and does not select the default"
+  )
+  check(
+    CaptureOutputWatch.step(notice: .streamFormat(sampleRate: 44100, channels: 8), applied: before, resolved: reappeared, rebuiltRecently: false) == .restart("StreamFormat"),
+    "a new rate and channel count restarts the output proc"
+  )
+  let opened = CaptureOutputWatch.Snapshot(deviceID: 11, alive: true, running: true, sampleRate: 44100, channels: 8)
+  check(
+    CaptureOutputWatch.step(notice: .running(true), applied: opened, resolved: opened, rebuiltRecently: true) == .keep,
+    "our own start does not restart again"
+  )
+  check(
+    CaptureOutputWatch.step(notice: .running(false), applied: opened, resolved: opened, rebuiltRecently: true) == .keep,
+    "a stop notification that has already recovered does not loop"
+  )
+  check(
+    CaptureOutputWatch.step(notice: .devicesChanged, applied: opened, resolved: opened, rebuiltRecently: true) == .keep,
+    "the device-list echo of a restart is ignored"
+  )
+  check(
+    CaptureOutputWatch.step(notice: .devicesChanged, applied: opened, resolved: opened, rebuiltRecently: false) == .restart("Devices"),
+    "a later device-list change rebuilds the proc once"
+  )
+  check(
+    CaptureOutputWatch.step(notice: .defaultSystemOutputChanged, applied: opened, resolved: opened, rebuiltRecently: false) == .restart("DefaultSystemOutputDevice"),
+    "the system output notification rebuilds the saved device once"
+  )
+  let retimed = CaptureOutputWatch.Snapshot(deviceID: 11, alive: true, running: true, sampleRate: 96000, channels: 2)
+  check(
+    CaptureOutputWatch.step(notice: .nominalSampleRate(96000), applied: opened, resolved: retimed, rebuiltRecently: true) == .restart("NominalSampleRate"),
+    "a sample-rate change restarts even when a rebuild just happened"
+  )
+  let reformatted = CaptureOutputWatch.Snapshot(
+    deviceID: 11, alive: true, running: true, sampleRate: 44100, channels: 8,
+    bits: 24, isFloat: false, bytesPerFrame: 6, nonInterleaved: false
+  )
+  check(
+    CaptureOutputWatch.step(notice: .streamFormat(sampleRate: 44100, channels: 8), applied: opened, resolved: reformatted, rebuiltRecently: true) == .restart("StreamFormat"),
+    "a new sample format restarts the output proc"
+  )
+  check(CaptureOutputWatch.matches(before, CaptureOutputWatch.Snapshot(deviceID: 4, alive: true, running: true, sampleRate: 48000.4, channels: 2)), "half a hertz is the same rate")
+  check(!CaptureOutputWatch.matches(before, retimed), "a different device does not match")
+  let split = CaptureOutputWatch.Snapshot(deviceID: 4, alive: true, running: true, sampleRate: 48000, channels: 2, nonInterleaved: true)
+  check(!CaptureOutputWatch.matches(before, split), "a non-interleaved format is a different stream")
+
+  let stereo = CaptureLoopbackMix.stereoPair(preferred: [1, 2], channels: 2)
+  check(stereo.left == 0 && stereo.right == 1, "stereo channels 1 and 2 are the first pair")
+  let surround = CaptureLoopbackMix.stereoPair(preferred: [3, 4], channels: 8)
+  check(surround.left == 2 && surround.right == 3, "the preferred pair is used on a multi-channel device")
+  let fallback = CaptureLoopbackMix.stereoPair(preferred: [0, 0], channels: 2)
+  check(fallback.left == 0 && fallback.right == 1, "an empty preferred pair falls back to stereo")
+  let monoPair = CaptureLoopbackMix.stereoPair(preferred: [1, 2], channels: 1)
+  check(monoPair.left == 0 && monoPair.right == 0, "a mono device mixes to its only channel")
+
+  var identity = [Float]()
+  for index in 0..<8 {
+    identity.append(Float(index))
+    identity.append(Float(-index))
+  }
+  let copied = CaptureLoopbackMix.render(
+    source: identity,
+    request: CaptureLoopbackMix.Request(outputFrames: 8, deviceRate: 48000, channels: 2, left: 0, right: 1, phase: 0)
+  )
+  var same = copied.consumed == 8 && copied.underrunFrames == 0 && copied.phase == 0 && copied.samples.count == identity.count
+  if same {
+    for index in 0..<identity.count where abs(copied.samples[index] - identity[index]) > 0.0001 {
+      same = false
+    }
+  }
+  check(same, "48 kHz output copies the loopback")
+
+  let short = CaptureLoopbackMix.render(
+    source: [1, -1, 0.5, -0.5],
+    request: CaptureLoopbackMix.Request(outputFrames: 4, deviceRate: 48000, channels: 2, left: 0, right: 1, phase: 0)
+  )
+  check(short.consumed == 2 && short.underrunFrames == 2 && short.phase == 0, "frames past the ring are underruns")
+  check(abs(short.samples[0] - 1) < 0.0001 && abs(short.samples[1] + 1) < 0.0001, "the first queued frame is played")
+  check(short.samples[4] == 0 && short.samples[6] == 0, "an underrun writes silence")
+
+  let doubled = CaptureLoopbackMix.render(
+    source: [1, -1, 0, 0],
+    request: CaptureLoopbackMix.Request(outputFrames: 4, deviceRate: 96000, channels: 2, left: 0, right: 1, phase: 0)
+  )
+  check(doubled.consumed == 2 && doubled.underrunFrames == 0, "96 kHz consumes the 48 kHz source at half speed")
+  check(abs(doubled.samples[0] - 1) < 0.0001 && abs(doubled.samples[2] - 0.5) < 0.0001, "96 kHz interpolates between source frames")
+  check(abs(doubled.samples[1] + 1) < 0.0001 && abs(doubled.samples[3] + 0.5) < 0.0001, "96 kHz interpolates the right channel")
+
+  var slow = [Float]()
+  for _ in 0..<8 {
+    slow.append(0.25)
+    slow.append(-0.25)
+  }
+  let halved = CaptureLoopbackMix.render(
+    source: slow,
+    request: CaptureLoopbackMix.Request(outputFrames: 4, deviceRate: 24000, channels: 2, left: 0, right: 1, phase: 0)
+  )
+  check(halved.consumed == 8 && halved.underrunFrames == 0, "24 kHz consumes two source frames per output frame")
+
+  let placed = CaptureLoopbackMix.render(
+    source: [0.5, -0.25],
+    request: CaptureLoopbackMix.Request(outputFrames: 1, deviceRate: 48000, channels: 6, left: 2, right: 4, phase: 0)
+  )
+  check(placed.samples.count == 6, "a 6 channel device gets one frame of 6 samples")
+  check(abs(placed.samples[2] - 0.5) < 0.0001 && abs(placed.samples[4] + 0.25) < 0.0001, "the preferred stereo pair receives the loopback")
+  check(placed.samples[0] == 0 && placed.samples[1] == 0 && placed.samples[3] == 0 && placed.samples[5] == 0, "the other channels stay silent")
+
+  let mono = CaptureLoopbackMix.render(
+    source: [1, -1],
+    request: CaptureLoopbackMix.Request(outputFrames: 1, deviceRate: 48000, channels: 1, left: 0, right: 0, phase: 0)
+  )
+  check(mono.samples.count == 1 && abs(mono.samples[0]) < 0.0001, "mono averages the stereo pair")
+
+  let carried = CaptureLoopbackMix.render(
+    source: [0, 0, 1, 1, 2, 2, 3, 3],
+    request: CaptureLoopbackMix.Request(outputFrames: 2, deviceRate: 96000, channels: 2, left: 0, right: 1, phase: 0.25)
+  )
+  check(abs(carried.phase - 0.25) < 0.0001 && carried.consumed == 1, "the resampler keeps the fractional source phase")
+  check(abs(carried.samples[0] - 0.25) < 0.0001 && abs(carried.samples[2] - 0.75) < 0.0001, "a fractional phase interpolates from the first source frame")
+
+  let silent = CaptureLoopbackMix.render(
+    source: [],
+    request: CaptureLoopbackMix.Request(outputFrames: 3, deviceRate: 48000, channels: 2, left: 0, right: 1, phase: 0)
+  )
+  check(silent.underrunFrames == 3 && silent.consumed == 0 && silent.samples.allSatisfy { $0 == 0 }, "an empty ring underruns every output frame")
+}
+
 private func testContentRect() {
   let player = StereoOffscreen.contentRect(outputWidth: 3840, outputHeight: 1080, contentAspect: 16.0 / 9.0, fullSizeEyes: true, colorIsPicture: false)
   check(abs(player.x - 0.25) < 0.001 && abs(player.w - 0.5) < 0.001, "player 16:9 sits in the center of 3840x1080")
@@ -778,6 +942,7 @@ enum CaptureSelfTest {
     testQuitDuringCapture()
     testAudioPolicy()
     testRoute()
+    testLoopbackOutput()
     testContentRect()
     let zombies = ProcessInfo.processInfo.environment["CAPTURE_ZOMBIES"] == "1"
     if !zombies {

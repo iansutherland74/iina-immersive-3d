@@ -6,11 +6,12 @@
 //  Based on IINA, Copyright (C) 2017-2026 Collider LI and contributors.
 //  Licensed under the GNU General Public License, version 3.
 //
-//  Plays loopback samples through AVAudioEngine on the real Core Audio device,
-//  following mpv volume and mute. The samples wait for the measured capture
-//  latency so they line up with the picture. ScreenCaptureKit audio stays off:
-//  muting the browser silences that capture, and playing it while the browser
-//  still speaks is an echo.
+//  Plays loopback samples on the saved Core Audio device. The host-clock path
+//  uses an IO proc so a glasses display-mode change can restart that proc.
+//  AVAudioEngine remains for the mute-tap path. Volume and mute follow mpv.
+//  The samples wait for the measured capture latency so they line up with the
+//  picture. ScreenCaptureKit audio stays off: muting the browser silences that
+//  capture, and playing it while the browser still speaks is an echo.
 
 import AVFoundation
 import AudioToolbox
@@ -53,6 +54,7 @@ final class BrowserCaptureAudioPlayer {
   var onStatus: ((String) -> Void)?
 
   private let queue = DispatchQueue(label: "com.colliderli.iina.browser-capture-audio", qos: .userInteractive)
+  private let loopbackOutput = CaptureLoopbackOutput()
   private let engine = AVAudioEngine()
   private let node = AVAudioPlayerNode()
   private let targetFormat: AVAudioFormat
@@ -97,30 +99,17 @@ final class BrowserCaptureAudioPlayer {
 
   func start() {
     queue.async { [weak self] in
-      self?.startOnQueue()
+      self?.startOnQueue(hostUID: nil)
     }
   }
 
   /// Loopback samples are stamped with the host clock. Playback starts at delay 0
   /// so a missing video present cannot mute the capture. A later measurement
   /// tightens that delay. `pinnedUID` is the real output, never the system default.
+  /// The glasses 3D button does not come through here and does not change this UID.
   func beginHostClock(pinnedUID: String) {
     queue.async { [weak self] in
-      guard let self else { return }
-      self.startOnQueue()
-      self.pinnedUID = pinnedUID
-      self.hostMode = true
-      self.haveDelay = true
-      self.hostDelay = 0
-      self.announcedDelayMs = nil
-      self.announcedOffset = nil
-      self.announcedOutput = false
-      self.loggedConvert = false
-      self.loggedDevice = false
-      self.loggedMute = false
-      self.lastOutLog = 0
-      self.outSum = 0
-      self.outCount = 0
+      self?.startOnQueue(hostUID: pinnedUID)
     }
   }
 
@@ -212,11 +201,14 @@ final class BrowserCaptureAudioPlayer {
     }
   }
 
-  private func startOnQueue() {
+  private func startOnQueue(hostUID: String?) {
     stopOnQueue()
-    hostMode = false
-    haveDelay = false
-    pinnedUID = nil
+    hostMode = hostUID != nil
+    haveDelay = hostUID != nil
+    pinnedUID = hostUID
+    if hostUID != nil {
+      hostDelay = 0
+    }
     started = true
     playingTap = false
     announcedTap = false
@@ -226,8 +218,21 @@ final class BrowserCaptureAudioPlayer {
     videoPTS = nil
     queuedUntil = 0
     pending.removeAll()
+    announcedDelayMs = nil
+    announcedOffset = nil
+    announcedOutput = false
+    loggedConvert = false
+    loggedDevice = false
+    loggedMute = false
+    lastOutLog = 0
+    outSum = 0
+    outCount = 0
     armRouteTimer()
     armDrainTimer()
+    if let hostUID {
+      loopbackOutput.start(uid: hostUID)
+      loopbackOutput.setGain(currentGain())
+    }
   }
 
   private func stopOnQueue() {
@@ -239,12 +244,17 @@ final class BrowserCaptureAudioPlayer {
     pending.removeAll()
     videoPTS = nil
     queuedUntil = 0
+    loopbackOutput.stop()
     if node.isPlaying {
       node.stop()
     }
     if engine.isRunning {
       engine.stop()
     }
+  }
+
+  private func currentGain() -> Float {
+    route.muted ? 0 : min(max(route.volume, 0), 1)
   }
 
   private func armRouteTimer() {
@@ -404,6 +414,14 @@ final class BrowserCaptureAudioPlayer {
   }
 
   private func schedule(_ buffer: AVAudioPCMBuffer) {
+    if hostMode {
+      guard let interleaved = Self.interleavedStereo(buffer) else { return }
+      interleaved.withUnsafeBufferPointer { raw in
+        guard let base = raw.baseAddress else { return }
+        self.loopbackOutput.write(base, frames: Int(buffer.frameLength))
+      }
+      return
+    }
     guard ensureEngine() else { return }
     noteOutputStarted()
     noteOutputLevel(buffer)
@@ -426,6 +444,8 @@ final class BrowserCaptureAudioPlayer {
   }
 
   private func noteOutputLevel(_ buffer: AVAudioPCMBuffer) {
+    // Host-clock playback logs rms from the output IO callback. This buffer is
+    // still ahead of the device, so it is not the level the glasses are playing.
     guard hostMode else { return }
     let level = rms(buffer)
     outSum += level
@@ -442,6 +462,7 @@ final class BrowserCaptureAudioPlayer {
 
   @discardableResult
   private func ensureEngine() -> Bool {
+    if hostMode { return false }
     if let pinnedUID, Self.deviceID(forUID: pinnedUID) == nil {
       if hostMode && !loggedDevice {
         loggedDevice = true
@@ -475,14 +496,25 @@ final class BrowserCaptureAudioPlayer {
 
   private func applyRoute(_ route: BrowserCaptureAudioRoute) {
     self.route = route
+    let gain = currentGain()
+    if hostMode {
+      // The IO proc owns the device. Starting AVAudioEngine here would keep the
+      // device id from before the glasses changed display mode.
+      loopbackOutput.setGain(gain)
+      if gain == 0 && !loggedMute {
+        loggedMute = true
+        CaptureAudioFileLog.info("loopback output gain is 0")
+      }
+      return
+    }
     if connected {
       applyDevice(force: false)
-      let gain = route.muted ? Float(0) : min(max(route.volume, 0), 1)
       engine.mainMixerNode.outputVolume = gain
     }
   }
 
   private func applyDevice(force: Bool) {
+    if hostMode { return }
     let uid = pinnedUID ?? route.deviceUID
     let device: AudioDeviceID
     if let uid, let id = Self.deviceID(forUID: uid) {
@@ -567,6 +599,21 @@ final class BrowserCaptureAudioPlayer {
     }
     guard error == nil, status != .error, output.frameLength > 0 else { return nil }
     return output
+  }
+
+  private static func interleavedStereo(_ buffer: AVAudioPCMBuffer) -> [Float]? {
+    guard let channels = buffer.floatChannelData else { return nil }
+    let frames = Int(buffer.frameLength)
+    let count = Int(buffer.format.channelCount)
+    guard frames > 0, count > 0 else { return nil }
+    var samples = [Float](repeating: 0, count: frames * 2)
+    let left = channels[0]
+    let right = count > 1 ? channels[1] : channels[0]
+    for frame in 0..<frames {
+      samples[frame * 2] = left[frame]
+      samples[frame * 2 + 1] = right[frame]
+    }
+    return samples
   }
 
   private func rms(_ buffer: AVAudioPCMBuffer) -> Float {
