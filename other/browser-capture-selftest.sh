@@ -2,8 +2,9 @@
 # Headless Browser Capture checks: session, drawable size, window follow, frame
 # coalescing, the quit-during-capture resize rule, latency smoothing, the sync
 # offset, the default-output read-back, audio policy, loopback route order, the
-# loopback ring, a tone through that loopback, texture lifetime, and one synthetic side-by-side frame. No
-# display is required.
+# loopback ring, a tone through that loopback, texture lifetime, one synthetic
+# side-by-side frame, and the live-caption silence gate plus hallucination
+# filter. No display is required.
 # AddressSanitizer and a zombie run cover the texture retain path. The HAL
 # plugin is not installed and coreaudiod is not restarted.
 set -euo pipefail
@@ -33,6 +34,7 @@ sources=(
   "$root/iina/Immersive3D/CaptureOutputRoute.swift"
   "$root/iina/Immersive3D/CaptureTextureLifetime.swift"
   "$root/iina/Immersive3D/StereoOffscreen.swift"
+  "$root/iina/LiveCaptions/LiveCaptionFilter.swift"
   "$root/other/capture-selftest/main.swift"
 )
 

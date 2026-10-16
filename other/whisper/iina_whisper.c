@@ -123,16 +123,20 @@ int iina_whisper_transcribe(
   params.print_realtime = false;
   params.print_timestamps = false;
   params.suppress_blank = true;
+  // suppress_non_speech_tokens. Drops the music-note, [MUSIC], and [Applause]
+  // tokens the model emits on music and noise. The default in whisper.cpp is off.
   params.suppress_nst = true;
   params.temperature = 0.0f;
   params.initial_prompt = NULL;
-  // Sung lyrics often score as non-speech or as low-probability tokens, so the
-  // stock 0.6 / -1.0 cutoffs return an empty result for a music video. The
-  // caller already drops near-silent chunks by RMS. "auto" still detects the
+  // whisper.cpp's stock fallbacks. The window is non-speech when
+  // no_speech_prob is above 0.6 and the average token logprob is below -1.0.
+  // Raising these (0.95 / -1.5) let "Thank you for watching" through on
+  // silence and noise. The caller also skips near-silent windows by RMS and
+  // drops a short or quiet outro after the decode. "auto" still detects the
   // language and then transcribes; detect_language must stay false because
   // that flag returns before any words are decoded.
-  params.no_speech_thold = 0.95f;
-  params.logprob_thold = -1.5f;
+  params.no_speech_thold = 0.6f;
+  params.logprob_thold = -1.0f;
   params.language = (language && language[0] && strcmp(language, "auto") != 0) ? language : "auto";
   params.detect_language = false;
   if (beam > 1) {

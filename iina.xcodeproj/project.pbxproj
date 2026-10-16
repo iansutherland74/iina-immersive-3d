@@ -186,6 +186,7 @@
 		B1E700112F00000100BEEF11 /* IPTVLiveOverlay.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1E700102F00000100BEEF10 /* IPTVLiveOverlay.swift */; };
 		B1E700132F00000100BEEF13 /* IPTVBrowseOverlay.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1E700122F00000100BEEF12 /* IPTVBrowseOverlay.swift */; };
 		C1E800112F00000100BEEF11 /* LiveCaptionEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = C1E800102F00000100BEEF10 /* LiveCaptionEngine.swift */; };
+		C1E800312F00000100BEEF31 /* LiveCaptionFilter.swift in Sources */ = {isa = PBXBuildFile; fileRef = C1E800302F00000100BEEF30 /* LiveCaptionFilter.swift */; };
 		C1E800132F00000100BEEF13 /* LiveCaptionOverlay.swift in Sources */ = {isa = PBXBuildFile; fileRef = C1E800122F00000100BEEF12 /* LiveCaptionOverlay.swift */; };
 		C1E800172F00000100BEEF17 /* LiveCaptionDecode.c in Sources */ = {isa = PBXBuildFile; fileRef = C1E800162F00000100BEEF16 /* LiveCaptionDecode.c */; };
 		C1E8001D2F00000100BEEF1D /* AudioToolbox.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = C1E8001C2F00000100BEEF1C /* AudioToolbox.framework */; };
@@ -1256,6 +1257,7 @@
 		B1E700102F00000100BEEF10 /* IPTVLiveOverlay.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = IPTVLiveOverlay.swift; sourceTree = "<group>"; };
 		B1E700122F00000100BEEF12 /* IPTVBrowseOverlay.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = IPTVBrowseOverlay.swift; sourceTree = "<group>"; };
 		C1E800102F00000100BEEF10 /* LiveCaptionEngine.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = LiveCaptionEngine.swift; sourceTree = "<group>"; };
+		C1E800302F00000100BEEF30 /* LiveCaptionFilter.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = LiveCaptionFilter.swift; sourceTree = "<group>"; };
 		C1E800122F00000100BEEF12 /* LiveCaptionOverlay.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = LiveCaptionOverlay.swift; sourceTree = "<group>"; };
 		C1E800142F00000100BEEF14 /* LiveCaptionDecode.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = LiveCaptionDecode.h; sourceTree = "<group>"; };
 		C1E800162F00000100BEEF16 /* LiveCaptionDecode.c */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.c; path = LiveCaptionDecode.c; sourceTree = "<group>"; };
@@ -2451,6 +2453,7 @@
 			isa = PBXGroup;
 			children = (
 				C1E800102F00000100BEEF10 /* LiveCaptionEngine.swift */,
+				C1E800302F00000100BEEF30 /* LiveCaptionFilter.swift */,
 				C1E800122F00000100BEEF12 /* LiveCaptionOverlay.swift */,
 				C1E800142F00000100BEEF14 /* LiveCaptionDecode.h */,
 				C1E800162F00000100BEEF16 /* LiveCaptionDecode.c */,
@@ -3232,6 +3235,7 @@
 				B1E700112F00000100BEEF11 /* IPTVLiveOverlay.swift in Sources */,
 				B1E700132F00000100BEEF13 /* IPTVBrowseOverlay.swift in Sources */,
 				C1E800112F00000100BEEF11 /* LiveCaptionEngine.swift in Sources */,
+				C1E800312F00000100BEEF31 /* LiveCaptionFilter.swift in Sources */,
 				C1E800132F00000100BEEF13 /* LiveCaptionOverlay.swift in Sources */,
 				C1E800172F00000100BEEF17 /* LiveCaptionDecode.c in Sources */,
 				C1E800202F00000100BEEF20 /* LiveCaptionTap.c in Sources */,
