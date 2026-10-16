@@ -157,6 +157,7 @@ final class LiveCaptionController {
   private var usingOSD = false
   private var savedSubVisibility: Bool?
   private var lastRaw = ""
+  private var lastSpokenKey = ""
   private var lastTranslated = ""
   private var observing = false
   private var cues: [CaptionCue] = []
@@ -406,6 +407,7 @@ final class LiveCaptionController {
     running = true
     activeURL = url
     lastRaw = ""
+    lastSpokenKey = ""
     lastTranslated = ""
     lastText = ""
     cues.removeAll()
@@ -543,10 +545,10 @@ final class LiveCaptionController {
     if missed >= 4 {
       presentStatusOSD("Live captions: listening")
     }
-    let level = rms(audio.samples)
+    let level = LiveCaptionFilter.rms(audio.samples)
     let chunkSeconds = Double(audio.samples.count) / 16000
     liveCaptionInfo(String(format: "chunk rms %.4f samples %d start %.2f dur %.2f", level, audio.samples.count, audio.start, chunkSeconds))
-    if level < 0.008 {
+    if !LiveCaptionFilter.shouldTranscribe(audio.samples) {
       if !loggedQuiet {
         loggedQuiet = true
         liveCaptionInfo("audio is below the speech threshold")
@@ -572,7 +574,7 @@ final class LiveCaptionController {
     let inference = Date().timeIntervalSince(started)
     guard token == generation else { return }
     let duration = Double(audio.samples.count) / 16000
-    var parsed = cues(from: raw, audioStart: audio.start, audioDuration: duration)
+    var parsed = cues(from: raw, audioStart: audio.start, audioDuration: duration, energy: level)
     if let now = mediaTime() {
       let audioEnd = audio.start + duration
       if audioEnd <= now + 0.5 {
@@ -965,42 +967,47 @@ final class LiveCaptionController {
       .replacingOccurrences(of: "\n", with: "\\N")
   }
 
-  private func clean(_ raw: String) -> String {
-    var text = raw.replacingOccurrences(of: "[BLANK_AUDIO]", with: "")
-    while let start = text.range(of: "<|"), let end = text.range(of: "|>", range: start.upperBound..<text.endIndex) {
-      text.removeSubrange(start.lowerBound..<end.upperBound)
-    }
-    text = text.trimmingCharacters(in: .whitespacesAndNewlines)
-    let folded = text.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: " .!?,;:"))
-    let junk: Set<String> = [
-      "", "you", "thank you", "thanks for watching", "thank you for watching",
-      "subtitles by the amara.org community", "www.youtube.com"
-    ]
-    if junk.contains(folded) { return "" }
-    if text.count > 400 {
-      text = String(text.prefix(400))
-    }
-    return text
+  private func boundedCaption(_ text: String) -> String {
+    guard text.count > 400 else { return text }
+    return String(text.prefix(400))
   }
 
-  private func cues(from raw: String, audioStart: Double, audioDuration: Double) -> [CaptionCue] {
+  private func cues(from raw: String, audioStart: Double, audioDuration: Double, energy: Float) -> [CaptionCue] {
     var parsed: [CaptionCue] = []
+    var previous = lastSpokenKey
+    var sawTimestamp = false
     for line in raw.split(separator: "\n", omittingEmptySubsequences: true) {
       let parts = line.split(separator: "\t", maxSplits: 2, omittingEmptySubsequences: false)
       guard parts.count == 3, let t0 = Double(parts[0]), let t1 = Double(parts[1]) else { continue }
-      let text = clean(String(parts[2]))
+      sawTimestamp = true
+      let duration = max(0, t1 - t0) / 100
+      let kept = LiveCaptionFilter.filter(
+        [LiveCaptionFilter.Segment(text: String(parts[2]), duration: duration)],
+        energy: energy,
+        previous: &previous
+      )
+      guard let segment = kept.first else { continue }
+      let text = boundedCaption(segment.text)
       guard !text.isEmpty else { continue }
       let start = audioStart + t0 / 100
       var end = audioStart + max(t0, t1) / 100
       if end < start + 0.8 { end = start + 1.6 }
       parsed.append(CaptionCue(start: start, end: end, text: text))
     }
-    if parsed.isEmpty {
-      let text = clean(raw.replacingOccurrences(of: "\t", with: " "))
-      if !text.isEmpty {
-        parsed.append(CaptionCue(start: audioStart, end: audioStart + max(1.6, audioDuration), text: text))
+    if !sawTimestamp {
+      let kept = LiveCaptionFilter.filter(
+        [LiveCaptionFilter.Segment(text: raw.replacingOccurrences(of: "\t", with: " "), duration: audioDuration)],
+        energy: energy,
+        previous: &previous
+      )
+      if let segment = kept.first {
+        let text = boundedCaption(segment.text)
+        if !text.isEmpty {
+          parsed.append(CaptionCue(start: audioStart, end: audioStart + max(1.6, audioDuration), text: text))
+        }
       }
     }
+    lastSpokenKey = previous
     return parsed
   }
 
@@ -1232,15 +1239,6 @@ final class LiveCaptionController {
       return "This item is not a live channel and could not be read ahead, so the line can arrive after the words."
     }
     return String(format: "Reading %.1f s ahead. Playback is not delayed. Whisper is taking about %.1f s.", reportedLookahead, measuredInference)
-  }
-
-  private func rms(_ samples: [Float]) -> Float {
-    guard !samples.isEmpty else { return 0 }
-    var acc: Float = 0
-    for value in samples {
-      acc += value * value
-    }
-    return sqrt(acc / Float(samples.count))
   }
 
   private func translate(_ text: String, sourceLanguage: String, target: String, alreadyEnglish: Bool) -> String {

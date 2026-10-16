@@ -34,6 +34,142 @@ private func chrome(_ id: UInt32, title: String, width: Int, height: Int, onScre
   )
 }
 
+private func testLiveCaptionFilter() {
+  let silent = [Float](repeating: 0, count: 16_000)
+  check(!LiveCaptionFilter.shouldTranscribe(silent), "silence is not sent to whisper")
+  check(LiveCaptionFilter.rms(silent) < LiveCaptionFilter.silenceRMS, "silence rms is below the gate")
+
+  let hiss = [Float](repeating: 0.004, count: 16_000)
+  check(!LiveCaptionFilter.shouldTranscribe(hiss), "near-silent noise is not sent to whisper")
+
+  var burst = [Float](repeating: 0, count: 16_000)
+  for index in 7680..<8160 {
+    burst[index] = 0.05
+  }
+  check(LiveCaptionFilter.shouldTranscribe(burst), "a short word in a quiet window is sent to whisper")
+  check(LiveCaptionFilter.shouldTranscribe([Float](repeating: 0.05, count: 1600)), "audible audio is sent to whisper")
+
+  check(LiveCaptionFilter.normalize("Thanks for watching!!!") == "thanks for watching", "phrase match ignores case and punctuation")
+  check(LiveCaptionFilter.normalize("  PLEASE   SUBSCRIBE. ") == "please subscribe", "phrase match collapses spaces")
+
+  let outros = [
+    "Thank you for watching",
+    "Thanks for watching",
+    "Please subscribe",
+    "Thank you.",
+    "Bye.",
+    "THANKS FOR WATCHING!!!",
+    "Bye!",
+    "You"
+  ]
+  for phrase in outros {
+    var previous = ""
+    let dropped = LiveCaptionFilter.filter(
+      [LiveCaptionFilter.Segment(text: phrase, duration: 1.2)],
+      energy: 0.08,
+      previous: &previous
+    )
+    check(dropped.isEmpty, "short hallucination dropped: \(phrase)")
+  }
+
+  var previous = ""
+  let spokenOutro = LiveCaptionFilter.filter(
+    [LiveCaptionFilter.Segment(text: "Thank you for watching", duration: 4.0)],
+    energy: 0.08,
+    previous: &previous
+  )
+  check(spokenOutro.count == 1, "a long loud thank-you is kept")
+
+  previous = ""
+  let quietOutro = LiveCaptionFilter.filter(
+    [LiveCaptionFilter.Segment(text: "Please subscribe", duration: 4.0)],
+    energy: 0.01,
+    previous: &previous
+  )
+  check(quietOutro.isEmpty, "a long low-energy hallucination is dropped")
+
+  previous = ""
+  let sentence = LiveCaptionFilter.filter(
+    [LiveCaptionFilter.Segment(text: "Thank you for watching the second half with us", duration: 1.2)],
+    energy: 0.08,
+    previous: &previous
+  )
+  check(sentence.count == 1, "a short line that only contains the phrase is kept")
+
+  previous = ""
+  let combined = LiveCaptionFilter.filter(
+    [LiveCaptionFilter.Segment(text: "Thank you. Bye.", duration: 1.0)],
+    energy: 0.08,
+    previous: &previous
+  )
+  check(combined.isEmpty, "joined hallucination phrases are dropped when short")
+
+  previous = ""
+  let blank = LiveCaptionFilter.filter(
+    [LiveCaptionFilter.Segment(text: "[BLANK_AUDIO] <|endoftext|>", duration: 1.0)],
+    energy: 0.08,
+    previous: &previous
+  )
+  check(blank.isEmpty && previous.isEmpty, "blank-audio tokens are dropped")
+
+  previous = ""
+  let once = LiveCaptionFilter.filter(
+    [
+      LiveCaptionFilter.Segment(text: "Hello there", duration: 1.0),
+      LiveCaptionFilter.Segment(text: "Hello there!", duration: 1.0)
+    ],
+    energy: 0.08,
+    previous: &previous
+  )
+  check(once.count == 1, "a repeated short segment is dropped")
+
+  previous = ""
+  let firstWindow = LiveCaptionFilter.filter(
+    [LiveCaptionFilter.Segment(text: "Hello there", duration: 1.0)],
+    energy: 0.08,
+    previous: &previous
+  )
+  let nextWindow = LiveCaptionFilter.filter(
+    [LiveCaptionFilter.Segment(text: "hello there", duration: 1.0)],
+    energy: 0.08,
+    previous: &previous
+  )
+  check(firstWindow.count == 1 && nextWindow.isEmpty, "a repeated short segment from the next window is dropped")
+
+  previous = ""
+  let longLine = "The weather stays clear through the evening"
+  let longKept = LiveCaptionFilter.filter(
+    [
+      LiveCaptionFilter.Segment(text: longLine, duration: 4.0),
+      LiveCaptionFilter.Segment(text: longLine, duration: 4.0)
+    ],
+    energy: 0.08,
+    previous: &previous
+  )
+  check(longKept.count == 2, "a repeated long loud line is kept")
+
+  previous = ""
+  let loud = LiveCaptionFilter.filter(
+    [LiveCaptionFilter.Segment(text: longLine, duration: 4.0)],
+    energy: 0.08,
+    previous: &previous
+  )
+  let quietRepeat = LiveCaptionFilter.filter(
+    [LiveCaptionFilter.Segment(text: longLine, duration: 4.0)],
+    energy: 0.01,
+    previous: &previous
+  )
+  check(loud.count == 1 && quietRepeat.isEmpty, "a repeated line is dropped when the audio is low-energy")
+
+  previous = ""
+  let quietSpeech = LiveCaptionFilter.filter(
+    [LiveCaptionFilter.Segment(text: longLine, duration: 4.0)],
+    energy: 0.01,
+    previous: &previous
+  )
+  check(quietSpeech.count == 1, "low-energy speech that is not a known phrase is kept")
+}
+
 private func testDrawable() {
   let full = GlassesDrawable.pixels(pointsWidth: 3840, pointsHeight: 1080, scale: 1)
   check(full?.width == 3840 && full?.height == 1080, "3840x1080 points at scale 1")
@@ -769,6 +905,7 @@ private func testScale() {
 @main
 enum CaptureSelfTest {
   static func main() {
+    testLiveCaptionFilter()
     testDrawable()
     testDrawableLock()
     testSession()
