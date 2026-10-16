@@ -120,6 +120,45 @@ int main(void) {
     IINALoopback_Write(&loop, 512, tone, 512, IINA_LOOPBACK_SOURCE);
     IINALoopback_Read(&loop, 1024, heard, 512);
     check(heard[0] == 0.5f, "the buffer after that is the tone just written");
+
+    /* macOS 13.7 can ask for input on a sample time that never overlapped
+       the output write. That used to be a buffer of zeros. */
+    IINALoopback_Reset(&loop);
+    for (i = 0; i < 512 * 2; i++) {
+      tone[i] = (i % 2 == 0) ? 0.25f : -0.25f;
+    }
+    IINALoopback_Write(&loop, 8000, tone, 512, IINA_LOOPBACK_SOURCE);
+    for (i = 0; i < 512 * 2; i++) {
+      heard[i] = 0.0f;
+    }
+    IINALoopback_Read(&loop, 0, heard, 512);
+    check(heard[0] == 0.25f && heard[1] == -0.25f, "a read on the other timeline is the last tone, not silence");
+
+    /* WriteMix of the mixed buffer can carry the reader's client id and
+       still hold the browser. Dropping that buffer is silence. */
+    IINALoopback_Reset(&loop);
+    for (i = 0; i < 512 * 2; i++) {
+      tone[i] = (i % 2 == 0) ? 0.25f : -0.25f;
+      heard[i] = 0.0f;
+    }
+    IINALoopback_Write(&loop, 1000, tone, 512, IINA_LOOPBACK_READER);
+    IINALoopback_Read(&loop, 1000, heard, 512);
+    check(heard[0] == 0.25f && heard[1] == -0.25f, "a mix tagged as the reader is kept when it is not silence");
+  }
+
+  {
+    IINAClock clock;
+    double sample = -1;
+    double host = -1;
+    double period = 500.0 * 16384.0;
+    IINAClock_Reset(&clock, 500.0, 16384, 1000.0);
+    IINAClock_Read(&clock, 1000.0, &sample, &host);
+    check(sample == 0.0 && host == 1000.0, "the clock starts at sample 0");
+    IINAClock_Read(&clock, 1000.0 + period * 5.0 + 10.0, &sample, &host);
+    check(sample == 16384.0 * 5.0, "the clock catches up every elapsed period, not one period per call");
+    check(host == 1000.0 + period * 5.0, "the host time matches the periods that elapsed");
+    IINAClock_Read(&clock, 1000.0 + period * 5.0 + 10.0, &sample, &host);
+    check(sample == 16384.0 * 5.0, "asking again in the same period does not move the clock");
   }
 
   if (fails != 0) {

@@ -241,3 +241,201 @@ enum CaptureLoopbackClock {
     return .play
   }
 }
+
+/// The output IO proc plays on the device written to the restore file. That is
+/// the glasses when they were the default output. The virtual device is never
+/// a playback target: the system default is the loopback while a capture runs.
+enum CapturePlaybackRoute {
+  enum Encoding: Equatable {
+    case float32Interleaved
+    case float32Planar
+    case int16Interleaved
+    case unsupported
+  }
+
+  struct Plan: Equatable {
+    var sampleRate: Double
+    var channels: Int
+    var encoding: Encoding
+    var resample: Bool
+  }
+
+  static func uid(restore: String?, pinned: String?) -> String? {
+    let saved = cleaned(restore)
+    if let saved, !CaptureOutputRoute.isVirtualUID(saved) {
+      return saved
+    }
+    let fallback = cleaned(pinned)
+    if let fallback, !CaptureOutputRoute.isVirtualUID(fallback) {
+      return fallback
+    }
+    return nil
+  }
+
+  /// Glasses are 2 ch at 48 kHz or 44.1 kHz. The loopback is always 48 kHz,
+  /// so a 44.1 kHz device has to be resampled or the IO proc writes the wrong
+  /// clock and the glasses stay silent.
+  static func plan(sampleRate: Double, channels: Int, bits: Int, isFloat: Bool, interleaved: Bool) -> Plan {
+    let rate = sampleRate > 0 ? sampleRate : 48000
+    let count = channels > 0 ? channels : 2
+    let encoding: Encoding
+    if isFloat && bits == 32 && interleaved {
+      encoding = .float32Interleaved
+    } else if isFloat && bits == 32 && !interleaved {
+      encoding = .float32Planar
+    } else if !isFloat && bits == 16 && interleaved {
+      encoding = .int16Interleaved
+    } else {
+      encoding = .unsupported
+    }
+    return Plan(sampleRate: rate, channels: count, encoding: encoding, resample: abs(rate - 48000) > 1)
+  }
+
+  private static func cleaned(_ uid: String?) -> String? {
+    guard let uid else { return nil }
+    let trimmed = uid.trimmingCharacters(in: .whitespacesAndNewlines)
+    return trimmed.isEmpty ? nil : trimmed
+  }
+}
+
+/// Linear resampler from the 48 kHz loopback to the output device rate.
+enum CaptureRateConvert {
+  struct Stream {
+    var fromRate: Double
+    var toRate: Double
+    var channels: Int
+    private var pending: [Float] = []
+    private var phase = 0.0
+
+    init(fromRate: Double, toRate: Double, channels: Int) {
+      self.fromRate = fromRate > 0 ? fromRate : 48000
+      self.toRate = toRate > 0 ? toRate : 48000
+      self.channels = max(channels, 1)
+    }
+
+    mutating func reset(fromRate: Double, toRate: Double, channels: Int) {
+      self = Stream(fromRate: fromRate, toRate: toRate, channels: channels)
+    }
+
+    mutating func process(_ interleaved: [Float]) -> [Float] {
+      guard channels > 0, interleaved.count >= channels else { return [] }
+      if abs(fromRate - toRate) <= 1 {
+        return interleaved
+      }
+      pending.append(contentsOf: interleaved)
+      let available = pending.count / channels
+      guard available >= 2 else { return [] }
+      let step = fromRate / toRate
+      var produced: [Float] = []
+      while phase + 1 < Double(available) {
+        let index = Int(phase)
+        let fraction = Float(phase - Double(index))
+        for channel in 0..<channels {
+          let a = pending[index * channels + channel]
+          let b = pending[(index + 1) * channels + channel]
+          produced.append(a + (b - a) * fraction)
+        }
+        phase += step
+      }
+      let drop = min(Int(phase), max(available - 1, 0))
+      if drop > 0 {
+        pending.removeFirst(drop * channels)
+        phase -= Double(drop)
+      }
+      return produced
+    }
+  }
+
+  static func convert(_ interleaved: [Float], channels: Int, fromRate: Double, toRate: Double) -> [Float] {
+    var stream = Stream(fromRate: fromRate, toRate: toRate, channels: channels)
+    return stream.process(interleaved)
+  }
+
+  static func int16(_ sample: Float) -> Int16 {
+    guard sample.isFinite else { return 0 }
+    let clamped = min(max(sample, -1), 1)
+    return Int16((clamped * 32767).rounded())
+  }
+}
+
+/// A volume of 0, or a mute, on IINA Capture Audio silences the read. The
+/// device has no slider of its own until it becomes the default output, and
+/// macOS can leave the scalar at 0.
+enum CaptureDeviceGain {
+  static func restoredScalar(_ scalar: Float) -> Float? {
+    scalar <= 0.0001 ? 1 : nil
+  }
+
+  static func shouldClearMute(_ muted: Bool) -> Bool {
+    muted
+  }
+}
+
+/// Pinning the capture on the glasses reopens the output after the display
+/// mode settles. It does not stop the reader, or the browser's audio is gone
+/// for the rest of the capture.
+enum CaptureGlassesAudioHandoff {
+  struct Result: Equatable {
+    var stopReader: Bool
+    var reopenOutput: Bool
+  }
+
+  static func afterPin(readerRunning: Bool) -> Result {
+    Result(stopReader: false, reopenOutput: readerRunning)
+  }
+}
+
+/// Unified logging redacts these lines on the machine that has the glasses.
+/// The same text is appended here so it can be read from the home directory.
+enum CaptureAudioFileLog {
+  static let maxBytes = 200_000
+
+  private static let lock = NSLock()
+  private static let formatter: DateFormatter = {
+    let formatter = DateFormatter()
+    formatter.locale = Locale(identifier: "en_US_POSIX")
+    formatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
+    formatter.timeZone = TimeZone(identifier: "UTC")
+    return formatter
+  }()
+
+  static func fileURL(home: URL) -> URL {
+    home
+      .appendingPathComponent("Library/Logs/IINA", isDirectory: true)
+      .appendingPathComponent("capture-audio.log")
+  }
+
+  static func append(_ line: String, home: URL = URL(fileURLWithPath: NSHomeDirectory()), maxBytes: Int = CaptureAudioFileLog.maxBytes) {
+    let text = line.trimmingCharacters(in: .newlines)
+    guard !text.isEmpty else { return }
+    lock.lock()
+    defer { lock.unlock() }
+    let file = fileURL(home: home)
+    let directory = file.deletingLastPathComponent()
+    do {
+      try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    } catch {
+      return
+    }
+    rotateIfNeeded(file, maxBytes: maxBytes)
+    let stamped = formatter.string(from: Date()) + " " + text + "\n"
+    if FileManager.default.fileExists(atPath: file.path),
+       let handle = try? FileHandle(forWritingTo: file) {
+      _ = try? handle.seekToEnd()
+      handle.write(Data(stamped.utf8))
+      try? handle.close()
+    } else {
+      try? Data(stamped.utf8).write(to: file)
+    }
+  }
+
+  private static func rotateIfNeeded(_ file: URL, maxBytes: Int) {
+    guard maxBytes > 0,
+          let attrs = try? FileManager.default.attributesOfItem(atPath: file.path),
+          let size = attrs[.size] as? NSNumber,
+          size.intValue > maxBytes else { return }
+    let backup = URL(fileURLWithPath: file.path + ".1")
+    try? FileManager.default.removeItem(at: backup)
+    try? FileManager.default.moveItem(at: file, to: backup)
+  }
+}

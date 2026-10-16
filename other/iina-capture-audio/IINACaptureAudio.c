@@ -89,9 +89,7 @@ static pthread_mutex_t gMutex = PTHREAD_MUTEX_INITIALIZER;
 static IINALoopback gLoop;
 static UInt32 gIOCount = 0;
 static Float64 gTicksPerFrame = 0;
-static UInt64 gAnchorHost = 0;
-static Float64 gPreviousTicks = 0;
-static UInt64 gStampCount = 0;
+static IINAClock gClock;
 static UInt32 gReaderClient = 0;
 static bool gReaderKnown = false;
 static Float32 gVolume = 1.0f;
@@ -764,9 +762,7 @@ static OSStatus IINA_StartIO(AudioServerPlugInDriverRef driver, AudioObjectID de
   pthread_mutex_lock(&gMutex);
   if (gIOCount == 0) {
     IINALoopback_Reset(&gLoop);
-    gAnchorHost = mach_absolute_time();
-    gPreviousTicks = 0;
-    gStampCount = 0;
+    IINAClock_Reset(&gClock, gTicksPerFrame, IINA_RING_FRAMES, (double)mach_absolute_time());
     gReaderKnown = false;
     gReaderClient = 0;
   }
@@ -791,29 +787,21 @@ static OSStatus IINA_StopIO(AudioServerPlugInDriverRef driver, AudioObjectID dev
 }
 
 static OSStatus IINA_GetZeroTimeStamp(AudioServerPlugInDriverRef driver, AudioObjectID deviceObjectID, UInt32 clientID, Float64 *outSampleTime, UInt64 *outHostTime, UInt64 *outSeed) {
-  Float64 period;
-  UInt64 now;
-  UInt64 nextHost;
+  double now;
+  double sample;
+  double host;
   (void)clientID;
   if (!isDriver(driver) || deviceObjectID != kObjectID_Device || outSampleTime == NULL || outHostTime == NULL || outSeed == NULL) {
     return kAudioHardwareBadObjectError;
   }
   pthread_mutex_lock(&gMutex);
-  if (gAnchorHost == 0) {
-    gAnchorHost = mach_absolute_time();
+  now = (double)mach_absolute_time();
+  if (gClock.anchorHost == 0 || gClock.periodFrames == 0) {
+    IINAClock_Reset(&gClock, gTicksPerFrame > 0 ? gTicksPerFrame : 1, IINA_RING_FRAMES, now);
   }
-  period = gTicksPerFrame * (Float64)IINA_RING_FRAMES;
-  if (period < 1.0) {
-    period = 1.0;
-  }
-  now = mach_absolute_time();
-  nextHost = gAnchorHost + (UInt64)(gPreviousTicks + period);
-  if (nextHost <= now) {
-    gStampCount += 1;
-    gPreviousTicks += period;
-  }
-  *outSampleTime = (Float64)(gStampCount * IINA_RING_FRAMES);
-  *outHostTime = gAnchorHost + (UInt64)gPreviousTicks;
+  IINAClock_Read(&gClock, now, &sample, &host);
+  *outSampleTime = sample;
+  *outHostTime = (UInt64)host;
   *outSeed = 1;
   pthread_mutex_unlock(&gMutex);
   return noErr;
