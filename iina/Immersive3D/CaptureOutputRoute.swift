@@ -371,6 +371,52 @@ enum CaptureDeviceGain {
   }
 }
 
+/// Microphone TCC applies to the loopback input. The orange mic indicator
+/// means the IO proc is running; without authorization, macOS still fills
+/// every buffer with zeros. `NSAudioCaptureUsageDescription` does not cover
+/// this prompt.
+enum CaptureMicAuthorization: Equatable {
+  case notDetermined
+  case restricted
+  case denied
+  case authorized
+}
+
+enum CaptureMicAccess {
+  static func usageDescriptionPresent(_ info: [String: Any]?) -> Bool {
+    guard let text = info?["NSMicrophoneUsageDescription"] as? String else { return false }
+    return !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+  }
+
+  /// The system prompt has to finish before `AudioDeviceStart`. Starting the
+  /// input while the answer is still pending leaves the orange indicator on
+  /// and the samples at zero for that IO proc.
+  static func waitForDecision(_ status: CaptureMicAuthorization) -> Bool {
+    status == .notDetermined
+  }
+
+  static func inputWillBeSilence(_ status: CaptureMicAuthorization) -> Bool {
+    status != .authorized
+  }
+
+  static func logLine(status: CaptureMicAuthorization, usageDescriptionPresent: Bool) -> String {
+    let name: String
+    switch status {
+    case .notDetermined: name = "notDetermined"
+    case .restricted: name = "restricted"
+    case .denied: name = "denied"
+    case .authorized: name = "authorized"
+    }
+    let described = usageDescriptionPresent ? "present" : "missing"
+    let input = inputWillBeSilence(status) ? "silence" : "live"
+    var line = "loopback mic authorization \(name) usageDescription=\(described) input=\(input)"
+    if status == .denied || status == .restricted {
+      line += " enable Microphone for IINA in System Settings"
+    }
+    return line
+  }
+}
+
 /// Pinning the capture on the glasses reopens the output after the display
 /// mode settles. It does not stop the reader, or the browser's audio is gone
 /// for the rest of the capture.

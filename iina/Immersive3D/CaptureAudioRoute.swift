@@ -548,6 +548,7 @@ final class CaptureLoopbackReader {
 
   private let queue = DispatchQueue(label: "com.colliderli.iina.capture-loopback", qos: .userInteractive)
   private let slotLock = NSLock()
+  private let ioLock = NSLock()
   private var slots: [Slot] = (0..<16).map { _ in Slot() }
   private var device = AudioDeviceID(0)
   private var procID: AudioDeviceIOProcID?
@@ -557,6 +558,8 @@ final class CaptureLoopbackReader {
   private var lastLevelLog: CFTimeInterval = 0
   private var levelSum: Float = 0
   private var levelCount = 0
+  private var loggedSignal = false
+  private var startGeneration = 0
   private let format = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 48000, channels: 2, interleaved: true)
 
   private struct Slot {
@@ -567,11 +570,68 @@ final class CaptureLoopbackReader {
   }
 
   func start() -> Bool {
-    guard let id = CaptureSystemOutput.deviceID(forUID: CaptureOutputRoute.virtualUID), let format else {
+    guard CaptureSystemOutput.deviceID(forUID: CaptureOutputRoute.virtualUID) != nil, format != nil else {
       captureAudioNote("loopback reader did not start device=0 status=\(CaptureDefaultOutput.statusText(kAudioHardwareBadDeviceError))", error: true)
       return false
     }
     stop()
+    ioLock.lock()
+    startGeneration += 1
+    let generation = startGeneration
+    ioLock.unlock()
+    let described = CaptureMicAccess.usageDescriptionPresent(Bundle.main.infoDictionary)
+    let authorization = Self.microphoneAuthorization()
+    captureAudioNote(
+      CaptureMicAccess.logLine(status: authorization, usageDescriptionPresent: described),
+      error: CaptureMicAccess.inputWillBeSilence(authorization)
+    )
+    if CaptureMicAccess.waitForDecision(authorization) {
+      guard described else {
+        captureAudioNote("loopback mic authorization not requested usageDescription=missing", error: true)
+        return startIO(generation: generation)
+      }
+      captureAudioNote("loopback mic authorization requesting")
+      AVCaptureDevice.requestAccess(for: .audio) { [weak self] granted in
+        let after: CaptureMicAuthorization = granted ? .authorized : .denied
+        captureAudioNote(CaptureMicAccess.logLine(status: after, usageDescriptionPresent: true), error: !granted)
+        self?.queue.async {
+          guard let self else { return }
+          if !self.startIO(generation: generation) {
+            captureAudioNote("loopback reader did not start after mic authorization", error: true)
+          }
+        }
+      }
+      return true
+    }
+    return startIO(generation: generation)
+  }
+
+  private static func microphoneAuthorization() -> CaptureMicAuthorization {
+    switch AVCaptureDevice.authorizationStatus(for: .audio) {
+    case .authorized:
+      return .authorized
+    case .denied:
+      return .denied
+    case .restricted:
+      return .restricted
+    case .notDetermined:
+      return .notDetermined
+    @unknown default:
+      return .notDetermined
+    }
+  }
+
+  /// `false` only when this generation is still current and the device did not
+  /// start. A stop that landed during the microphone prompt is not a failure.
+  private func startIO(generation: Int) -> Bool {
+    ioLock.lock()
+    let current = startGeneration == generation
+    ioLock.unlock()
+    guard current else { return true }
+    guard let id = CaptureSystemOutput.deviceID(forUID: CaptureOutputRoute.virtualUID), format != nil else {
+      captureAudioNote("loopback reader did not start device=0 status=\(CaptureDefaultOutput.statusText(kAudioHardwareBadDeviceError))", error: true)
+      return false
+    }
     var created: AudioDeviceIOProcID?
     let status = AudioDeviceCreateIOProcID(id, Self.ioProc, Unmanaged.passUnretained(self).toOpaque(), &created)
     guard status == noErr, let created else {
@@ -584,6 +644,20 @@ final class CaptureLoopbackReader {
       captureAudioNote("loopback reader did not start status=\(CaptureDefaultOutput.statusText(started)) device=\(id)", error: true)
       return false
     }
+    let timer = DispatchSource.makeTimerSource(queue: queue)
+    timer.schedule(deadline: .now() + 0.01, repeating: 0.01)
+    timer.setEventHandler { [weak self] in
+      self?.drain()
+    }
+    ioLock.lock()
+    if startGeneration != generation {
+      ioLock.unlock()
+      timer.cancel()
+      timer.resume()
+      AudioDeviceStop(id, created)
+      AudioDeviceDestroyIOProcID(id, created)
+      return true
+    }
     device = id
     procID = created
     running = true
@@ -591,27 +665,29 @@ final class CaptureLoopbackReader {
     lastLevelLog = 0
     levelSum = 0
     levelCount = 0
-    let timer = DispatchSource.makeTimerSource(queue: queue)
-    timer.schedule(deadline: .now() + 0.01, repeating: 0.01)
-    timer.setEventHandler { [weak self] in
-      self?.drain()
-    }
+    loggedSignal = false
     self.timer = timer
     timer.resume()
-    _ = format
+    ioLock.unlock()
     captureAudioNote("loopback reader started device=\(id) uid=\(CaptureOutputRoute.virtualUID) format=48000 Hz 2ch float32")
     captureAudioNote(CaptureSystemOutput.ensureLoopbackAudible(device: id))
     return true
   }
 
   func stop() {
-    timer?.cancel()
-    timer = nil
+    ioLock.lock()
+    startGeneration += 1
+    let proc = procID
+    let dev = device
+    procID = nil
     running = false
-    if let procID {
-      AudioDeviceStop(device, procID)
-      AudioDeviceDestroyIOProcID(device, procID)
-      self.procID = nil
+    let pending = timer
+    timer = nil
+    ioLock.unlock()
+    pending?.cancel()
+    if let proc {
+      AudioDeviceStop(dev, proc)
+      AudioDeviceDestroyIOProcID(dev, proc)
     }
     slotLock.lock()
     for index in slots.indices {
@@ -702,7 +778,7 @@ final class CaptureLoopbackReader {
       let now = CACurrentMediaTime()
       if lastLevelLog == 0 || now - lastLevelLog >= 1 {
         lastLevelLog = now
-        captureAudioNote("loopback in rms=0.0000")
+        captureAudioNote("loopback in rms=0.0000 samples=none")
       }
     } else {
       noteInputLevel(ready)
@@ -742,8 +818,15 @@ final class CaptureLoopbackReader {
     let mean = levelSum / Float(max(levelCount, 1))
     levelSum = 0
     levelCount = 0
-    let line = String(format: "loopback in rms=%.4f", mean)
-    captureAudioNote(line)
+    if mean > 0.0001 {
+      if !loggedSignal {
+        loggedSignal = true
+        captureAudioNote(String(format: "loopback in signal rms=%.4f", mean))
+      }
+      captureAudioNote(String(format: "loopback in rms=%.4f", mean))
+    } else {
+      captureAudioNote(String(format: "loopback in rms=%.4f samples=silence", mean))
+    }
   }
 }
 

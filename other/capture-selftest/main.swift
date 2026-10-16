@@ -475,6 +475,27 @@ private func testLoopbackPlayback() {
   let attrs = try? FileManager.default.attributesOfItem(atPath: log.path)
   let liveSize = (attrs?[.size] as? NSNumber)?.intValue ?? (attrs?[.size] as? Int) ?? Int.max
   check(liveSize <= 200 && !backup.isEmpty && (live.contains("loopback out rms=") || backup.contains("loopback reader started")), "capture-audio.log rotates and stays small")
+
+  check(CaptureMicAccess.usageDescriptionPresent(["NSMicrophoneUsageDescription": "IINA reads the loopback"]), "the microphone usage description is present")
+  check(!CaptureMicAccess.usageDescriptionPresent(nil) && !CaptureMicAccess.usageDescriptionPresent([:]), "a missing microphone usage description is reported")
+  check(!CaptureMicAccess.usageDescriptionPresent(["NSMicrophoneUsageDescription": "  "]), "a blank microphone usage description is missing")
+  check(CaptureMicAccess.waitForDecision(.notDetermined), "microphone access is requested before the reader starts")
+  check(!CaptureMicAccess.waitForDecision(.authorized) && !CaptureMicAccess.waitForDecision(.denied), "a decided microphone starts the reader without another prompt")
+  check(CaptureMicAccess.inputWillBeSilence(.notDetermined) && CaptureMicAccess.inputWillBeSilence(.denied) && CaptureMicAccess.inputWillBeSilence(.restricted), "TCC delivers silence until the microphone is authorized")
+  check(!CaptureMicAccess.inputWillBeSilence(.authorized), "an authorized microphone can deliver samples")
+  let denied = CaptureMicAccess.logLine(status: .denied, usageDescriptionPresent: true)
+  check(denied.contains("loopback mic authorization denied") && denied.contains("usageDescription=present") && denied.contains("input=silence"), "a denied microphone is logged as silence")
+  let granted = CaptureMicAccess.logLine(status: .authorized, usageDescriptionPresent: true)
+  check(granted.contains("loopback mic authorization authorized") && granted.contains("input=live"), "an authorized microphone is logged as live")
+  let missing = CaptureMicAccess.logLine(status: .notDetermined, usageDescriptionPresent: false)
+  check(missing.contains("usageDescription=missing") && missing.contains("input=silence"), "a missing usage description is logged as silence")
+  if let plistPath = ProcessInfo.processInfo.environment["CAPTURE_INFO_PLIST"],
+     let plist = NSDictionary(contentsOfFile: plistPath),
+     let text = plist["NSMicrophoneUsageDescription"] as? String {
+    check(CaptureMicAccess.usageDescriptionPresent(["NSMicrophoneUsageDescription": text]), "Info.plist has NSMicrophoneUsageDescription")
+  } else {
+    check(false, "Info.plist has NSMicrophoneUsageDescription")
+  }
 }
 
 private func testContentRect() {

@@ -1385,6 +1385,8 @@
 	<string>IINA captures the window you choose, including its audio on macOS 13 and later, and turns that picture into side-by-side 3D on the glasses. Protected video stays black; IINA does not bypass it.</string>
 	<key>NSAudioCaptureUsageDescription</key>
 	<string>IINA mutes the app whose window you are capturing so its sound plays through IINA.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>IINA reads its loopback device so the browser's sound can play in sync on the glasses. macOS treats that device as a microphone.</string>
 	<key>com.colliderli.iina.build.branch</key>
 	<string>IINA_BUILD_BRANCH</string>
 	<key>com.colliderli.iina.build.commit</key>
