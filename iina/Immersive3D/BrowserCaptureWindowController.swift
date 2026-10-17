@@ -227,6 +227,16 @@ final class BrowserCaptureWindowController: NSWindowController, NSTableViewDataS
     }
     applyGlassesScreen(screen, fullSizeEyes: Immersive3DController.isFullWidthSBS(screen))
     browserCaptureLog.info("glasses source capture \(pixels.width)x\(pixels.height) \(screen.localizedName, privacy: .public)")
+    let handoff = CaptureGlassesAudioHandoff.afterPin(readerRunning: manager.routedAudioIsRunning)
+    if handoff.reopenOutput {
+      manager.reopenLoopbackOutput()
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak manager] in
+        guard let manager else { return }
+        if CaptureGlassesAudioHandoff.afterPin(readerRunning: manager.routedAudioIsRunning).reopenOutput {
+          manager.reopenLoopbackOutput()
+        }
+      }
+    }
     syncMenu()
     return true
   }

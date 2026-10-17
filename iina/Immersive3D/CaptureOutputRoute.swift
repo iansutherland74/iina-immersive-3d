@@ -360,36 +360,84 @@ enum CaptureOutputWatch {
   }
 }
 
-/// 48 kHz stereo from the loopback, rendered into the output device's rate and
-/// channel layout. Linear interpolation. A missing source frame is silence and
-/// counts as an underrun. Channel indexes are 0-based.
-enum CaptureLoopbackMix {
-  static let sourceRate = 48000.0
+/// The output IO proc plays on the device written to the restore file. That is
+/// the glasses when they were the default output. The virtual device is never
+/// a playback target: the system default is the loopback while a capture runs.
+enum CapturePlaybackRoute {
+  enum Encoding: Equatable {
+    case float32Interleaved
+    case float32Planar
+    case int16Interleaved
+    case int24Interleaved
+    case int32Interleaved
+    case unsupported
+  }
 
-  struct Request: Equatable {
-    var outputFrames: Int
-    var deviceRate: Double
+  struct Plan: Equatable {
+    var sampleRate: Double
     var channels: Int
-    var left: Int
-    var right: Int
-    var phase: Double
+    var encoding: Encoding
+    var resample: Bool
+    var bytesPerFrame: Int = 0
+    var bigEndian: Bool = false
+    var alignedHigh: Bool = false
   }
 
-  struct Result: Equatable {
-    var samples: [Float]
-    var consumed: Int
-    var phase: Double
-    var underrunFrames: Int
+  static func uid(restore: String?, pinned: String?) -> String? {
+    let saved = cleaned(restore)
+    if let saved, !CaptureOutputRoute.isVirtualUID(saved) {
+      return saved
+    }
+    let fallback = cleaned(pinned)
+    if let fallback, !CaptureOutputRoute.isVirtualUID(fallback) {
+      return fallback
+    }
+    return nil
   }
 
-  struct Tail: Equatable {
-    var consumed: Int
-    var phase: Double
-    var underrunFrames: Int
+  /// Glasses are 2 ch at 48 kHz or 44.1 kHz. The loopback is always 48 kHz,
+  /// so a 44.1 kHz device has to be resampled or the IO proc writes the wrong
+  /// clock and the glasses stay silent.
+  static func plan(
+    sampleRate: Double,
+    channels: Int,
+    bits: Int,
+    isFloat: Bool,
+    interleaved: Bool,
+    bytesPerFrame: Int = 0,
+    bigEndian: Bool = false,
+    alignedHigh: Bool = false
+  ) -> Plan {
+    let rate = sampleRate > 0 ? sampleRate : 48000
+    let count = channels > 0 ? channels : 2
+    let frameBytes = bytesPerFrame > 0 ? bytesPerFrame : count * max(bits / 8, 1)
+    let encoding: Encoding
+    if isFloat && bits == 32 && interleaved && (bytesPerFrame == 0 || frameBytes == count * 4) {
+      encoding = .float32Interleaved
+    } else if isFloat && bits == 32 && !interleaved {
+      encoding = .float32Planar
+    } else if !isFloat && bits == 16 && interleaved && (bytesPerFrame == 0 || frameBytes == count * 2) {
+      encoding = .int16Interleaved
+    } else if !isFloat && bits == 24 && interleaved {
+      let per = count > 0 ? frameBytes / count : 0
+      encoding = (per == 3 || per == 4) && frameBytes == per * count ? .int24Interleaved : .unsupported
+    } else if !isFloat && bits == 32 && interleaved && (bytesPerFrame == 0 || frameBytes == count * 4) {
+      encoding = .int32Interleaved
+    } else {
+      encoding = .unsupported
+    }
+    return Plan(
+      sampleRate: rate,
+      channels: count,
+      encoding: encoding,
+      resample: abs(rate - 48000) > 1,
+      bytesPerFrame: frameBytes,
+      bigEndian: bigEndian,
+      alignedHigh: alignedHigh
+    )
   }
 
   /// `preferred` is the 1-based pair from kAudioDevicePropertyPreferredChannelsForStereo.
-  /// An unusable pair falls back to the first one or two channels.
   static func stereoPair(preferred: [UInt32], channels: Int) -> (left: Int, right: Int) {
     let count = max(channels, 1)
     let fallbackRight = count > 1 ? 1 : 0
@@ -402,114 +450,197 @@ enum CaptureLoopbackMix {
     return (left - 1, right - 1)
   }
 
-  static func render(source: [Float], request: Request) -> Result {
-    let channels = max(request.channels, 1)
-    let outputFrames = max(request.outputFrames, 0)
-    var samples = [Float](repeating: 0, count: outputFrames * channels)
-    guard outputFrames > 0 else {
-      return Result(samples: samples, consumed: 0, phase: request.phase, underrunFrames: 0)
+  private static func cleaned(_ uid: String?) -> String? {
+    guard let uid else { return nil }
+    let trimmed = uid.trimmingCharacters(in: .whitespacesAndNewlines)
+    return trimmed.isEmpty ? nil : trimmed
+  }
+}
+
+/// Linear resampler from the 48 kHz loopback to the output device rate.
+enum CaptureRateConvert {
+  struct Stream {
+    var fromRate: Double
+    var toRate: Double
+    var channels: Int
+    private var pending: [Float] = []
+    private var phase = 0.0
+
+    init(fromRate: Double, toRate: Double, channels: Int) {
+      self.fromRate = fromRate > 0 ? fromRate : 48000
+      self.toRate = toRate > 0 ? toRate : 48000
+      self.channels = max(channels, 1)
     }
-    let sourceFrames = source.count / 2
-    guard sourceFrames > 0 else {
-      return Result(samples: samples, consumed: 0, phase: 0, underrunFrames: outputFrames)
+
+    mutating func reset(fromRate: Double, toRate: Double, channels: Int) {
+      self = Stream(fromRate: fromRate, toRate: toRate, channels: channels)
     }
-    let tail = source.withUnsafeBufferPointer { src -> Tail in
-      guard let inBase = src.baseAddress else {
-        return Tail(consumed: 0, phase: 0, underrunFrames: outputFrames)
+
+    mutating func process(_ interleaved: [Float]) -> [Float] {
+      guard channels > 0, interleaved.count >= channels else { return [] }
+      if abs(fromRate - toRate) <= 1 {
+        return interleaved
       }
-      return samples.withUnsafeMutableBufferPointer { destination -> Tail in
-        guard let outBase = destination.baseAddress else {
-          return Tail(consumed: 0, phase: 0, underrunFrames: outputFrames)
+      pending.append(contentsOf: interleaved)
+      let available = pending.count / channels
+      guard available >= 2 else { return [] }
+      let step = fromRate / toRate
+      var produced: [Float] = []
+      while phase + 1 < Double(available) {
+        let index = Int(phase)
+        let fraction = Float(phase - Double(index))
+        for channel in 0..<channels {
+          let a = pending[index * channels + channel]
+          let b = pending[(index + 1) * channels + channel]
+          produced.append(a + (b - a) * fraction)
         }
-        return render(
-          source: inBase,
-          sourceFrames: sourceFrames,
-          output: outBase,
-          outputFrames: outputFrames,
-          deviceRate: request.deviceRate,
-          channels: channels,
-          left: request.left,
-          right: request.right,
-          phase: request.phase
-        )
+        phase += step
       }
+      let drop = min(Int(phase), max(available - 1, 0))
+      if drop > 0 {
+        pending.removeFirst(drop * channels)
+        phase -= Double(drop)
+      }
+      return produced
     }
-    return Result(samples: samples, consumed: tail.consumed, phase: tail.phase, underrunFrames: tail.underrunFrames)
   }
 
-  static func render(
-    source: UnsafePointer<Float>,
-    sourceFrames: Int,
-    output: UnsafeMutablePointer<Float>,
-    outputFrames: Int,
-    deviceRate: Double,
-    channels: Int,
-    left: Int,
-    right: Int,
-    phase: Double
-  ) -> Tail {
-    let channelCount = max(channels, 1)
-    let frames = max(outputFrames, 0)
-    let leftIndex = min(max(left, 0), channelCount - 1)
-    let rightIndex = min(max(right, 0), channelCount - 1)
-    for index in 0..<(frames * channelCount) {
-      output[index] = 0
+  static func convert(_ interleaved: [Float], channels: Int, fromRate: Double, toRate: Double) -> [Float] {
+    var stream = Stream(fromRate: fromRate, toRate: toRate, channels: channels)
+    return stream.process(interleaved)
+  }
+
+  static func int16(_ sample: Float) -> Int16 {
+    guard sample.isFinite else { return 0 }
+    let clamped = min(max(sample, -1), 1)
+    return Int16((clamped * 32767).rounded())
+  }
+}
+
+/// A volume of 0, or a mute, on IINA Capture Audio silences the read. The
+/// device has no slider of its own until it becomes the default output, and
+/// macOS can leave the scalar at 0.
+enum CaptureDeviceGain {
+  static func restoredScalar(_ scalar: Float) -> Float? {
+    scalar <= 0.0001 ? 1 : nil
+  }
+
+  static func shouldClearMute(_ muted: Bool) -> Bool {
+    muted
+  }
+}
+
+/// Microphone TCC applies to the loopback input. The orange mic indicator
+/// means the IO proc is running; without authorization, macOS still fills
+/// every buffer with zeros. `NSAudioCaptureUsageDescription` does not cover
+/// this prompt.
+enum CaptureMicAuthorization: Equatable {
+  case notDetermined
+  case restricted
+  case denied
+  case authorized
+}
+
+enum CaptureMicAccess {
+  static func usageDescriptionPresent(_ info: [String: Any]?) -> Bool {
+    guard let text = info?["NSMicrophoneUsageDescription"] as? String else { return false }
+    return !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+  }
+
+  /// The system prompt has to finish before `AudioDeviceStart`. Starting the
+  /// input while the answer is still pending leaves the orange indicator on
+  /// and the samples at zero for that IO proc.
+  static func waitForDecision(_ status: CaptureMicAuthorization) -> Bool {
+    status == .notDetermined
+  }
+
+  static func inputWillBeSilence(_ status: CaptureMicAuthorization) -> Bool {
+    status != .authorized
+  }
+
+  static func logLine(status: CaptureMicAuthorization, usageDescriptionPresent: Bool) -> String {
+    let name: String
+    switch status {
+    case .notDetermined: name = "notDetermined"
+    case .restricted: name = "restricted"
+    case .denied: name = "denied"
+    case .authorized: name = "authorized"
     }
-    guard frames > 0 else {
-      return Tail(consumed: 0, phase: phase, underrunFrames: 0)
+    let described = usageDescriptionPresent ? "present" : "missing"
+    let input = inputWillBeSilence(status) ? "silence" : "live"
+    var line = "loopback mic authorization \(name) usageDescription=\(described) input=\(input)"
+    if status == .denied || status == .restricted {
+      line += " enable Microphone for IINA in System Settings"
     }
-    guard sourceFrames > 0 else {
-      return Tail(consumed: 0, phase: 0, underrunFrames: frames)
+    return line
+  }
+}
+
+/// Pinning the capture on the glasses reopens the output after the display
+/// mode settles. It does not stop the reader, or the browser's audio is gone
+/// for the rest of the capture.
+enum CaptureGlassesAudioHandoff {
+  struct Result: Equatable {
+    var stopReader: Bool
+    var reopenOutput: Bool
+  }
+
+  static func afterPin(readerRunning: Bool) -> Result {
+    Result(stopReader: false, reopenOutput: readerRunning)
+  }
+}
+
+/// Unified logging redacts these lines on the machine that has the glasses.
+/// The same text is appended here so it can be read from the home directory.
+enum CaptureAudioFileLog {
+  static let maxBytes = 200_000
+
+  private static let lock = NSLock()
+  private static let formatter: DateFormatter = {
+    let formatter = DateFormatter()
+    formatter.locale = Locale(identifier: "en_US_POSIX")
+    formatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
+    formatter.timeZone = TimeZone(identifier: "UTC")
+    return formatter
+  }()
+
+  static func fileURL(home: URL) -> URL {
+    home
+      .appendingPathComponent("Library/Logs/IINA", isDirectory: true)
+      .appendingPathComponent("capture-audio.log")
+  }
+
+  static func append(_ line: String, home: URL = URL(fileURLWithPath: NSHomeDirectory()), maxBytes: Int = CaptureAudioFileLog.maxBytes) {
+    let text = line.trimmingCharacters(in: .newlines)
+    guard !text.isEmpty else { return }
+    lock.lock()
+    defer { lock.unlock() }
+    let file = fileURL(home: home)
+    let directory = file.deletingLastPathComponent()
+    do {
+      try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    } catch {
+      return
     }
-    let rate = deviceRate > 0 ? deviceRate : sourceRate
-    let step = sourceRate / rate
-    var start = phase
-    if !start.isFinite || start < 0 { start = 0 }
-    var underrun = 0
-    for frame in 0..<frames {
-      let position = start + Double(frame) * step
-      if position < 0 {
-        underrun += 1
-        continue
-      }
-      let index = Int(position)
-      if index >= sourceFrames {
-        underrun += 1
-        continue
-      }
-      let fraction = Float(position - Double(index))
-      let firstLeft = source[index * 2]
-      let firstRight = source[index * 2 + 1]
-      let secondLeft: Float
-      let secondRight: Float
-      if index + 1 < sourceFrames {
-        secondLeft = source[(index + 1) * 2]
-        secondRight = source[(index + 1) * 2 + 1]
-      } else {
-        secondLeft = firstLeft
-        secondRight = firstRight
-      }
-      let mixedLeft = firstLeft + (secondLeft - firstLeft) * fraction
-      let mixedRight = firstRight + (secondRight - firstRight) * fraction
-      let base = frame * channelCount
-      if leftIndex == rightIndex {
-        output[base + leftIndex] = (mixedLeft + mixedRight) * 0.5
-      } else {
-        output[base + leftIndex] = mixedLeft
-        output[base + rightIndex] = mixedRight
-      }
-    }
-    let end = start + Double(frames) * step
-    var consumed = end > 0 ? Int(end) : 0
-    if consumed > sourceFrames { consumed = sourceFrames }
-    if consumed < 0 { consumed = 0 }
-    let next: Double
-    if consumed >= sourceFrames {
-      consumed = sourceFrames
-      next = 0
+    rotateIfNeeded(file, maxBytes: maxBytes)
+    let stamped = formatter.string(from: Date()) + " " + text + "\n"
+    if FileManager.default.fileExists(atPath: file.path),
+       let handle = try? FileHandle(forWritingTo: file) {
+      _ = try? handle.seekToEnd()
+      handle.write(Data(stamped.utf8))
+      try? handle.close()
     } else {
-      next = end - Double(consumed)
+      try? Data(stamped.utf8).write(to: file)
     }
-    return Tail(consumed: consumed, phase: next > 0 ? next : 0, underrunFrames: underrun)
+  }
+
+  private static func rotateIfNeeded(_ file: URL, maxBytes: Int) {
+    guard maxBytes > 0,
+          let attrs = try? FileManager.default.attributesOfItem(atPath: file.path),
+          let size = attrs[.size] as? NSNumber,
+          size.intValue > maxBytes else { return }
+    let backup = URL(fileURLWithPath: file.path + ".1")
+    try? FileManager.default.removeItem(at: backup)
+    try? FileManager.default.moveItem(at: file, to: backup)
   }
 }

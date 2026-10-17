@@ -867,9 +867,9 @@ final class Immersive3DController: NSObject, NSWindowDelegate {
   private func noteAudioRouteUntouched(_ action: CaptureGlassesAudio.Action, _ detail: String) {
     let effects = CaptureGlassesAudio.routeEffects(for: action)
     if effects.isEmpty {
-      CaptureAudioFileLog.info("\(detail); loopback keeps the saved output; system default and mpv device were not changed")
+      captureAudioNote("\(detail); loopback keeps the saved output; system default and mpv device were not changed")
     } else {
-      CaptureAudioFileLog.error("\(detail); refused \(effects.count) audio route changes")
+      captureAudioNote("\(detail); refused \(effects.count) audio route changes", error: true)
     }
   }
 

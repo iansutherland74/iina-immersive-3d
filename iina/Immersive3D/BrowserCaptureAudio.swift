@@ -83,7 +83,6 @@ final class BrowserCaptureAudioPlayer {
   private var pinnedUID: String?
   private var announcedDelayMs: Int?
   private var announcedOffset: Int?
-  private var announcedOutput = false
   private var loggedConvert = false
   private var loggedDevice = false
   private var loggedMute = false
@@ -99,7 +98,7 @@ final class BrowserCaptureAudioPlayer {
 
   func start() {
     queue.async { [weak self] in
-      self?.startOnQueue(hostUID: nil)
+      self?.startOnQueue()
     }
   }
 
@@ -109,7 +108,31 @@ final class BrowserCaptureAudioPlayer {
   /// The glasses 3D button does not come through here and does not change this UID.
   func beginHostClock(pinnedUID: String) {
     queue.async { [weak self] in
-      self?.startOnQueue(hostUID: pinnedUID)
+      guard let self else { return }
+      self.startOnQueue()
+      self.pinnedUID = pinnedUID
+      self.hostMode = true
+      self.haveDelay = true
+      self.hostDelay = 0
+      self.announcedDelayMs = nil
+      self.announcedOffset = nil
+      self.loggedConvert = false
+      self.loggedDevice = false
+      self.loggedMute = false
+      self.lastOutLog = 0
+      self.outSum = 0
+      self.outCount = 0
+      self.openOutput()
+    }
+  }
+
+  /// The glasses display can reset its audio device when the capture window
+  /// lands on it. Open the output again. The reader is left running.
+  func reopenOutput() {
+    queue.async { [weak self] in
+      guard let self, self.hostMode else { return }
+      self.loggedDevice = false
+      self.openOutput(force: true)
     }
   }
 
@@ -141,7 +164,7 @@ final class BrowserCaptureAudioPlayer {
       guard let converted = self.convert(buffer) else {
         if !self.loggedConvert {
           self.loggedConvert = true
-          browserCaptureLog.error("loopback convert failed")
+          captureAudioNote("loopback convert failed", error: true)
         }
         return
       }
@@ -201,14 +224,11 @@ final class BrowserCaptureAudioPlayer {
     }
   }
 
-  private func startOnQueue(hostUID: String?) {
+  private func startOnQueue() {
     stopOnQueue()
-    hostMode = hostUID != nil
-    haveDelay = hostUID != nil
-    pinnedUID = hostUID
-    if hostUID != nil {
-      hostDelay = 0
-    }
+    hostMode = false
+    haveDelay = false
+    pinnedUID = nil
     started = true
     playingTap = false
     announcedTap = false
@@ -218,21 +238,8 @@ final class BrowserCaptureAudioPlayer {
     videoPTS = nil
     queuedUntil = 0
     pending.removeAll()
-    announcedDelayMs = nil
-    announcedOffset = nil
-    announcedOutput = false
-    loggedConvert = false
-    loggedDevice = false
-    loggedMute = false
-    lastOutLog = 0
-    outSum = 0
-    outCount = 0
     armRouteTimer()
     armDrainTimer()
-    if let hostUID {
-      loopbackOutput.start(uid: hostUID)
-      loopbackOutput.setGain(currentGain())
-    }
   }
 
   private func stopOnQueue() {
@@ -240,21 +247,17 @@ final class BrowserCaptureAudioPlayer {
     routeTimer = nil
     drainTimer?.cancel()
     drainTimer = nil
+    loopbackOutput.stop()
     started = false
     pending.removeAll()
     videoPTS = nil
     queuedUntil = 0
-    loopbackOutput.stop()
     if node.isPlaying {
       node.stop()
     }
     if engine.isRunning {
       engine.stop()
     }
-  }
-
-  private func currentGain() -> Float {
-    route.muted ? 0 : min(max(route.volume, 0), 1)
   }
 
   private func armRouteTimer() {
@@ -388,7 +391,32 @@ final class BrowserCaptureAudioPlayer {
     if announcedDelayMs == ms && announcedOffset == syncOffsetMs { return }
     announcedDelayMs = ms
     announcedOffset = syncOffsetMs
-    browserCaptureLog.info("loopback delay \(ms) ms offset \(self.syncOffsetMs) ms")
+    captureAudioNote("loopback delay \(ms) ms offset \(self.syncOffsetMs) ms")
+  }
+
+  private func openOutput(force: Bool = false) {
+    let outcome = loopbackOutput.start(uid: pinnedUID ?? "", force: force)
+    switch outcome.kind {
+    case .started:
+      appliedDevice = outcome.device
+      appliedUID = outcome.uid
+      let rate = Int(outcome.rate.rounded())
+      captureAudioNote("loopback output started device=\(outcome.device) uid=\(outcome.uid) status=\(CaptureDefaultOutput.statusText(outcome.status)) rate=\(rate) ch=\(outcome.channels)")
+    case .already:
+      appliedDevice = outcome.device
+      appliedUID = outcome.uid
+    case .failed:
+      if !loggedDevice {
+        loggedDevice = true
+        captureAudioNote("loopback output did not start uid=\(outcome.uid.isEmpty ? "none" : outcome.uid) status=\(CaptureDefaultOutput.statusText(outcome.status)) device=\(outcome.device) rate=\(Int(outcome.rate.rounded())) ch=\(outcome.channels)", error: true)
+      }
+    }
+    let gain = route.muted ? Float(0) : min(max(route.volume, 0), 1)
+    loopbackOutput.setGain(gain)
+    if gain == 0 && !loggedMute {
+      loggedMute = true
+      captureAudioNote("loopback output gain is 0")
+    }
   }
 
   private func pump() {
@@ -415,49 +443,14 @@ final class BrowserCaptureAudioPlayer {
 
   private func schedule(_ buffer: AVAudioPCMBuffer) {
     if hostMode {
-      guard let interleaved = Self.interleavedStereo(buffer) else { return }
-      interleaved.withUnsafeBufferPointer { raw in
-        guard let base = raw.baseAddress else { return }
-        self.loopbackOutput.write(base, frames: Int(buffer.frameLength))
-      }
+      loopbackOutput.enqueue(buffer)
       return
     }
     guard ensureEngine() else { return }
-    noteOutputStarted()
-    noteOutputLevel(buffer)
     if !node.isPlaying {
       node.play()
     }
     node.scheduleBuffer(buffer, completionHandler: nil)
-  }
-
-  private func noteOutputStarted() {
-    guard hostMode, !announcedOutput else { return }
-    announcedOutput = true
-    let uid = pinnedUID ?? appliedUID ?? "default"
-    browserCaptureLog.info("loopback output started device=\(self.appliedDevice) uid=\(uid, privacy: .public)")
-    let gain = route.muted ? Float(0) : min(max(route.volume, 0), 1)
-    if gain == 0 && !loggedMute {
-      loggedMute = true
-      browserCaptureLog.info("loopback output gain is 0")
-    }
-  }
-
-  private func noteOutputLevel(_ buffer: AVAudioPCMBuffer) {
-    // Host-clock playback logs rms from the output IO callback. This buffer is
-    // still ahead of the device, so it is not the level the glasses are playing.
-    guard hostMode else { return }
-    let level = rms(buffer)
-    outSum += level
-    outCount += 1
-    let now = CACurrentMediaTime()
-    if now - lastOutLog < 1 { return }
-    lastOutLog = now
-    let mean = outSum / Float(max(outCount, 1))
-    outSum = 0
-    outCount = 0
-    let line = String(format: "loopback out rms=%.4f", mean)
-    browserCaptureLog.info("\(line, privacy: .public)")
   }
 
   @discardableResult
@@ -466,7 +459,7 @@ final class BrowserCaptureAudioPlayer {
     if let pinnedUID, Self.deviceID(forUID: pinnedUID) == nil {
       if hostMode && !loggedDevice {
         loggedDevice = true
-        browserCaptureLog.error("loopback output device was not found uid=\(pinnedUID, privacy: .public)")
+        captureAudioNote("loopback output device was not found uid=\(pinnedUID)", error: true)
       }
       return false
     }
@@ -496,14 +489,12 @@ final class BrowserCaptureAudioPlayer {
 
   private func applyRoute(_ route: BrowserCaptureAudioRoute) {
     self.route = route
-    let gain = currentGain()
+    let gain = route.muted ? Float(0) : min(max(route.volume, 0), 1)
     if hostMode {
-      // The IO proc owns the device. Starting AVAudioEngine here would keep the
-      // device id from before the glasses changed display mode.
       loopbackOutput.setGain(gain)
       if gain == 0 && !loggedMute {
         loggedMute = true
-        CaptureAudioFileLog.info("loopback output gain is 0")
+        captureAudioNote("loopback output gain is 0")
       }
       return
     }
@@ -548,7 +539,7 @@ final class BrowserCaptureAudioPlayer {
       appliedUID = uid
     } else if hostMode && !loggedDevice {
       loggedDevice = true
-      browserCaptureLog.error("loopback output device was not set status=\(status) device=\(device)")
+      captureAudioNote("loopback output device was not set status=\(CaptureDefaultOutput.statusText(status)) device=\(device)", error: true)
     }
     if wasRunning {
       try? engine.start()
@@ -651,26 +642,7 @@ final class BrowserCaptureAudioPlayer {
   }
 
   private static func deviceID(forUID uid: String) -> AudioDeviceID? {
-    var address = AudioObjectPropertyAddress(
-      mSelector: kAudioHardwarePropertyTranslateUIDToDevice,
-      mScope: kAudioObjectPropertyScopeGlobal,
-      mElement: kAudioObjectPropertyElementMain
-    )
-    let name = uid as CFString
-    var device = AudioDeviceID(0)
-    var size = UInt32(MemoryLayout<AudioDeviceID>.size)
-    let status = withUnsafePointer(to: name) { pointer in
-      AudioObjectGetPropertyData(
-        AudioObjectID(kAudioObjectSystemObject),
-        &address,
-        UInt32(MemoryLayout<CFString>.size),
-        pointer,
-        &size,
-        &device
-      )
-    }
-    guard status == noErr, device != 0 else { return nil }
-    return device
+    CaptureSystemOutput.deviceID(forUID: uid)
   }
 }
 
