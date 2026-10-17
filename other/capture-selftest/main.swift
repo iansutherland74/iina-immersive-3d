@@ -497,6 +497,13 @@ private func testAVSync() {
   delayed.push(id: 4, received: 1)
   delayed.push(id: 5, received: 1.1)
   check(delayed.popDue(now: 1.1)?.id == 5 && delayed.waiting.isEmpty, "without a video delay only the newest frame is kept")
+  delayed.hold = 0.5
+  delayed.push(id: 6, received: 2)
+  delayed.push(id: 7, received: 2.2)
+  delayed.flush()
+  check(delayed.waiting.isEmpty && delayed.popDue(now: 4) == nil, "flush drops frames still waiting out a video delay")
+  delayed.hold = 0
+  check(delayed.popDue(now: 4) == nil, "a flushed queue stays empty when the offset is cleared")
 }
 
 private func testLoopbackOutput() {
