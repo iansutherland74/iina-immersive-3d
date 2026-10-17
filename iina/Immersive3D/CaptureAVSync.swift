@@ -61,6 +61,14 @@ struct CaptureLevelEdge: Equatable {
   private var quiet = true
   private var haveLevel = false
 
+  /// Explicit so callers outside this type can build an edge. The private
+  /// samples make the synthesized memberwise initializer private.
+  internal init(low: Float, high: Float, rise: Float) {
+    self.low = low
+    self.high = high
+    self.rise = rise
+  }
+
   mutating func observe(_ sample: Float) -> Bool {
     guard sample.isFinite else { return false }
     let previous = level
