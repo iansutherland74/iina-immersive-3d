@@ -242,6 +242,124 @@ enum CaptureLoopbackClock {
   }
 }
 
+/// Play on Glasses, the Immersive 3D toggle, and a glasses display-mode change
+/// (the hardware 3D button switching the panel to side-by-side) do not move the
+/// system output and do not pin or unpin mpv. The picture path repins a window.
+/// The DisplayPort device restart is handled by the loopback output IO proc.
+enum CaptureGlassesAudio {
+  enum Action: Equatable {
+    case playOnGlasses
+    case exitGlasses
+    case immersive3DToggle
+    case screenParameters
+  }
+
+  static func routeEffects(for action: Action) -> [CaptureOutputRoute.Effect] {
+    switch action {
+    case .playOnGlasses, .exitGlasses, .immersive3DToggle, .screenParameters:
+      return []
+    }
+  }
+}
+
+/// While a capture is routed, a device list change must not send mpv to auto.
+/// The glasses 3D mode drops the DisplayPort device out of the list for a moment.
+enum CapturePinnedDeviceHold {
+  static func keepMPVDevice(routed: Bool, deviceStillListed: Bool) -> Bool {
+    routed && !deviceStillListed
+  }
+}
+
+/// What the loopback output does when Core Audio reports a device change.
+/// A match means the IO proc we already opened still describes the device.
+/// Default-device notifications never select a new UID.
+enum CaptureOutputWatch {
+  static let deviceIsRunning = "DeviceIsRunning"
+  static let deviceIsAlive = "DeviceIsAlive"
+  static let nominalSampleRate = "NominalSampleRate"
+  static let streamFormat = "StreamFormat"
+  static let devices = "Devices"
+  static let defaultOutput = "DefaultOutputDevice"
+  static let defaultSystemOutput = "DefaultSystemOutputDevice"
+
+  struct Snapshot: Equatable {
+    var deviceID: UInt32
+    var alive: Bool
+    var running: Bool
+    var sampleRate: Double
+    var channels: Int
+    /// Sample format of the stream the IO proc was opened with. A glasses mode
+    /// switch can keep the rate and channel count while changing these.
+    var bits: Int = 0
+    var isFloat: Bool = false
+    var bytesPerFrame: Int = 0
+    var nonInterleaved: Bool = false
+  }
+
+  enum Notice: Equatable {
+    case running(Bool)
+    case alive(Bool)
+    case nominalSampleRate(Double)
+    case streamFormat(sampleRate: Double, channels: Int)
+    case devicesChanged
+    case defaultOutputChanged
+    case defaultSystemOutputChanged
+
+    var name: String {
+      switch self {
+      case .running: return CaptureOutputWatch.deviceIsRunning
+      case .alive: return CaptureOutputWatch.deviceIsAlive
+      case .nominalSampleRate: return CaptureOutputWatch.nominalSampleRate
+      case .streamFormat: return CaptureOutputWatch.streamFormat
+      case .devicesChanged: return CaptureOutputWatch.devices
+      case .defaultOutputChanged: return CaptureOutputWatch.defaultOutput
+      case .defaultSystemOutputChanged: return CaptureOutputWatch.defaultSystemOutput
+      }
+    }
+  }
+
+  enum Step: Equatable {
+    case keep
+    case restart(String)
+  }
+
+  static func matches(_ applied: Snapshot, _ resolved: Snapshot) -> Bool {
+    applied.deviceID == resolved.deviceID
+      && applied.alive == resolved.alive
+      && applied.running == resolved.running
+      && applied.channels == resolved.channels
+      && applied.bits == resolved.bits
+      && applied.isFloat == resolved.isFloat
+      && applied.bytesPerFrame == resolved.bytesPerFrame
+      && applied.nonInterleaved == resolved.nonInterleaved
+      && abs(applied.sampleRate - resolved.sampleRate) < 0.5
+  }
+
+  /// `rebuiltRecently` is true when this process just opened the IO proc.
+  /// A default-device or device-list notification still rebuilds once, because
+  /// the glasses can reset the stream without changing the id. A second copy of
+  /// that notification, while the resolved device still matches, is the echo of
+  /// that rebuild.
+  static func step(notice: Notice, applied: Snapshot, resolved: Snapshot, rebuiltRecently: Bool) -> Step {
+    if !matches(applied, resolved) {
+      return .restart(notice.name)
+    }
+    switch notice {
+    case .devicesChanged, .defaultOutputChanged, .defaultSystemOutputChanged:
+      return rebuiltRecently ? .keep : .restart(notice.name)
+    case .running, .alive, .nominalSampleRate, .streamFormat:
+      return .keep
+    }
+  }
+
+  static func routeEffects(for notice: Notice) -> [CaptureOutputRoute.Effect] {
+    switch notice {
+    case .running, .alive, .nominalSampleRate, .streamFormat, .devicesChanged, .defaultOutputChanged, .defaultSystemOutputChanged:
+      return []
+    }
+  }
+}
+
 /// The output IO proc plays on the device written to the restore file. That is
 /// the glasses when they were the default output. The virtual device is never
 /// a playback target: the system default is the loopback while a capture runs.
@@ -250,6 +368,8 @@ enum CapturePlaybackRoute {
     case float32Interleaved
     case float32Planar
     case int16Interleaved
+    case int24Interleaved
+    case int32Interleaved
     case unsupported
   }
 
@@ -258,6 +378,9 @@ enum CapturePlaybackRoute {
     var channels: Int
     var encoding: Encoding
     var resample: Bool
+    var bytesPerFrame: Int = 0
+    var bigEndian: Bool = false
+    var alignedHigh: Bool = false
   }
 
   static func uid(restore: String?, pinned: String?) -> String? {
@@ -275,20 +398,56 @@ enum CapturePlaybackRoute {
   /// Glasses are 2 ch at 48 kHz or 44.1 kHz. The loopback is always 48 kHz,
   /// so a 44.1 kHz device has to be resampled or the IO proc writes the wrong
   /// clock and the glasses stay silent.
-  static func plan(sampleRate: Double, channels: Int, bits: Int, isFloat: Bool, interleaved: Bool) -> Plan {
+  static func plan(
+    sampleRate: Double,
+    channels: Int,
+    bits: Int,
+    isFloat: Bool,
+    interleaved: Bool,
+    bytesPerFrame: Int = 0,
+    bigEndian: Bool = false,
+    alignedHigh: Bool = false
+  ) -> Plan {
     let rate = sampleRate > 0 ? sampleRate : 48000
     let count = channels > 0 ? channels : 2
+    let frameBytes = bytesPerFrame > 0 ? bytesPerFrame : count * max(bits / 8, 1)
     let encoding: Encoding
-    if isFloat && bits == 32 && interleaved {
+    if isFloat && bits == 32 && interleaved && (bytesPerFrame == 0 || frameBytes == count * 4) {
       encoding = .float32Interleaved
     } else if isFloat && bits == 32 && !interleaved {
       encoding = .float32Planar
-    } else if !isFloat && bits == 16 && interleaved {
+    } else if !isFloat && bits == 16 && interleaved && (bytesPerFrame == 0 || frameBytes == count * 2) {
       encoding = .int16Interleaved
+    } else if !isFloat && bits == 24 && interleaved {
+      let per = count > 0 ? frameBytes / count : 0
+      encoding = (per == 3 || per == 4) && frameBytes == per * count ? .int24Interleaved : .unsupported
+    } else if !isFloat && bits == 32 && interleaved && (bytesPerFrame == 0 || frameBytes == count * 4) {
+      encoding = .int32Interleaved
     } else {
       encoding = .unsupported
     }
-    return Plan(sampleRate: rate, channels: count, encoding: encoding, resample: abs(rate - 48000) > 1)
+    return Plan(
+      sampleRate: rate,
+      channels: count,
+      encoding: encoding,
+      resample: abs(rate - 48000) > 1,
+      bytesPerFrame: frameBytes,
+      bigEndian: bigEndian,
+      alignedHigh: alignedHigh
+    )
+  }
+
+  /// `preferred` is the 1-based pair from kAudioDevicePropertyPreferredChannelsForStereo.
+  static func stereoPair(preferred: [UInt32], channels: Int) -> (left: Int, right: Int) {
+    let count = max(channels, 1)
+    let fallbackRight = count > 1 ? 1 : 0
+    guard preferred.count >= 2 else { return (0, fallbackRight) }
+    let left = Int(preferred[0])
+    let right = Int(preferred[1])
+    guard left >= 1, right >= 1, left <= count, right <= count else {
+      return (0, fallbackRight)
+    }
+    return (left - 1, right - 1)
   }
 
   private static func cleaned(_ uid: String?) -> String? {

@@ -418,6 +418,99 @@ private func testRoute() {
   check(CaptureDefaultOutput.statusText(1852797029) == "1852797029 'nope'", "the OSStatus fourcc is logged")
 }
 
+private func testLoopbackOutput() {
+  let actions: [CaptureGlassesAudio.Action] = [.playOnGlasses, .exitGlasses, .immersive3DToggle, .screenParameters]
+  for action in actions {
+    check(CaptureGlassesAudio.routeEffects(for: action).isEmpty, "glasses action \(action) does not move the audio route")
+  }
+  check(CapturePinnedDeviceHold.keepMPVDevice(routed: true, deviceStillListed: false), "a missing device during capture keeps the mpv pin")
+  check(!CapturePinnedDeviceHold.keepMPVDevice(routed: true, deviceStillListed: true), "a device that is still listed is not a hold")
+  check(!CapturePinnedDeviceHold.keepMPVDevice(routed: false, deviceStillListed: false), "outside a capture a missing device can fall back to auto")
+
+  let notices: [CaptureOutputWatch.Notice] = [
+    .running(false),
+    .alive(false),
+    .nominalSampleRate(44100),
+    .streamFormat(sampleRate: 44100, channels: 8),
+    .devicesChanged,
+    .defaultOutputChanged,
+    .defaultSystemOutputChanged
+  ]
+  for notice in notices {
+    check(CaptureOutputWatch.routeEffects(for: notice).isEmpty, "\(notice.name) does not change the system output or mpv")
+  }
+  check(CaptureOutputWatch.Notice.devicesChanged.name == "Devices", "device list events are named")
+  check(CaptureOutputWatch.Notice.defaultOutputChanged.name == "DefaultOutputDevice", "default output events are named")
+  check(CaptureOutputWatch.Notice.streamFormat(sampleRate: 48000, channels: 2).name == "StreamFormat", "format events are named")
+
+  let before = CaptureOutputWatch.Snapshot(deviceID: 4, alive: true, running: true, sampleRate: 48000, channels: 2)
+  let stopped = CaptureOutputWatch.Snapshot(deviceID: 4, alive: true, running: false, sampleRate: 48000, channels: 2)
+  check(
+    CaptureOutputWatch.step(notice: .running(false), applied: before, resolved: stopped, rebuiltRecently: false) == .restart("DeviceIsRunning"),
+    "the output proc restarts when the device stops"
+  )
+  let reappeared = CaptureOutputWatch.Snapshot(deviceID: 11, alive: true, running: false, sampleRate: 44100, channels: 8)
+  check(
+    CaptureOutputWatch.step(notice: .devicesChanged, applied: before, resolved: reappeared, rebuiltRecently: false) == .restart("Devices"),
+    "re-enumeration restarts the output proc on the saved device"
+  )
+  check(
+    CaptureOutputWatch.step(notice: .defaultOutputChanged, applied: before, resolved: reappeared, rebuiltRecently: false) == .restart("DefaultOutputDevice"),
+    "a default-device change restarts the saved device and does not select the default"
+  )
+  check(
+    CaptureOutputWatch.step(notice: .streamFormat(sampleRate: 44100, channels: 8), applied: before, resolved: reappeared, rebuiltRecently: false) == .restart("StreamFormat"),
+    "a new rate and channel count restarts the output proc"
+  )
+  let opened = CaptureOutputWatch.Snapshot(deviceID: 11, alive: true, running: true, sampleRate: 44100, channels: 8)
+  check(
+    CaptureOutputWatch.step(notice: .running(true), applied: opened, resolved: opened, rebuiltRecently: true) == .keep,
+    "our own start does not restart again"
+  )
+  check(
+    CaptureOutputWatch.step(notice: .running(false), applied: opened, resolved: opened, rebuiltRecently: true) == .keep,
+    "a stop notification that has already recovered does not loop"
+  )
+  check(
+    CaptureOutputWatch.step(notice: .devicesChanged, applied: opened, resolved: opened, rebuiltRecently: true) == .keep,
+    "the device-list echo of a restart is ignored"
+  )
+  check(
+    CaptureOutputWatch.step(notice: .devicesChanged, applied: opened, resolved: opened, rebuiltRecently: false) == .restart("Devices"),
+    "a later device-list change rebuilds the proc once"
+  )
+  check(
+    CaptureOutputWatch.step(notice: .defaultSystemOutputChanged, applied: opened, resolved: opened, rebuiltRecently: false) == .restart("DefaultSystemOutputDevice"),
+    "the system output notification rebuilds the saved device once"
+  )
+  let retimed = CaptureOutputWatch.Snapshot(deviceID: 11, alive: true, running: true, sampleRate: 96000, channels: 2)
+  check(
+    CaptureOutputWatch.step(notice: .nominalSampleRate(96000), applied: opened, resolved: retimed, rebuiltRecently: true) == .restart("NominalSampleRate"),
+    "a sample-rate change restarts even when a rebuild just happened"
+  )
+  let reformatted = CaptureOutputWatch.Snapshot(
+    deviceID: 11, alive: true, running: true, sampleRate: 44100, channels: 8,
+    bits: 24, isFloat: false, bytesPerFrame: 6, nonInterleaved: false
+  )
+  check(
+    CaptureOutputWatch.step(notice: .streamFormat(sampleRate: 44100, channels: 8), applied: opened, resolved: reformatted, rebuiltRecently: true) == .restart("StreamFormat"),
+    "a new sample format restarts the output proc"
+  )
+  check(CaptureOutputWatch.matches(before, CaptureOutputWatch.Snapshot(deviceID: 4, alive: true, running: true, sampleRate: 48000.4, channels: 2)), "half a hertz is the same rate")
+  check(!CaptureOutputWatch.matches(before, retimed), "a different device does not match")
+  let split = CaptureOutputWatch.Snapshot(deviceID: 4, alive: true, running: true, sampleRate: 48000, channels: 2, nonInterleaved: true)
+  check(!CaptureOutputWatch.matches(before, split), "a non-interleaved format is a different stream")
+
+  let stereo = CapturePlaybackRoute.stereoPair(preferred: [1, 2], channels: 2)
+  check(stereo.left == 0 && stereo.right == 1, "stereo channels 1 and 2 are the first pair")
+  let surround = CapturePlaybackRoute.stereoPair(preferred: [3, 4], channels: 8)
+  check(surround.left == 2 && surround.right == 3, "the preferred pair is used on a multi-channel device")
+  let fallback = CapturePlaybackRoute.stereoPair(preferred: [0, 0], channels: 2)
+  check(fallback.left == 0 && fallback.right == 1, "an empty preferred pair falls back to stereo")
+  let monoPair = CapturePlaybackRoute.stereoPair(preferred: [1, 2], channels: 1)
+  check(monoPair.left == 0 && monoPair.right == 0, "a mono device mixes to its only channel")
+}
+
 private func testLoopbackPlayback() {
   check(CapturePlaybackRoute.uid(restore: "SmartGlasses-DP", pinned: "BuiltInSpeakerDevice") == "SmartGlasses-DP", "playback uses the glasses uid from the restore file")
   check(CapturePlaybackRoute.uid(restore: "  SmartGlasses-DP\n", pinned: nil) == "SmartGlasses-DP", "the restore file uid is trimmed")
@@ -431,6 +524,12 @@ private func testLoopbackPlayback() {
   check(!glasses48.resample && glasses48.encoding == .float32Interleaved, "48 kHz glasses play the loopback rate directly")
   let int16 = CapturePlaybackRoute.plan(sampleRate: 48000, channels: 2, bits: 16, isFloat: false, interleaved: true)
   check(int16.encoding == .int16Interleaved, "16-bit glasses are converted from float")
+  let int32 = CapturePlaybackRoute.plan(sampleRate: 48000, channels: 2, bits: 32, isFloat: false, interleaved: true)
+  check(int32.encoding == .int32Interleaved, "32-bit integer glasses are converted from float")
+  let int24 = CapturePlaybackRoute.plan(sampleRate: 48000, channels: 2, bits: 24, isFloat: false, interleaved: true, bytesPerFrame: 6)
+  check(int24.encoding == .int24Interleaved && int24.bytesPerFrame == 6, "24-bit packed glasses are converted from float")
+  let int24wide = CapturePlaybackRoute.plan(sampleRate: 48000, channels: 2, bits: 24, isFloat: false, interleaved: true, bytesPerFrame: 8)
+  check(int24wide.encoding == .int24Interleaved && int24wide.bytesPerFrame == 8, "24-bit glasses in a 32-bit word are converted from float")
   let planar = CapturePlaybackRoute.plan(sampleRate: 48000, channels: 2, bits: 32, isFloat: true, interleaved: false)
   check(planar.encoding == .float32Planar, "planar float glasses stay planar")
   check(CaptureRateConvert.int16(0.5) == 16384 && CaptureRateConvert.int16(-1) == -32767, "float samples convert to 16-bit")
@@ -858,6 +957,7 @@ enum CaptureSelfTest {
     testQuitDuringCapture()
     testAudioPolicy()
     testRoute()
+    testLoopbackOutput()
     testLoopbackPlayback()
     testContentRect()
     let zombies = ProcessInfo.processInfo.environment["CAPTURE_ZOMBIES"] == "1"

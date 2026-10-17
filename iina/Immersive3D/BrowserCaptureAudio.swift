@@ -6,11 +6,12 @@
 //  Based on IINA, Copyright (C) 2017-2026 Collider LI and contributors.
 //  Licensed under the GNU General Public License, version 3.
 //
-//  Plays loopback samples through AVAudioEngine on the real Core Audio device,
-//  following mpv volume and mute. The samples wait for the measured capture
-//  latency so they line up with the picture. ScreenCaptureKit audio stays off:
-//  muting the browser silences that capture, and playing it while the browser
-//  still speaks is an echo.
+//  Plays loopback samples on the saved Core Audio device. The host-clock path
+//  uses an IO proc so a glasses display-mode change can restart that proc.
+//  AVAudioEngine remains for the mute-tap path. Volume and mute follow mpv.
+//  The samples wait for the measured capture latency so they line up with the
+//  picture. ScreenCaptureKit audio stays off: muting the browser silences that
+//  capture, and playing it while the browser still speaks is an echo.
 
 import AVFoundation
 import AudioToolbox
@@ -104,6 +105,7 @@ final class BrowserCaptureAudioPlayer {
   /// Loopback samples are stamped with the host clock. Playback starts at delay 0
   /// so a missing video present cannot mute the capture. A later measurement
   /// tightens that delay. `pinnedUID` is the real output, never the system default.
+  /// The glasses 3D button does not come through here and does not change this UID.
   func beginHostClock(pinnedUID: String) {
     queue.async { [weak self] in
       guard let self else { return }
@@ -441,35 +443,19 @@ final class BrowserCaptureAudioPlayer {
 
   private func schedule(_ buffer: AVAudioPCMBuffer) {
     if hostMode {
-      noteOutputLevel(buffer)
       loopbackOutput.enqueue(buffer)
       return
     }
     guard ensureEngine() else { return }
-    noteOutputLevel(buffer)
     if !node.isPlaying {
       node.play()
     }
     node.scheduleBuffer(buffer, completionHandler: nil)
   }
 
-  private func noteOutputLevel(_ buffer: AVAudioPCMBuffer) {
-    guard hostMode else { return }
-    let level = rms(buffer)
-    outSum += level
-    outCount += 1
-    let now = CACurrentMediaTime()
-    if now - lastOutLog < 1 { return }
-    lastOutLog = now
-    let mean = outSum / Float(max(outCount, 1))
-    outSum = 0
-    outCount = 0
-    let line = String(format: "loopback out rms=%.4f", mean)
-    captureAudioNote(line)
-  }
-
   @discardableResult
   private func ensureEngine() -> Bool {
+    if hostMode { return false }
     if let pinnedUID, Self.deviceID(forUID: pinnedUID) == nil {
       if hostMode && !loggedDevice {
         loggedDevice = true
@@ -510,6 +496,7 @@ final class BrowserCaptureAudioPlayer {
         loggedMute = true
         captureAudioNote("loopback output gain is 0")
       }
+      return
     }
     if connected {
       applyDevice(force: false)
@@ -518,6 +505,7 @@ final class BrowserCaptureAudioPlayer {
   }
 
   private func applyDevice(force: Bool) {
+    if hostMode { return }
     let uid = pinnedUID ?? route.deviceUID
     let device: AudioDeviceID
     if let uid, let id = Self.deviceID(forUID: uid) {
@@ -602,6 +590,21 @@ final class BrowserCaptureAudioPlayer {
     }
     guard error == nil, status != .error, output.frameLength > 0 else { return nil }
     return output
+  }
+
+  private static func interleavedStereo(_ buffer: AVAudioPCMBuffer) -> [Float]? {
+    guard let channels = buffer.floatChannelData else { return nil }
+    let frames = Int(buffer.frameLength)
+    let count = Int(buffer.format.channelCount)
+    guard frames > 0, count > 0 else { return nil }
+    var samples = [Float](repeating: 0, count: frames * 2)
+    let left = channels[0]
+    let right = count > 1 ? channels[1] : channels[0]
+    for frame in 0..<frames {
+      samples[frame * 2] = left[frame]
+      samples[frame * 2 + 1] = right[frame]
+    }
+    return samples
   }
 
   private func rms(_ buffer: AVAudioPCMBuffer) -> Float {

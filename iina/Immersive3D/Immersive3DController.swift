@@ -422,6 +422,7 @@ final class Immersive3DController: NSObject, NSWindowDelegate {
   }
 
   func setEnabled(_ enabled: Bool) {
+    noteAudioRouteUntouched(.immersive3DToggle, "immersive 3d toggled enabled=\(enabled ? 1 : 0)")
     Preference.set(enabled, for: .immersive3DEnabled)
     publishAndRedraw()
     if enabled {
@@ -441,6 +442,7 @@ final class Immersive3DController: NSObject, NSWindowDelegate {
   // MARK: - Glasses
 
   @objc func playOnGlasses(_ sender: Any?) {
+    noteAudioRouteUntouched(.playOnGlasses, "play on glasses")
     let screens = Self.glassesCandidates()
     if screens.isEmpty && !session.isOn {
       showMessage(
@@ -860,8 +862,20 @@ final class Immersive3DController: NSObject, NSWindowDelegate {
     }
   }
 
+  /// Display-mode changes, including the glasses 3D button, land here. The window
+  /// is repinned. The capture route is not engaged or released.
+  private func noteAudioRouteUntouched(_ action: CaptureGlassesAudio.Action, _ detail: String) {
+    let effects = CaptureGlassesAudio.routeEffects(for: action)
+    if effects.isEmpty {
+      captureAudioNote("\(detail); loopback keeps the saved output; system default and mpv device were not changed")
+    } else {
+      captureAudioNote("\(detail); refused \(effects.count) audio route changes", error: true)
+    }
+  }
+
   private func glassesScreenParametersChanged() {
     guard !shuttingDown, !isPinningGlasses, !applyingDisplayConfig else { return }
+    noteAudioRouteUntouched(.screenParameters, "glasses display parameters changed")
     if captureWindowPinned {
       if !glassesActive {
         _ = ensureGlassesExtended()

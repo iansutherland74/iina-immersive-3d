@@ -153,6 +153,7 @@ struct GlassesSession: Equatable {
   }
 
   /// A 2D/3D mode switch changes the glasses pixel size. The window pin is separate.
+  /// It does not change the system output or the mpv device.
   mutating func noteScreen(_ display: GlassesDisplayChoice) {
     guard case .showing(let source, _) = output else { return }
     output = .showing(source, display)

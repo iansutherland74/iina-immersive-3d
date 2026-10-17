@@ -2334,8 +2334,13 @@ class PlayerCore: NSObject {
   func audioDeviceListChanged() {
     guard info.state.active else { return }
     let devices = getAudioDevices()
-    let device = mpv.getString(MPVProperty.audioDevice)
-    guard !devices.contains(where: {$0.name == device}) else { return }
+    let device = mpv.getString(MPVProperty.audioDevice) ?? "auto"
+    let listed = devices.contains(where: { $0.name == device })
+    if CapturePinnedDeviceHold.keepMPVDevice(routed: CaptureAudioRouteController.isRouted(), deviceStillListed: listed) {
+      captureAudioNote("audio device list changed during capture; keeping mpv device \(device); system default was not changed")
+      return
+    }
+    guard !listed else { return }
     log("Selected audio device is no longer present, setting selected device to auto")
     setAudioDevice("auto")
   }

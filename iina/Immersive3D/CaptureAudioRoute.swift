@@ -14,6 +14,7 @@ import AVFoundation
 import AudioToolbox
 import Cocoa
 import CoreAudio
+import Darwin
 import os
 
 enum CaptureOutputRestoreFile {
@@ -335,7 +336,7 @@ enum CaptureSystemOutput {
   }
 
   /// Device name and UID are +1 CFStrings. The buffer is one pointer.
-  private static func copyString(_ device: AudioDeviceID, selector: AudioObjectPropertySelector) -> String? {
+  static func copyString(_ device: AudioDeviceID, selector: AudioObjectPropertySelector) -> String? {
     var address = AudioObjectPropertyAddress(
       mSelector: selector,
       mScope: kAudioObjectPropertyScopeGlobal,
@@ -508,6 +509,13 @@ enum CaptureAudioRouteController {
     }
     lock.unlock()
     return plan
+  }
+
+  static func isRouted() -> Bool {
+    lock.lock()
+    defer { lock.unlock() }
+    if case .routed = state.phase { return true }
+    return false
   }
 
   private static func currentMPVDevice() -> String {
@@ -832,7 +840,8 @@ final class CaptureLoopbackReader {
 
 /// Plays loopback samples on the real output named in the restore file.
 /// AVAudioEngine stays at 48 kHz and does not follow a DisplayPort device that
-/// is 44.1 kHz, which is why the glasses were silent.
+/// is 44.1 kHz, which is why the glasses were silent. Property listeners reopen
+/// that saved device when a glasses display-mode change restarts it.
 final class CaptureLoopbackOutput {
   struct Outcome {
     enum Kind {
@@ -849,7 +858,15 @@ final class CaptureLoopbackOutput {
     var uid: String
   }
 
+  private struct InstalledListener {
+    var object: AudioObjectID
+    var selector: AudioObjectPropertySelector
+    var scope: AudioObjectPropertyScope
+  }
+
   private let lock = NSLock()
+  private let queueKey = DispatchSpecificKey<UInt8>()
+  private let queue = DispatchQueue(label: "com.colliderli.iina.capture-loopback-watch", qos: .userInteractive)
   private var device = AudioDeviceID(0)
   private var procID: AudioDeviceIOProcID?
   private var plan = CapturePlaybackRoute.plan(sampleRate: 48000, channels: 2, bits: 32, isFloat: true, interleaved: true)
@@ -860,7 +877,37 @@ final class CaptureLoopbackOutput {
   private var resampler = CaptureRateConvert.Stream(fromRate: 48000, toRate: 48000, channels: 2)
   private var gain: Float = 1
   private var activeUID = ""
+  private var requestedUID = ""
   private var scratch = [Float](repeating: 0, count: 4096 * 2)
+  private var leftChannel = 0
+  private var rightChannel = 1
+  private var installed: [InstalledListener] = []
+  private var listenedDevice = AudioDeviceID(0)
+  private var applied = CaptureOutputWatch.Snapshot(deviceID: 0, alive: false, running: false, sampleRate: 0, channels: 0)
+  private var lastRestart = 0.0
+  private var watchdog: DispatchSourceTimer?
+  private var ioStarted = false
+  private var lastCallback = 0.0
+  private var rmsSum: Float = 0
+  private var rmsCount = 0
+  private var underrunWindow = 0
+  private var underrunTotal = 0
+  private var lastRMSLog = 0.0
+  private var lastFailure = ""
+  private var lastFailureAt = 0.0
+
+  init() {
+    queue.setSpecific(key: queueKey, value: 1)
+  }
+
+  deinit {
+    // Listeners and the IO proc hold an unretained pointer. Tear them down here,
+    // on this thread: hopping to the queue would retain self during deinit.
+    requestedUID = ""
+    cancelWatchdog()
+    removeListeners()
+    stopProc()
+  }
 
   func setGain(_ value: Float) {
     lock.lock()
@@ -869,35 +916,62 @@ final class CaptureLoopbackOutput {
   }
 
   func start(uid: String, force: Bool = false) -> Outcome {
+    if DispatchQueue.getSpecific(key: queueKey) != nil {
+      return open(uid: uid, force: force)
+    }
+    return queue.sync { self.open(uid: uid, force: force) }
+  }
+
+  func stop() {
+    let work = {
+      self.requestedUID = ""
+      self.cancelWatchdog()
+      self.removeListeners()
+      self.stopProc()
+      self.lock.lock()
+      self.storedFrames = 0
+      self.readFrame = 0
+      self.writeFrame = 0
+      self.lock.unlock()
+      self.ioStarted = false
+      self.resampler.reset(fromRate: 48000, toRate: self.plan.sampleRate, channels: 2)
+    }
+    if DispatchQueue.getSpecific(key: queueKey) != nil {
+      work()
+    } else {
+      queue.sync(execute: work)
+    }
+  }
+
+  /// Re-resolves the saved UID and opens a new IO proc. Does not write the system default or mpv's device.
+  private func open(uid: String, force: Bool) -> Outcome {
+    requestedUID = uid
+    installSystemListeners()
+    armWatchdog()
     let playback = CapturePlaybackRoute.uid(restore: CaptureOutputRestoreFile.read(), pinned: uid) ?? ""
     guard !playback.isEmpty, let id = CaptureSystemOutput.deviceID(forUID: playback), id != 0 else {
+      stopProc()
+      syncDeviceListeners(0)
       return Outcome(kind: .failed, device: 0, status: kAudioHardwareBadDeviceError, rate: 0, channels: 0, uid: playback)
     }
+    syncDeviceListeners(id)
     guard var format = Self.outputFormat(of: id) else {
+      stopProc()
       return Outcome(kind: .failed, device: id, status: kAudioHardwareIllegalOperationError, rate: 0, channels: 0, uid: playback)
     }
-    var next = CapturePlaybackRoute.plan(
-      sampleRate: format.mSampleRate,
-      channels: Int(format.mChannelsPerFrame),
-      bits: Int(format.mBitsPerChannel),
-      isFloat: format.mFormatFlags & kAudioFormatFlagIsFloat != 0,
-      interleaved: format.mFormatFlags & kAudioFormatFlagIsNonInterleaved == 0
-    )
+    var next = Self.makePlan(format)
     if next.encoding == .unsupported {
       let channels = min(max(Int(format.mChannelsPerFrame), 2), 2)
       let status = Self.setFloatFormat(of: id, rate: format.mSampleRate > 0 ? format.mSampleRate : 48000, channels: channels)
+      captureAudioNote("loopback output set stream format status=\(CaptureDefaultOutput.statusText(status))")
       guard status == noErr, let updated = Self.outputFormat(of: id) else {
+        stopProc()
         return Outcome(kind: .failed, device: id, status: status, rate: format.mSampleRate, channels: Int(format.mChannelsPerFrame), uid: playback)
       }
       format = updated
-      next = CapturePlaybackRoute.plan(
-        sampleRate: format.mSampleRate,
-        channels: Int(format.mChannelsPerFrame),
-        bits: Int(format.mBitsPerChannel),
-        isFloat: format.mFormatFlags & kAudioFormatFlagIsFloat != 0,
-        interleaved: format.mFormatFlags & kAudioFormatFlagIsNonInterleaved == 0
-      )
+      next = Self.makePlan(format)
       guard next.encoding != .unsupported else {
+        stopProc()
         return Outcome(kind: .failed, device: id, status: kAudioHardwareIllegalOperationError, rate: next.sampleRate, channels: next.channels, uid: playback)
       }
     }
@@ -913,31 +987,45 @@ final class CaptureLoopbackOutput {
       lock.unlock()
     }
     plan = next
+    let layoutStatus = Self.setStereoLayout(id)
+    let pairStatus = Self.setStereoPair(id)
+    let pair = CapturePlaybackRoute.stereoPair(preferred: Self.readStereoPair(id), channels: next.channels)
+    leftChannel = pair.left
+    rightChannel = pair.right
+    captureAudioNote("loopback output preferred stereo layout=\(CaptureDefaultOutput.statusText(layoutStatus)) channels=\(CaptureDefaultOutput.statusText(pairStatus)) pair=\(pair.left + 1),\(pair.right + 1)")
     resampler.reset(fromRate: 48000, toRate: next.sampleRate, channels: 2)
     var created: AudioDeviceIOProcID?
     let createdStatus = AudioDeviceCreateIOProcID(id, Self.ioProc, Unmanaged.passUnretained(self).toOpaque(), &created)
     guard createdStatus == noErr, let created else {
+      ioStarted = false
       return Outcome(kind: .failed, device: id, status: createdStatus, rate: next.sampleRate, channels: next.channels, uid: playback)
     }
     let started = AudioDeviceStart(id, created)
     guard started == noErr else {
       AudioDeviceDestroyIOProcID(id, created)
+      ioStarted = false
       return Outcome(kind: .failed, device: id, status: started, rate: next.sampleRate, channels: next.channels, uid: playback)
     }
     device = id
     procID = created
     activeUID = playback
+    ioStarted = true
+    lastCallback = CACurrentMediaTime()
+    let alive = Self.readFlag(id, kAudioDevicePropertyDeviceIsAlive)
+    let running = Self.readFlag(id, kAudioDevicePropertyDeviceIsRunning)
+    applied = CaptureOutputWatch.Snapshot(
+      deviceID: id,
+      alive: alive,
+      running: running,
+      sampleRate: format.mSampleRate > 0 ? format.mSampleRate : next.sampleRate,
+      channels: Int(format.mChannelsPerFrame),
+      bits: Int(format.mBitsPerChannel),
+      isFloat: format.mFormatFlags & kAudioFormatFlagIsFloat != 0,
+      bytesPerFrame: Int(format.mBytesPerFrame),
+      nonInterleaved: format.mFormatFlags & kAudioFormatFlagIsNonInterleaved != 0
+    )
+    lastRestart = CACurrentMediaTime()
     return Outcome(kind: .started, device: id, status: started, rate: next.sampleRate, channels: next.channels, uid: playback)
-  }
-
-  func stop() {
-    stopProc()
-    lock.lock()
-    storedFrames = 0
-    readFrame = 0
-    writeFrame = 0
-    lock.unlock()
-    resampler.reset(fromRate: 48000, toRate: plan.sampleRate, channels: 2)
   }
 
   func enqueue(_ buffer: AVAudioPCMBuffer) {
@@ -964,11 +1052,19 @@ final class CaptureLoopbackOutput {
     } else {
       return
     }
-    let converted = resampler.process(interleaved)
-    guard converted.count >= 2 else { return }
-    lock.lock()
-    push(converted)
-    lock.unlock()
+    let samples = interleaved
+    let deliver = {
+      let converted = self.resampler.process(samples)
+      guard converted.count >= 2 else { return }
+      self.lock.lock()
+      self.push(converted)
+      self.lock.unlock()
+    }
+    if DispatchQueue.getSpecific(key: queueKey) != nil {
+      deliver()
+    } else {
+      queue.sync(execute: deliver)
+    }
   }
 
   private func stopProc() {
@@ -977,6 +1073,7 @@ final class CaptureLoopbackOutput {
       AudioDeviceDestroyIOProcID(device, procID)
       self.procID = nil
     }
+    ioStarted = false
   }
 
   private static let ioProc: AudioDeviceIOProc = { _, _, _, _, output, _, client in
@@ -990,30 +1087,44 @@ final class CaptureLoopbackOutput {
     let buffers = UnsafeMutableAudioBufferListPointer(output)
     guard let first = buffers.first, let data = first.mData, first.mDataByteSize > 0 else { return }
     let encoding = plan.encoding
+    let channels = max(Int(first.mNumberChannels), 1)
     let frames: Int
     switch encoding {
     case .float32Interleaved:
-      let channels = max(Int(first.mNumberChannels), 1)
       frames = Int(first.mDataByteSize) / (MemoryLayout<Float>.size * channels)
     case .float32Planar:
       frames = Int(first.mDataByteSize) / MemoryLayout<Float>.size
     case .int16Interleaved:
-      let channels = max(Int(first.mNumberChannels), 1)
       frames = Int(first.mDataByteSize) / (MemoryLayout<Int16>.size * channels)
+    case .int32Interleaved:
+      frames = Int(first.mDataByteSize) / (MemoryLayout<Int32>.size * channels)
+    case .int24Interleaved:
+      let stride = max(plan.bytesPerFrame, 1)
+      frames = Int(first.mDataByteSize) / stride
     case .unsupported:
       return
     }
     guard frames > 0 else { return }
     let chunk = scratch.count / 2
     var done = 0
+    var sum: Float = 0
+    var underrun = 0
     while done < frames {
       let count = min(chunk, frames - done)
-      fillScratch(count)
+      underrun += fillScratch(count)
+      for frame in 0..<count {
+        let sample = scratch[frame * 2]
+        sum += sample * sample
+      }
       switch encoding {
       case .float32Interleaved:
-        writeInterleavedFloat(data, frames: count, channels: max(Int(first.mNumberChannels), 1), offset: done)
+        writeInterleavedFloat(data, frames: count, channels: channels, offset: done)
       case .int16Interleaved:
-        writeInterleavedInt16(data, frames: count, channels: max(Int(first.mNumberChannels), 1), offset: done)
+        writeInterleavedInt16(data, frames: count, channels: channels, offset: done)
+      case .int32Interleaved:
+        writeInterleavedInt32(data, frames: count, channels: channels, offset: done)
+      case .int24Interleaved:
+        writeInterleavedInt24(data, frames: count, channels: channels, offset: done)
       case .float32Planar:
         writePlanarFloat(buffers, frames: count, offset: done)
       case .unsupported:
@@ -1021,9 +1132,10 @@ final class CaptureLoopbackOutput {
       }
       done += count
     }
+    noteCallbackLevel(sum: sum, count: frames, underrun: underrun)
   }
 
-  private func fillScratch(_ frames: Int) {
+  private func fillScratch(_ frames: Int) -> Int {
     lock.lock()
     let gained = gain
     let count = min(frames, storedFrames)
@@ -1041,46 +1153,97 @@ final class CaptureLoopbackOutput {
         scratch[index * 2 + 1] = 0
       }
     }
+    return max(frames - count, 0)
+  }
+
+  private func place(_ frame: Int, channels: Int, into write: (Int, Float) -> Void) {
+    let leftSample = scratch[frame * 2]
+    let rightSample = scratch[frame * 2 + 1]
+    let left = min(max(leftChannel, 0), channels - 1)
+    let right = min(max(rightChannel, 0), channels - 1)
+    if left == right {
+      write(left, (leftSample + rightSample) * 0.5)
+    } else {
+      write(left, leftSample)
+      write(right, rightSample)
+    }
   }
 
   private func writeInterleavedFloat(_ data: UnsafeMutableRawPointer, frames: Int, channels: Int, offset: Int) {
     let destination = data.assumingMemoryBound(to: Float.self)
+    guard channels > 0 else { return }
     for frame in 0..<frames {
-      let at = offset + frame
-      destination[at * channels] = scratch[frame * 2]
-      if channels > 1 {
-        destination[at * channels + 1] = scratch[frame * 2 + 1]
+      let at = (offset + frame) * channels
+      for channel in 0..<channels {
+        destination[at + channel] = 0
       }
-      if channels > 2 {
-        for channel in 2..<channels {
-          destination[at * channels + channel] = 0
-        }
+      place(frame, channels: channels) { channel, sample in
+        destination[at + channel] = sample
       }
     }
   }
 
   private func writeInterleavedInt16(_ data: UnsafeMutableRawPointer, frames: Int, channels: Int, offset: Int) {
     let destination = data.assumingMemoryBound(to: Int16.self)
+    guard channels > 0 else { return }
     for frame in 0..<frames {
-      let at = offset + frame
-      destination[at * channels] = CaptureRateConvert.int16(scratch[frame * 2])
-      if channels > 1 {
-        destination[at * channels + 1] = CaptureRateConvert.int16(scratch[frame * 2 + 1])
+      let at = (offset + frame) * channels
+      for channel in 0..<channels {
+        destination[at + channel] = 0
       }
-      if channels > 2 {
-        for channel in 2..<channels {
-          destination[at * channels + channel] = 0
-        }
+      place(frame, channels: channels) { channel, sample in
+        destination[at + channel] = CaptureRateConvert.int16(sample)
+      }
+    }
+  }
+
+  private func writeInterleavedInt32(_ data: UnsafeMutableRawPointer, frames: Int, channels: Int, offset: Int) {
+    let destination = data.assumingMemoryBound(to: Int32.self)
+    guard channels > 0 else { return }
+    for frame in 0..<frames {
+      let at = (offset + frame) * channels
+      for channel in 0..<channels {
+        destination[at + channel] = 0
+      }
+      place(frame, channels: channels) { channel, sample in
+        destination[at + channel] = quantize32(sample)
+      }
+    }
+  }
+
+  private func writeInterleavedInt24(_ data: UnsafeMutableRawPointer, frames: Int, channels: Int, offset: Int) {
+    let stride = max(plan.bytesPerFrame / max(channels, 1), 1)
+    guard channels > 0 else { return }
+    for frame in 0..<frames {
+      let at = (offset + frame) * plan.bytesPerFrame
+      memset(data.advanced(by: at), 0, max(plan.bytesPerFrame, stride))
+      place(frame, channels: channels) { channel, sample in
+        writeInt24(sample, at: data.advanced(by: at + channel * stride))
       }
     }
   }
 
   private func writePlanarFloat(_ buffers: UnsafeMutableAudioBufferListPointer, frames: Int, offset: Int) {
-    guard let left = buffers.first?.mData?.assumingMemoryBound(to: Float.self) else { return }
-    let right = buffers.count > 1 ? buffers[1].mData?.assumingMemoryBound(to: Float.self) : nil
+    for buffer in buffers {
+      guard let data = buffer.mData?.assumingMemoryBound(to: Float.self) else { continue }
+      for frame in 0..<frames {
+        data[offset + frame] = 0
+      }
+    }
+    let count = max(buffers.count, 1)
+    let left = min(max(leftChannel, 0), count - 1)
+    let right = min(max(rightChannel, 0), count - 1)
+    guard let leftData = buffers.indices.contains(left) ? buffers[left].mData?.assumingMemoryBound(to: Float.self) : nil else { return }
+    let rightData = buffers.indices.contains(right) ? buffers[right].mData?.assumingMemoryBound(to: Float.self) : nil
     for frame in 0..<frames {
-      left[offset + frame] = scratch[frame * 2]
-      right?[offset + frame] = scratch[frame * 2 + 1]
+      let leftSample = scratch[frame * 2]
+      let rightSample = scratch[frame * 2 + 1]
+      if left == right {
+        leftData[offset + frame] = (leftSample + rightSample) * 0.5
+      } else {
+        leftData[offset + frame] = leftSample
+        rightData?[offset + frame] = rightSample
+      }
     }
   }
 
@@ -1132,6 +1295,308 @@ final class CaptureLoopbackOutput {
       mElement: kAudioObjectPropertyElementMain
     )
     return AudioObjectSetPropertyData(device, &address, 0, nil, UInt32(MemoryLayout<AudioStreamBasicDescription>.size), &format)
+  }
+
+  private static func makePlan(_ format: AudioStreamBasicDescription) -> CapturePlaybackRoute.Plan {
+    CapturePlaybackRoute.plan(
+      sampleRate: format.mSampleRate,
+      channels: Int(format.mChannelsPerFrame),
+      bits: Int(format.mBitsPerChannel),
+      isFloat: format.mFormatFlags & kAudioFormatFlagIsFloat != 0,
+      interleaved: format.mFormatFlags & kAudioFormatFlagIsNonInterleaved == 0,
+      bytesPerFrame: Int(format.mBytesPerFrame),
+      bigEndian: format.mFormatFlags & kAudioFormatFlagIsBigEndian != 0,
+      alignedHigh: format.mFormatFlags & kAudioFormatFlagIsAlignedHigh != 0
+    )
+  }
+
+  private func noteCallbackLevel(sum: Float, count: Int, underrun: Int) {
+    rmsSum += sum
+    rmsCount += count
+    underrunWindow += underrun
+    underrunTotal += underrun
+    lastCallback = CACurrentMediaTime()
+    let now = lastCallback
+    if lastRMSLog == 0 {
+      lastRMSLog = now
+      return
+    }
+    if now - lastRMSLog < 1 { return }
+    lastRMSLog = now
+    let mean = sqrt(rmsSum / Float(max(rmsCount, 1)))
+    rmsSum = 0
+    rmsCount = 0
+    let window = underrunWindow
+    underrunWindow = 0
+    let total = underrunTotal
+    let rms = String(format: "%.4f", mean)
+    captureAudioNote("loopback out rms=\(rms) underrun=\(window) total=\(total)")
+  }
+
+  private func quantize32(_ sample: Float) -> Int32 {
+    guard sample.isFinite else { return 0 }
+    let clipped = min(max(Double(sample), -1), 1)
+    let scaled = clipped * 2147483647.0
+    return Int32(max(min(scaled, 2147483647.0), -2147483648.0))
+  }
+
+  private func writeInt24(_ sample: Float, at dest: UnsafeMutableRawPointer) {
+    guard sample.isFinite else {
+      memset(dest, 0, max(plan.bytesPerFrame / max(plan.channels, 1), 1))
+      return
+    }
+    let peak: Float = 8388607
+    let floor: Float = -8388608
+    let clipped = min(max(sample, -1), 1)
+    let full = Int32(max(min(clipped * peak, peak), floor))
+    let bytes = max(plan.bytesPerFrame / max(plan.channels, 1), 1)
+    if bytes == 3 {
+      let raw = UInt32(bitPattern: full)
+      let low = raw & 0xff
+      let mid = (raw >> 8) & 0xff
+      let high = (raw >> 16) & 0xff
+      var word: UInt32 = plan.bigEndian ? (high | (mid << 8) | (low << 16)) : (raw & 0x00ffffff)
+      memcpy(dest, &word, 3)
+      return
+    }
+    let bits24 = UInt32(bitPattern: full) & 0x00ffffff
+    var word = plan.alignedHigh ? (bits24 << 8) : bits24
+    if plan.bigEndian { word = word.bigEndian }
+    memcpy(dest, &word, 4)
+  }
+
+  private func armWatchdog() {
+    if watchdog != nil { return }
+    let timer = DispatchSource.makeTimerSource(queue: queue)
+    timer.schedule(deadline: .now() + 0.5, repeating: 0.5)
+    timer.setEventHandler { [weak self] in
+      self?.poke()
+    }
+    watchdog = timer
+    timer.resume()
+  }
+
+  private func cancelWatchdog() {
+    watchdog?.cancel()
+    watchdog = nil
+  }
+
+  private func poke() {
+    guard !requestedUID.isEmpty else { return }
+    if procID == nil || !ioStarted {
+      let outcome = open(uid: requestedUID, force: true)
+      logRestart("retry", outcome)
+      return
+    }
+    if lastCallback > 0 && CACurrentMediaTime() - lastCallback > 1.5 {
+      note(true, "loopback output callback stalled")
+      logRestart("stalled", open(uid: requestedUID, force: true))
+    }
+  }
+
+  private func logRestart(_ reason: String, _ outcome: Outcome) {
+    let line = "loopback output restart reason=\(reason) status=\(CaptureDefaultOutput.statusText(outcome.status)) device=\(outcome.device) uid=\(outcome.uid) rate=\(Int(outcome.rate.rounded())) ch=\(outcome.channels)"
+    note(outcome.kind == .failed, line)
+  }
+
+  private func note(_ error: Bool, _ line: String) {
+    if !error {
+      lastFailure = ""
+      captureAudioNote(line)
+      return
+    }
+    let now = CACurrentMediaTime()
+    if line == lastFailure && now - lastFailureAt < 2 { return }
+    lastFailure = line
+    lastFailureAt = now
+    captureAudioNote(line, error: true)
+  }
+
+  private static let listenerProc: AudioObjectPropertyListenerProc = { _, count, addresses, client in
+    guard let client else { return noErr }
+    let output = Unmanaged<CaptureLoopbackOutput>.fromOpaque(client).takeUnretainedValue()
+    for index in 0..<Int(count) {
+      output.enqueue(addresses[index])
+    }
+    return noErr
+  }
+
+  private func enqueue(_ address: AudioObjectPropertyAddress) {
+    queue.async { [weak self] in
+      self?.handle(address)
+    }
+  }
+
+  private func handle(_ address: AudioObjectPropertyAddress) {
+    guard !requestedUID.isEmpty else { return }
+    let resolved = resolvedSnapshot()
+    guard let notice = notice(for: address.mSelector, resolved: resolved) else { return }
+    let rateText = String(format: "%.0f", resolved.sampleRate)
+    var detail = "device=\(resolved.deviceID) alive=\(resolved.alive ? 1 : 0) running=\(resolved.running ? 1 : 0) rate=\(rateText) ch=\(resolved.channels) bits=\(resolved.bits) float=\(resolved.isFloat ? 1 : 0) bytes=\(resolved.bytesPerFrame)"
+    if address.mSelector == kAudioHardwarePropertyDefaultOutputDevice || address.mSelector == kAudioHardwarePropertyDefaultSystemOutputDevice {
+      detail += " default=\(Self.readFlagID(kAudioHardwarePropertyDefaultOutputDevice)) saved=\(resolved.deviceID)"
+    }
+    captureAudioNote("loopback output event \(notice.name) \(detail)")
+    if !CaptureOutputWatch.routeEffects(for: notice).isEmpty {
+      captureAudioNote("loopback output event \(notice.name) ignored an audio route change", error: true)
+      return
+    }
+    let recently = lastRestart > 0 && CACurrentMediaTime() - lastRestart < 1
+    switch CaptureOutputWatch.step(notice: notice, applied: applied, resolved: resolved, rebuiltRecently: recently) {
+    case .keep:
+      captureAudioNote("loopback output event \(notice.name) unchanged")
+    case .restart(let reason):
+      let outcome = open(uid: requestedUID, force: true)
+      let failed = outcome.kind == .failed
+      note(failed, "loopback output restart reason=\(reason) status=\(CaptureDefaultOutput.statusText(outcome.status)) device=\(outcome.device) uid=\(outcome.uid) rate=\(Int(outcome.rate.rounded())) ch=\(outcome.channels)")
+    }
+  }
+
+  private func notice(for selector: AudioObjectPropertySelector, resolved: CaptureOutputWatch.Snapshot) -> CaptureOutputWatch.Notice? {
+    switch selector {
+    case kAudioDevicePropertyDeviceIsRunning:
+      return .running(resolved.running)
+    case kAudioDevicePropertyDeviceIsAlive:
+      return .alive(resolved.alive)
+    case kAudioDevicePropertyNominalSampleRate:
+      return .nominalSampleRate(resolved.sampleRate)
+    case kAudioDevicePropertyStreamFormat:
+      return .streamFormat(sampleRate: resolved.sampleRate, channels: resolved.channels)
+    case kAudioHardwarePropertyDevices:
+      return .devicesChanged
+    case kAudioHardwarePropertyDefaultOutputDevice:
+      return .defaultOutputChanged
+    case kAudioHardwarePropertyDefaultSystemOutputDevice:
+      return .defaultSystemOutputChanged
+    default:
+      return nil
+    }
+  }
+
+  private func resolvedSnapshot() -> CaptureOutputWatch.Snapshot {
+    let playback = CapturePlaybackRoute.uid(restore: CaptureOutputRestoreFile.read(), pinned: requestedUID) ?? ""
+    guard let id = CaptureSystemOutput.deviceID(forUID: playback), id != 0, let format = Self.outputFormat(of: id) else {
+      return CaptureOutputWatch.Snapshot(deviceID: 0, alive: false, running: false, sampleRate: 0, channels: 0)
+    }
+    return CaptureOutputWatch.Snapshot(
+      deviceID: id,
+      alive: Self.readFlag(id, kAudioDevicePropertyDeviceIsAlive),
+      running: Self.readFlag(id, kAudioDevicePropertyDeviceIsRunning),
+      sampleRate: format.mSampleRate,
+      channels: Int(format.mChannelsPerFrame),
+      bits: Int(format.mBitsPerChannel),
+      isFloat: format.mFormatFlags & kAudioFormatFlagIsFloat != 0,
+      bytesPerFrame: Int(format.mBytesPerFrame),
+      nonInterleaved: format.mFormatFlags & kAudioFormatFlagIsNonInterleaved != 0
+    )
+  }
+
+  private func installSystemListeners() {
+    let system = AudioObjectID(kAudioObjectSystemObject)
+    addListener(object: system, selector: kAudioHardwarePropertyDevices, scope: kAudioObjectPropertyScopeGlobal)
+    addListener(object: system, selector: kAudioHardwarePropertyDefaultOutputDevice, scope: kAudioObjectPropertyScopeGlobal)
+    addListener(object: system, selector: kAudioHardwarePropertyDefaultSystemOutputDevice, scope: kAudioObjectPropertyScopeGlobal)
+  }
+
+  private func syncDeviceListeners(_ id: AudioDeviceID) {
+    if id == listenedDevice && id != 0 { return }
+    removeDeviceListeners()
+    guard id != 0 else { return }
+    addListener(object: id, selector: kAudioDevicePropertyDeviceIsRunning, scope: kAudioObjectPropertyScopeGlobal)
+    addListener(object: id, selector: kAudioDevicePropertyDeviceIsAlive, scope: kAudioObjectPropertyScopeGlobal)
+    addListener(object: id, selector: kAudioDevicePropertyNominalSampleRate, scope: kAudioObjectPropertyScopeGlobal)
+    addListener(object: id, selector: kAudioDevicePropertyStreamFormat, scope: kAudioDevicePropertyScopeOutput)
+    listenedDevice = id
+  }
+
+  private func addListener(object: AudioObjectID, selector: AudioObjectPropertySelector, scope: AudioObjectPropertyScope) {
+    if installed.contains(where: { $0.object == object && $0.selector == selector && $0.scope == scope }) {
+      return
+    }
+    var address = AudioObjectPropertyAddress(mSelector: selector, mScope: scope, mElement: kAudioObjectPropertyElementMain)
+    let status = AudioObjectAddPropertyListener(object, &address, Self.listenerProc, Unmanaged.passUnretained(self).toOpaque())
+    if status == noErr {
+      installed.append(InstalledListener(object: object, selector: selector, scope: scope))
+    } else if let notice = notice(for: selector, resolved: applied) {
+      note(true, "loopback output listen \(notice.name) status=\(CaptureDefaultOutput.statusText(status)) device=\(object)")
+    }
+  }
+
+  private func removeDeviceListeners() {
+    let system = AudioObjectID(kAudioObjectSystemObject)
+    let gone = installed.filter { $0.object != system }
+    installed.removeAll { $0.object != system }
+    for item in gone {
+      remove(item)
+    }
+    listenedDevice = 0
+  }
+
+  private func removeListeners() {
+    let copy = installed
+    installed.removeAll()
+    listenedDevice = 0
+    for item in copy {
+      remove(item)
+    }
+  }
+
+  private func remove(_ item: InstalledListener) {
+    var address = AudioObjectPropertyAddress(mSelector: item.selector, mScope: item.scope, mElement: kAudioObjectPropertyElementMain)
+    AudioObjectRemovePropertyListener(item.object, &address, Self.listenerProc, Unmanaged.passUnretained(self).toOpaque())
+  }
+
+  private static func readFlag(_ device: AudioDeviceID, _ selector: AudioObjectPropertySelector) -> Bool {
+    readUInt32(device, selector, kAudioObjectPropertyScopeGlobal) == 1
+  }
+
+  private static func readFlagID(_ selector: AudioObjectPropertySelector) -> AudioDeviceID {
+    readUInt32(AudioObjectID(kAudioObjectSystemObject), selector, kAudioObjectPropertyScopeGlobal)
+  }
+
+  private static func readUInt32(_ object: AudioObjectID, _ selector: AudioObjectPropertySelector, _ scope: AudioObjectPropertyScope) -> UInt32 {
+    var address = AudioObjectPropertyAddress(mSelector: selector, mScope: scope, mElement: kAudioObjectPropertyElementMain)
+    var value = UInt32(0)
+    var size = UInt32(MemoryLayout<UInt32>.size)
+    let status = AudioObjectGetPropertyData(object, &address, 0, nil, &size, &value)
+    return status == noErr ? value : 0
+  }
+
+  private static func setStereoLayout(_ device: AudioDeviceID) -> OSStatus {
+    var address = AudioObjectPropertyAddress(
+      mSelector: kAudioDevicePropertyPreferredChannelLayout,
+      mScope: kAudioDevicePropertyScopeOutput,
+      mElement: kAudioObjectPropertyElementMain
+    )
+    let size = MemoryLayout<AudioChannelLayout>.stride
+    let raw = UnsafeMutableRawPointer.allocate(byteCount: size, alignment: MemoryLayout<AudioChannelLayout>.alignment)
+    defer { raw.deallocate() }
+    memset(raw, 0, size)
+    raw.assumingMemoryBound(to: AudioChannelLayout.self).pointee.mChannelLayoutTag = kAudioChannelLayoutTag_Stereo
+    return AudioObjectSetPropertyData(device, &address, 0, nil, UInt32(size), raw)
+  }
+
+  private static func setStereoPair(_ device: AudioDeviceID) -> OSStatus {
+    var pair = (UInt32(1), UInt32(2))
+    var address = AudioObjectPropertyAddress(
+      mSelector: kAudioDevicePropertyPreferredChannelsForStereo,
+      mScope: kAudioDevicePropertyScopeOutput,
+      mElement: kAudioObjectPropertyElementMain
+    )
+    return AudioObjectSetPropertyData(device, &address, 0, nil, UInt32(MemoryLayout.size(ofValue: pair)), &pair)
+  }
+
+  private static func readStereoPair(_ device: AudioDeviceID) -> [UInt32] {
+    var pair = (UInt32(0), UInt32(0))
+    var address = AudioObjectPropertyAddress(
+      mSelector: kAudioDevicePropertyPreferredChannelsForStereo,
+      mScope: kAudioDevicePropertyScopeOutput,
+      mElement: kAudioObjectPropertyElementMain
+    )
+    var size = UInt32(MemoryLayout.size(ofValue: pair))
+    let status = AudioObjectGetPropertyData(device, &address, 0, nil, &size, &pair)
+    if status != noErr { return [1, 2] }
+    return [pair.0, pair.1]
   }
 }
 
