@@ -77,6 +77,9 @@ final class BrowserCaptureRenderer: NSView {
     var generation: Int
     var time: CMTime
     var received: CFTimeInterval
+    var luma: Float?
+    var captureWidth: Int
+    var captureHeight: Int
   }
 
   override init(frame frameRect: NSRect) {
@@ -385,6 +388,9 @@ final class BrowserCaptureRenderer: NSView {
     let stamp = time
     let received = latencyPending ? latencyStamp : 0
     latencyPending = false
+    let syncLuma: Float? = CaptureAVSyncTest.shared.isRunning ? Self.sourceLuma(pixelBuffer) : nil
+    let syncWidth = width
+    let syncHeight = height
     let wrote = Immersive3DController.shared.submitFrame(
       color: framed,
       output: presented,
@@ -408,7 +414,7 @@ final class BrowserCaptureRenderer: NSView {
             done()
             return
           }
-          self.finishPicture(ok: ok, texture: presented, slot: slot, generation: generation, time: stamp, received: received, done: done)
+          self.finishPicture(ok: ok, texture: presented, slot: slot, generation: generation, time: stamp, received: received, luma: syncLuma, captureWidth: syncWidth, captureHeight: syncHeight, done: done)
         }
       }
     )
@@ -437,12 +443,12 @@ final class BrowserCaptureRenderer: NSView {
 
   /// The stereo pass has finished. Present it unless a newer frame is already waiting and this one is late.
   /// Only the newest finished frame waits on the main thread. The slot it replaces is freed here, so the next stereo pass is not skipped while that present sits in the queue.
-  private func finishPicture(ok: Bool, texture: MTLTexture, slot: Int, generation: Int, time: CMTime, received: CFTimeInterval, done: @escaping () -> Void) {
+  private func finishPicture(ok: Bool, texture: MTLTexture, slot: Int, generation: Int, time: CMTime, received: CFTimeInterval, luma: Float?, captureWidth: Int, captureHeight: Int, done: @escaping () -> Void) {
     let newer = BrowserCaptureManager.shared.hasPendingFrame
     let age = received > 0 ? CACurrentMediaTime() - received : 0
     if ok && CapturePresentBudget.shouldPresent(age: age, newerWaiting: newer) {
       stageLock.lock()
-      queuedPresent = QueuedPresent(texture: texture, slot: slot, generation: generation, time: time, received: received)
+      queuedPresent = QueuedPresent(texture: texture, slot: slot, generation: generation, time: time, received: received, luma: luma, captureWidth: captureWidth, captureHeight: captureHeight)
       let replaced = stagePool.enqueue(CaptureStagePool.Claim(index: slot, generation: generation))
       let schedule = !presentScheduled
       presentScheduled = true
@@ -479,7 +485,7 @@ final class BrowserCaptureRenderer: NSView {
     queuedPresent = nil
     _ = stagePool.takeForPresent()
     stageLock.unlock()
-    present(queued.texture, slot: queued.slot, generation: queued.generation, time: queued.time, received: queued.received)
+    present(queued.texture, slot: queued.slot, generation: queued.generation, time: queued.time, received: queued.received, luma: queued.luma, captureWidth: queued.captureWidth, captureHeight: queued.captureHeight)
     stageLock.lock()
     let more = queuedPresent != nil
     if !more {
@@ -655,7 +661,7 @@ final class BrowserCaptureRenderer: NSView {
   }
 
   /// Drawable acquisition stays on the main thread and does not wait for the GPU. `allowsNextDrawableTimeout` makes `nextDrawable` return instead of blocking the run loop. The slot is released here if the present is not committed, and in the command-buffer completion otherwise. The drawable size is not changed while this present holds a drawable.
-  private func present(_ texture: MTLTexture, slot: Int?, generation: Int, time: CMTime, received: CFTimeInterval = 0) {
+  private func present(_ texture: MTLTexture, slot: Int?, generation: Int, time: CMTime, received: CFTimeInterval = 0, luma: Float? = nil, captureWidth: Int = 0, captureHeight: Int = 0) {
     if let slot {
       stageLock.lock()
       stagePool.notePresenting(index: slot, generation: generation)
@@ -722,6 +728,23 @@ final class BrowserCaptureRenderer: NSView {
       logPresentSkip("glasses present scale failed \(texture.width)x\(texture.height) drawable \(drawable.texture.width)x\(drawable.texture.height)")
       return
     }
+    if let luma {
+      stageLock.lock()
+      let onGlasses = sizeLocked
+      stageLock.unlock()
+      let outputWidth = drawable.texture.width
+      let outputHeight = drawable.texture.height
+      let mode = CapturePictureMode.resolve(onGlasses: onGlasses, outputWidth: outputWidth, outputHeight: outputHeight)
+      CaptureAVSyncTest.shared.noteVideo(
+        luma: luma,
+        time: CaptureHostClock.now(),
+        captureWidth: captureWidth,
+        captureHeight: captureHeight,
+        outputWidth: outputWidth,
+        outputHeight: outputHeight,
+        mode: mode.logToken
+      )
+    }
     buffer.addCompletedHandler { [weak self] commandBuffer in
       if let slot {
         self?.releaseStage(slot, generation: generation)
@@ -766,8 +789,10 @@ final class BrowserCaptureRenderer: NSView {
   private func reportLatency(_ received: CFTimeInterval) {
     guard received > 0 else { return }
     let now = CACurrentMediaTime()
-    BrowserCaptureManager.shared.noteCaptureLatency(now - received)
-    let ms = CaptureLatency.milliseconds(received: received, presented: now)
+    let held = CaptureSyncOffset.paths(automatic: 0, offsetMs: BrowserCaptureSettings.shared.syncOffsetMs).videoHold
+    let presented = max(received, now - held)
+    BrowserCaptureManager.shared.noteCaptureLatency(presented - received)
+    let ms = CaptureLatency.milliseconds(received: received, presented: presented)
     if now - lastLatencyLog < 1 { return }
     lastLatencyLog = now
     browserCaptureLog.info("capture latency \(ms) ms")

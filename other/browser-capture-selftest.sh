@@ -1,7 +1,7 @@
 #!/bin/bash
 # Headless Browser Capture checks: session, drawable size, window follow, frame
 # coalescing, the quit-during-capture resize rule, latency smoothing, the sync
-# offset, the default-output read-back, audio policy, loopback route order,
+# offset, the flash/beep measurement, the default-output read-back, audio policy, loopback route order,
 # output-device restart decisions, resampling into the glasses device, the
 # loopback ring, a tone through that loopback, texture lifetime, and one synthetic side-by-side frame. No
 # display is required.
@@ -32,6 +32,7 @@ sources=(
   "$root/iina/Immersive3D/CaptureFrameCoalescer.swift"
   "$root/iina/Immersive3D/CaptureAudioPolicy.swift"
   "$root/iina/Immersive3D/CaptureOutputRoute.swift"
+  "$root/iina/Immersive3D/CaptureAVSync.swift"
   "$root/iina/Immersive3D/CaptureTextureLifetime.swift"
   "$root/iina/Immersive3D/StereoOffscreen.swift"
   "$root/other/capture-selftest/main.swift"

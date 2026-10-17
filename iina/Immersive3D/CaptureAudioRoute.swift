@@ -1133,6 +1133,10 @@ final class CaptureLoopbackOutput {
       done += count
     }
     noteCallbackLevel(sum: sum, count: frames, underrun: underrun)
+    if CaptureAVSyncTest.shared.isRunning {
+      let mean = sqrt(sum / Float(max(frames, 1)))
+      CaptureAVSyncTest.shared.noteAudio(rms: mean, time: CaptureHostClock.now())
+    }
   }
 
   private func fillScratch(_ frames: Int) -> Int {
@@ -1600,8 +1604,8 @@ final class CaptureLoopbackOutput {
   }
 }
 
-/// ±500 ms on top of the measured delay. The same control is used in the capture
-/// window, the glasses panel, and Settings.
+/// Audio sync offset, ±500 ms. Positive delays video. Negative delays audio.
+/// The same control is used in the capture window, the glasses panel, and Settings.
 final class CaptureSyncOffsetControl: NSView {
   enum Placement {
     case controls
@@ -1631,7 +1635,7 @@ final class CaptureSyncOffsetControl: NSView {
     NSLayoutConstraint.activate([
       label.leadingAnchor.constraint(equalTo: leadingAnchor),
       label.centerYAnchor.constraint(equalTo: centerYAnchor),
-      label.widthAnchor.constraint(equalToConstant: 150),
+      label.widthAnchor.constraint(equalToConstant: 240),
       slider.leadingAnchor.constraint(equalTo: label.trailingAnchor, constant: 8),
       slider.trailingAnchor.constraint(equalTo: trailingAnchor),
       slider.centerYAnchor.constraint(equalTo: centerYAnchor),
@@ -1667,7 +1671,9 @@ final class CaptureSyncOffsetControl: NSView {
     if Int(slider.doubleValue.rounded()) != clamped {
       slider.doubleValue = Double(clamped)
     }
-    label.stringValue = CaptureSyncOffset.label(ms: clamped)
+    label.stringValue = CaptureSyncOffset.effectLabel(ms: clamped)
+    slider.toolTip = "Audio sync offset (ms). Positive delays video. Negative delays audio."
+    label.toolTip = slider.toolTip
   }
 
   private func applyRoute() {

@@ -48,6 +48,7 @@ final class BrowserCaptureWindowController: NSWindowController, NSTableViewDataS
   private var uninstallAudioItem: NSMenuItem?
   private var chromeItem: NSMenuItem?
   private var videoItem: NSMenuItem?
+  private var syncTestItem: NSMenuItem?
 
   private var audioAvailable: Bool {
     if #available(macOS 13.0, *) { return true }
@@ -99,6 +100,11 @@ final class BrowserCaptureWindowController: NSWindowController, NSTableViewDataS
     renderer.onBlack = { [weak self] black in
       self?.showOutputMessage(black ? BrowserCaptureManager.protectedMessage : nil)
     }
+    CaptureAVSyncTest.shared.currentOffsetMs = { BrowserCaptureSettings.shared.syncOffsetMs }
+    CaptureAVSyncTest.shared.onLine = { [weak self] text in
+      self?.setStatus(text)
+      self?.syncMenu()
+    }
     Immersive3DController.shared.captureGlassesHandler = { [weak self] screen, fullSize in
       self?.applyGlassesScreen(screen, fullSizeEyes: fullSize)
     }
@@ -130,7 +136,10 @@ final class BrowserCaptureWindowController: NSWindowController, NSTableViewDataS
     let video = NSMenuItem(title: "Detect Video Area", action: #selector(detectVideoMenu(_:)), keyEquivalent: "")
     video.target = self
     videoItem = video
-    return [choose, toggle, glasses, audio, uninstall, chrome, video]
+    let syncTest = NSMenuItem(title: "A/V Sync Test", action: #selector(toggleSyncTest(_:)), keyEquivalent: "")
+    syncTest.target = self
+    syncTestItem = syncTest
+    return [choose, toggle, glasses, audio, uninstall, syncTest, chrome, video]
   }
 
   func syncMenu() {
@@ -143,6 +152,16 @@ final class BrowserCaptureWindowController: NSWindowController, NSTableViewDataS
     let mode = settings.cropMode
     chromeItem?.state = mode == .autoChrome ? .on : .off
     videoItem?.state = mode == .videoArea ? .on : .off
+    syncTestItem?.title = CaptureAVSyncTest.shared.isRunning ? "Stop A/V Sync Test" : "A/V Sync Test"
+  }
+
+  @objc func toggleSyncTest(_ sender: Any?) {
+    if CaptureAVSyncTest.shared.isRunning {
+      CaptureAVSyncTest.shared.stop()
+    } else {
+      CaptureAVSyncTest.shared.start()
+    }
+    syncMenu()
   }
 
   func stopAll() {
@@ -574,7 +593,7 @@ final class BrowserCaptureWindowController: NSWindowController, NSTableViewDataS
     if !audioAvailable {
       return "Sound stays in the other app. Routing it through IINA needs macOS 13."
     }
-    return "Plays the browser through IINA, delayed to match the picture. macOS asks once to install IINA Capture Audio. While a capture is running, other apps use that silent device too. Stopping capture puts the previous output back. Leave this off to hear the browser itself."
+    return "Plays the browser through IINA. Audio sync offset: positive delays the picture, negative delays the sound. A/V Sync Test measures a flash and a beep. macOS asks once to install IINA Capture Audio. While a capture is running, other apps use that silent device too. Stopping capture puts the previous output back."
   }
 
   private func reflectSettings() {
