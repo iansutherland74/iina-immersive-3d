@@ -240,6 +240,11 @@ struct CaptureVideoDelayQueue: Equatable {
     guard hold > 0, let first = waiting.first else { return nil }
     return max(0.002, first.received + hold - now)
   }
+
+  /// Drops every queued ticket. The caller still owns the pixel buffers those tickets named.
+  mutating func flush() {
+    waiting.removeAll()
+  }
 }
 
 /// Armed from the capture menu. Video calls `noteVideo` on the present path.
@@ -352,13 +357,14 @@ final class CaptureAVSyncTest {
     logQueue.async {
       CaptureAudioFileLog.append(line)
     }
+    // The next main turn, never this one. noteVideo runs from present() while
+    // nextDrawable's drawable is still in this turn's autorelease pool, and the
+    // menu action runs while that item is being tracked. Updating a label or
+    // menu item on this turn frees an object the pool still holds, and the
+    // pool's objc_release crashes at 0x20.
     let notify = onLine
-    if Thread.isMainThread {
+    DispatchQueue.main.async {
       notify?(line)
-    } else {
-      DispatchQueue.main.async {
-        notify?(line)
-      }
     }
   }
 

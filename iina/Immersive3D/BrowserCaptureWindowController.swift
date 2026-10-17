@@ -103,7 +103,6 @@ final class BrowserCaptureWindowController: NSWindowController, NSTableViewDataS
     CaptureAVSyncTest.shared.currentOffsetMs = { BrowserCaptureSettings.shared.syncOffsetMs }
     CaptureAVSyncTest.shared.onLine = { [weak self] text in
       self?.setStatus(text)
-      self?.syncMenu()
     }
     Immersive3DController.shared.captureGlassesHandler = { [weak self] screen, fullSize in
       self?.applyGlassesScreen(screen, fullSizeEyes: fullSize)
@@ -156,12 +155,14 @@ final class BrowserCaptureWindowController: NSWindowController, NSTableViewDataS
   }
 
   @objc func toggleSyncTest(_ sender: Any?) {
+    // This item is tracking the click. Retitling it now releases the view the
+    // menu run loop still has in its autorelease pool, and the pool's
+    // objc_release crashes at 0x20. menuWillOpen refreshes the title.
     if CaptureAVSyncTest.shared.isRunning {
       CaptureAVSyncTest.shared.stop()
     } else {
       CaptureAVSyncTest.shared.start()
     }
-    syncMenu()
   }
 
   func stopAll() {

@@ -728,6 +728,24 @@ final class BrowserCaptureRenderer: NSView {
       logPresentSkip("glasses present scale failed \(texture.width)x\(texture.height) drawable \(drawable.texture.width)x\(drawable.texture.height)")
       return
     }
+    buffer.addCompletedHandler { [weak self] commandBuffer in
+      if let slot {
+        self?.releaseStage(slot, generation: generation)
+      }
+      DispatchQueue.main.async {
+        self?.endPresent()
+        if let error = commandBuffer.error {
+          browserCaptureLog.error("glasses present failed: \(error.localizedDescription, privacy: .public)")
+        }
+      }
+    }
+    buffer.present(drawable)
+    buffer.commit()
+    handedOff = true
+    reportLatency(received)
+    BrowserCaptureManager.shared.notePresentedVideo(time)
+    // The drawable from nextDrawable is still in this turn's autorelease pool.
+    // noteVideo only records the flash; its UI callback is deferred to the next turn.
     if let luma {
       stageLock.lock()
       let onGlasses = sizeLocked
@@ -745,22 +763,6 @@ final class BrowserCaptureRenderer: NSView {
         mode: mode.logToken
       )
     }
-    buffer.addCompletedHandler { [weak self] commandBuffer in
-      if let slot {
-        self?.releaseStage(slot, generation: generation)
-      }
-      DispatchQueue.main.async {
-        self?.endPresent()
-        if let error = commandBuffer.error {
-          browserCaptureLog.error("glasses present failed: \(error.localizedDescription, privacy: .public)")
-        }
-      }
-    }
-    buffer.present(drawable)
-    buffer.commit()
-    handedOff = true
-    reportLatency(received)
-    BrowserCaptureManager.shared.notePresentedVideo(time)
   }
 
   private func endPresent() {
