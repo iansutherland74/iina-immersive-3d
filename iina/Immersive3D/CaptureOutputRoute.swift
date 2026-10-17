@@ -158,13 +158,20 @@ enum CaptureOutputRoute {
   }
 }
 
-/// Saved on top of the measured picture delay. Negative plays earlier.
+/// Persisted audio sync offset, in milliseconds, on top of the measured capture delay.
+/// `delay(automatic:offsetMs:)` is the raw sum. Playback uses `paths`: a positive
+/// offset holds the picture, and a negative offset holds the sound.
 enum CaptureSyncOffset {
   static let defaultsKey = "IINACaptureAudioSyncOffsetMS"
   static let changedNotification = Notification.Name("IINACaptureAudioSyncOffsetChanged")
   static let routeChangedNotification = Notification.Name("IINACaptureAudioRouteChanged")
   static let minMs = -500
   static let maxMs = 500
+
+  struct Paths: Equatable {
+    var audioDelay: Double
+    var videoHold: Double
+  }
 
   static func clamp(_ ms: Int) -> Int {
     min(max(ms, minMs), maxMs)
@@ -176,9 +183,46 @@ enum CaptureSyncOffset {
     return "Audio sync \(value) ms"
   }
 
+  /// What the slider is doing. Positive holds the picture so late sound can catch up.
+  /// Negative holds the sound.
+  static func effectLabel(ms: Int) -> String {
+    let value = clamp(ms)
+    if value > 0 { return "Audio sync +\(value) ms (delays video)" }
+    if value < 0 { return "Audio sync \(value) ms (delays audio)" }
+    return "Audio sync 0 ms"
+  }
+
+  static func effectPhrase(ms: Int) -> String {
+    let value = clamp(ms)
+    if value > 0 { return "delays video" }
+    if value < 0 { return "delays audio" }
+    return "no shift"
+  }
+
   static func delay(automatic seconds: Double, offsetMs: Int) -> Double {
     let automatic = seconds.isFinite ? seconds : 0
     return automatic + Double(clamp(offsetMs)) / 1000
+  }
+
+  /// Positive offset delays video presentation. Negative offset delays loopback audio.
+  /// The automatic capture delay still waits on the sound in both cases.
+  static func paths(automatic seconds: Double, offsetMs: Int) -> Paths {
+    let automatic = seconds.isFinite ? max(seconds, 0) : 0
+    let ms = clamp(offsetMs)
+    if ms > 0 {
+      return Paths(audioDelay: automatic, videoHold: Double(ms) / 1000)
+    }
+    if ms < 0 {
+      return Paths(audioDelay: automatic + Double(-ms) / 1000, videoHold: 0)
+    }
+    return Paths(audioDelay: automatic, videoHold: 0)
+  }
+
+  /// The offset that would cancel `averageDeltaMs` on top of the offset already applied.
+  /// Positive delta means the beep is later than the flash.
+  static func suggested(currentMs: Int, averageDeltaMs: Int) -> (ms: Int, raw: Int) {
+    let raw = currentMs + averageDeltaMs
+    return (clamp(raw), raw)
   }
 }
 

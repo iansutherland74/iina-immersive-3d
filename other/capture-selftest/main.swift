@@ -416,6 +416,87 @@ private func testRoute() {
   check(!CaptureDefaultOutput.accepted(deviceID: 7, writes: failed), "a failed OSStatus is not success")
   check(CaptureDefaultOutput.statusText(0) == "0", "noErr is logged as 0")
   check(CaptureDefaultOutput.statusText(1852797029) == "1852797029 'nope'", "the OSStatus fourcc is logged")
+  let picture = CaptureSyncOffset.paths(automatic: 0.004, offsetMs: 500)
+  check(abs(picture.audioDelay - 0.004) < 0.0001 && abs(picture.videoHold - 0.5) < 0.0001, "a positive offset delays video and leaves the loopback delay")
+  let sound = CaptureSyncOffset.paths(automatic: 0.004, offsetMs: -40)
+  check(abs(sound.audioDelay - 0.044) < 0.0001 && sound.videoHold == 0, "a negative offset delays audio")
+  let none = CaptureSyncOffset.paths(automatic: 0.004, offsetMs: 0)
+  check(abs(none.audioDelay - 0.004) < 0.0001 && none.videoHold == 0, "zero offset keeps the measured delay")
+  check(CaptureSyncOffset.effectLabel(ms: 500) == "Audio sync +500 ms (delays video)", "a positive offset is labeled as delaying video")
+  check(CaptureSyncOffset.effectLabel(ms: -40) == "Audio sync -40 ms (delays audio)", "a negative offset is labeled as delaying audio")
+  check(CaptureSyncOffset.effectLabel(ms: 0) == "Audio sync 0 ms", "zero offset names the setting")
+  let suggested = CaptureSyncOffset.suggested(currentMs: 100, averageDeltaMs: 450)
+  check(suggested.ms == 500 && suggested.raw == 550, "the suggested offset stays inside ±500 ms")
+}
+
+private func testAVSync() {
+  var luma = CaptureLevelEdge(low: 48, high: 110, rise: 45)
+  check(!luma.observe(20) && !luma.observe(30), "a dark frame is not a flash")
+  check(luma.observe(180), "a luma jump is a flash")
+  check(!luma.observe(190), "the flash is counted once")
+  check(!luma.observe(40), "the picture has to go dark again")
+  check(luma.observe(200), "the next luma jump is a new flash")
+  var beep = CaptureLevelEdge(low: 0.008, high: 0.03, rise: 0.02)
+  check(!beep.observe(0.001), "silence is not a beep")
+  check(beep.observe(0.08), "an RMS jump is a beep")
+  check(!beep.observe(0.09), "the beep is counted once")
+
+  var tracker = CaptureAVSyncTracker()
+  let hd = CaptureAVSyncFlash(time: 10, captureWidth: 1280, captureHeight: 720, outputWidth: 1920, outputHeight: 1080, mode: "2D")
+  check(tracker.addFlash(hd) == nil, "a flash waits for its beep")
+  let first = tracker.addBeep(time: 10.5)
+  check(first?.deltaMs == 500 && first?.averageMs == 500 && first?.count == 1, "the first flash-to-beep delta is 500 ms")
+  check(first?.captureWidth == 1280 && first?.captureHeight == 720 && first?.mode == "2D", "the 720p measurement keeps 2D")
+  let uhd = CaptureAVSyncFlash(time: 12, captureWidth: 3840, captureHeight: 2160, outputWidth: 3840, outputHeight: 1080, mode: "3D SBS")
+  check(tracker.addFlash(uhd) == nil, "the 4K flash waits for its beep")
+  let second = tracker.addBeep(time: 12.25)
+  check(second?.deltaMs == 250 && second?.averageMs == 375 && second?.count == 2, "the average covers both flashes")
+  check(second?.captureWidth == 3840 && second?.captureHeight == 2160 && second?.mode == "3D SBS", "the 4K measurement keeps 3D SBS")
+  var queued = CaptureAVSyncTracker()
+  queued.window = 1
+  _ = queued.addFlash(CaptureAVSyncFlash(time: 0, captureWidth: 1280, captureHeight: 720, outputWidth: 1920, outputHeight: 1080, mode: "2D"))
+  _ = queued.addFlash(CaptureAVSyncFlash(time: 1.25, captureWidth: 1920, captureHeight: 1080, outputWidth: 3840, outputHeight: 1080, mode: "3D SBS"))
+  let kept = queued.addBeep(time: 0.125)
+  check(kept?.deltaMs == 125 && kept?.captureWidth == 1280, "a beep still matches the flash it belongs to")
+  let early = CaptureAVSyncFlash(time: 20, captureWidth: 1920, captureHeight: 1080, outputWidth: 1920, outputHeight: 1080, mode: "3D SBS")
+  _ = tracker.addFlash(early)
+  let ahead = tracker.addBeep(time: 19.875)
+  check(ahead?.deltaMs == -125, "a beep before the flash is a negative delta")
+
+  if let first = first {
+    let line720 = CaptureAVSyncLog.line(match: first, currentOffsetMs: 0)
+    check(line720.contains("capture=1280x720") && line720.contains("mode=2D") && line720.contains("suggested=+500 ms (delays video)"), "a 720p 2D measurement names the resolution, mode, and video delay")
+    let clamped = CaptureAVSyncLog.line(match: first, currentOffsetMs: 100)
+    check(clamped.contains("suggested=+500 ms") && clamped.contains("clamped from +600"), "a suggestion past ±500 ms says it was clamped")
+  } else {
+    check(false, "a 720p 2D measurement names the resolution, mode, and video delay")
+  }
+  if let second = second {
+    let line4k = CaptureAVSyncLog.line(match: second, currentOffsetMs: 0)
+    check(line4k.contains("capture=3840x2160") && line4k.contains("output=3840x1080") && line4k.contains("mode=3D SBS"), "a 4K 3D SBS measurement names the resolution and mode")
+  } else {
+    check(false, "a 4K 3D SBS measurement names the resolution and mode")
+  }
+
+  check(CapturePictureMode.resolve(onGlasses: true, outputWidth: 3840, outputHeight: 1080) == .sideBySide, "3840x1080 is 3D SBS")
+  check(CapturePictureMode.resolve(onGlasses: true, outputWidth: 1920, outputHeight: 1080) == .sideBySide, "1920x1080 on the glasses is half side-by-side")
+  check(CapturePictureMode.resolve(onGlasses: false, outputWidth: 1920, outputHeight: 1080) == .twoD, "a 1080p preview is 2D")
+  check(CapturePictureMode.resolve(onGlasses: false, outputWidth: 1280, outputHeight: 720) == .twoD, "a 720p preview is 2D")
+  check(CapturePictureMode.resolve(onGlasses: true, outputWidth: 3840, outputHeight: 2160) == .twoD, "a 16:9 glasses frame is 2D")
+  check(CaptureHostClock.secondsPerTick > 0, "mach time converts to seconds")
+
+  var delayed = CaptureVideoDelayQueue()
+  delayed.hold = 0.5
+  delayed.push(id: 1, received: 0)
+  delayed.push(id: 2, received: 0.2)
+  delayed.push(id: 3, received: 0.4)
+  check(delayed.popDue(now: 0.49) == nil, "a frame waits out the video delay")
+  check(delayed.popDue(now: 0.5)?.id == 1, "the frame is drawn once it is old enough")
+  check(delayed.popDue(now: 0.9)?.id == 3, "the newest frame that has waited is the one drawn")
+  delayed.hold = 0
+  delayed.push(id: 4, received: 1)
+  delayed.push(id: 5, received: 1.1)
+  check(delayed.popDue(now: 1.1)?.id == 5 && delayed.waiting.isEmpty, "without a video delay only the newest frame is kept")
 }
 
 private func testLoopbackOutput() {
@@ -957,6 +1038,7 @@ enum CaptureSelfTest {
     testQuitDuringCapture()
     testAudioPolicy()
     testRoute()
+    testAVSync()
     testLoopbackOutput()
     testLoopbackPlayback()
     testContentRect()

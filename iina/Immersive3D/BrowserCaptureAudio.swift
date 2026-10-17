@@ -83,6 +83,8 @@ final class BrowserCaptureAudioPlayer {
   private var pinnedUID: String?
   private var announcedDelayMs: Int?
   private var announcedOffset: Int?
+  private var announcedPicture: Int?
+  private var pictureHoldMs: Int?
   private var loggedConvert = false
   private var loggedDevice = false
   private var loggedMute = false
@@ -116,6 +118,8 @@ final class BrowserCaptureAudioPlayer {
       self.hostDelay = 0
       self.announcedDelayMs = nil
       self.announcedOffset = nil
+      self.announcedPicture = nil
+      self.publishPictureHold()
       self.loggedConvert = false
       self.loggedDevice = false
       self.loggedMute = false
@@ -141,16 +145,18 @@ final class BrowserCaptureAudioPlayer {
       guard let self else { return }
       self.hostDelay = min(max(seconds, 0), 2)
       self.haveDelay = true
+      self.publishPictureHold()
       self.logDelay()
       self.pumpHost()
     }
   }
 
-  /// User adjustment, added to the measured delay. Negative plays earlier.
+  /// Positive offset delays the picture. Negative offset delays the sound.
   func setSyncOffset(ms: Int) {
     queue.async { [weak self] in
       guard let self else { return }
       self.syncOffsetMs = CaptureSyncOffset.clamp(ms)
+      self.publishPictureHold()
       if self.hostMode {
         self.logDelay()
       }
@@ -183,7 +189,11 @@ final class BrowserCaptureAudioPlayer {
       self.hostMode = false
       self.pinnedUID = nil
       self.haveDelay = false
+      self.pictureHoldMs = nil
       self.stopOnQueue()
+      if #available(macOS 12.3, *) {
+        BrowserCaptureManager.shared.noteVideoHold(0)
+      }
     }
     if Thread.isMainThread {
       queue.async(execute: work)
@@ -372,7 +382,7 @@ final class BrowserCaptureAudioPlayer {
       switch CaptureLoopbackClock.decide(
         chunk: CaptureLoopbackClock.Chunk(hostTime: first.pts, duration: duration),
         now: now,
-        delay: CaptureSyncOffset.delay(automatic: hostDelay, offsetMs: syncOffsetMs)
+        delay: self.playbackPaths().audioDelay
       ) {
       case .drop:
         pending.removeFirst()
@@ -386,12 +396,28 @@ final class BrowserCaptureAudioPlayer {
     }
   }
 
+  private func playbackPaths() -> CaptureSyncOffset.Paths {
+    CaptureSyncOffset.paths(automatic: hostDelay, offsetMs: syncOffsetMs)
+  }
+
+  /// Positive offset holds the picture. The loopback keeps the measured delay.
+  private func publishPictureHold() {
+    let ms = Int((playbackPaths().videoHold * 1000).rounded())
+    if pictureHoldMs == ms { return }
+    pictureHoldMs = ms
+    if #available(macOS 12.3, *) {
+      BrowserCaptureManager.shared.noteVideoHold(Double(ms) / 1000)
+    }
+  }
+
   private func logDelay() {
     let ms = Int((hostDelay * 1000).rounded())
-    if announcedDelayMs == ms && announcedOffset == syncOffsetMs { return }
+    let picture = Int((playbackPaths().videoHold * 1000).rounded())
+    if announcedDelayMs == ms && announcedOffset == syncOffsetMs && announcedPicture == picture { return }
     announcedDelayMs = ms
     announcedOffset = syncOffsetMs
-    captureAudioNote("loopback delay \(ms) ms offset \(self.syncOffsetMs) ms")
+    announcedPicture = picture
+    captureAudioNote("loopback delay \(ms) ms offset \(self.syncOffsetMs) ms picture=\(picture) ms")
   }
 
   private func openOutput(force: Bool = false) {

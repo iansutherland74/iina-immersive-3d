@@ -57,6 +57,12 @@ struct BrowserCaptureTarget {
   }
 }
 
+private struct DelayedFrame {
+  var buffer: CVPixelBuffer
+  var time: CMTime
+  var received: CFTimeInterval
+}
+
 @available(macOS 12.3, *)
 final class BrowserCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
   static let shared = BrowserCaptureManager()
@@ -100,6 +106,11 @@ final class BrowserCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
   private var latestTime = CMTime.invalid
   private var latestReceived: CFTimeInterval = 0
   private var drawBusy = false
+  private var videoHold = 0.0
+  private var delayQueue = CaptureVideoDelayQueue()
+  private var delayBuffers: [Int: DelayedFrame] = [:]
+  private var delaySerial = 0
+  private var holdWake = 0
   private(set) var sourcePID: pid_t?
   private(set) var audioActive = false
 
@@ -180,6 +191,33 @@ final class BrowserCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
 
   func noteSyncOffset(_ ms: Int) {
     audioPlayer.setSyncOffset(ms: ms)
+  }
+
+  /// Positive audio sync offset. Frames stay in the queue until they are this old.
+  func noteVideoHold(_ seconds: Double) {
+    let clamped = min(max(seconds.isFinite ? seconds : 0, 0), 2)
+    frameLock.lock()
+    videoHold = clamped
+    if clamped <= 0.0005 {
+      if let newest = delayQueue.waiting.last, let frame = delayBuffers[newest.id] {
+        latestOwned = frame.buffer
+        latestTime = frame.time
+        latestReceived = frame.received
+      }
+      delayQueue = CaptureVideoDelayQueue()
+      delayBuffers.removeAll()
+    } else {
+      delayQueue.hold = clamped
+      if let buffer = latestOwned {
+        delaySerial += 1
+        let id = delaySerial
+        delayBuffers[id] = DelayedFrame(buffer: buffer, time: latestTime, received: latestReceived)
+        delayQueue.push(id: id, received: latestReceived)
+        latestOwned = nil
+      }
+    }
+    frameLock.unlock()
+    scheduleDrain()
   }
 
   var hasPendingFrame: Bool {
@@ -415,6 +453,8 @@ final class BrowserCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
     }
     frameLock.lock()
     latestOwned = nil
+    delayQueue = CaptureVideoDelayQueue()
+    delayBuffers.removeAll()
     frameLock.unlock()
     guard let stream else { return }
     self.stream = nil
@@ -628,11 +668,22 @@ final class BrowserCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
   }
 
   /// Replaces any frame the draw queue has not started. One draw runs at a time; the next draw is the newest copy.
+  /// A positive sync offset keeps frames until they are old enough, and draws the newest one that has waited.
   private func publishFrame(_ buffer: CVPixelBuffer, time: CMTime, received: CFTimeInterval) {
     frameLock.lock()
-    latestOwned = buffer
-    latestTime = time
-    latestReceived = received
+    if videoHold > 0.0005 {
+      delaySerial += 1
+      let id = delaySerial
+      delayBuffers[id] = DelayedFrame(buffer: buffer, time: time, received: received)
+      delayQueue.hold = videoHold
+      delayQueue.push(id: id, received: received)
+      let live = Set(delayQueue.waiting.map(\.id))
+      delayBuffers = delayBuffers.filter { live.contains($0.key) }
+    } else {
+      latestOwned = buffer
+      latestTime = time
+      latestReceived = received
+    }
     let start = !drawBusy
     if start { drawBusy = true }
     frameLock.unlock()
@@ -643,8 +694,35 @@ final class BrowserCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
     }
   }
 
+  private func scheduleDrain() {
+    drawQueue.async { [weak self] in
+      guard let self else { return }
+      self.frameLock.lock()
+      let start = !self.drawBusy
+      if start { self.drawBusy = true }
+      self.frameLock.unlock()
+      if start { self.drainFrames() }
+    }
+  }
+
   private func drainFrames() {
     frameLock.lock()
+    if videoHold > 0.0005 {
+      delayQueue.hold = videoHold
+      let now = CACurrentMediaTime()
+      guard let ticket = delayQueue.popDue(now: now), let frame = delayBuffers.removeValue(forKey: ticket.id) else {
+        let wait = delayQueue.timeUntilDue(now: now)
+        drawBusy = false
+        frameLock.unlock()
+        if let wait { scheduleHoldDrain(after: wait) }
+        return
+      }
+      let live = Set(delayQueue.waiting.map(\.id))
+      delayBuffers = delayBuffers.filter { live.contains($0.key) }
+      frameLock.unlock()
+      deliver(frame.buffer, time: frame.time, received: frame.received)
+      return
+    }
     guard let buffer = latestOwned else {
       drawBusy = false
       frameLock.unlock()
@@ -654,6 +732,10 @@ final class BrowserCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
     let received = latestReceived
     latestOwned = nil
     frameLock.unlock()
+    deliver(buffer, time: time, received: received)
+  }
+
+  private func deliver(_ buffer: CVPixelBuffer, time: CMTime, received: CFTimeInterval) {
     let done: () -> Void = { [weak self] in
       guard let self else { return }
       self.drawQueue.async {
@@ -664,6 +746,19 @@ final class BrowserCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
       onFrame(buffer, time, received, done)
     } else {
       done()
+    }
+  }
+
+  private func scheduleHoldDrain(after seconds: Double) {
+    holdWake += 1
+    let token = holdWake
+    drawQueue.asyncAfter(deadline: .now() + seconds) { [weak self] in
+      guard let self, token == self.holdWake else { return }
+      self.frameLock.lock()
+      let start = !self.drawBusy
+      if start { self.drawBusy = true }
+      self.frameLock.unlock()
+      if start { self.drainFrames() }
     }
   }
 

@@ -175,6 +175,7 @@
 		A3D1A0262F00000100BEEF26 /* CaptureAudioPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = A3D1A0272F00000100BEEF27 /* CaptureAudioPolicy.swift */; };
 		A3D1A0282F00000100BEEF28 /* CaptureTextureLifetime.swift in Sources */ = {isa = PBXBuildFile; fileRef = A3D1A0292F00000100BEEF29 /* CaptureTextureLifetime.swift */; };
 		A3D1A02A2F00000100BEEF2A /* CaptureOutputRoute.swift in Sources */ = {isa = PBXBuildFile; fileRef = A3D1A02B2F00000100BEEF2B /* CaptureOutputRoute.swift */; };
+		A3D1A02E2F00000100BEEF2E /* CaptureAVSync.swift in Sources */ = {isa = PBXBuildFile; fileRef = A3D1A02F2F00000100BEEF2F /* CaptureAVSync.swift */; };
 		A3D1A02C2F00000100BEEF2C /* CaptureAudioRoute.swift in Sources */ = {isa = PBXBuildFile; fileRef = A3D1A02D2F00000100BEEF2D /* CaptureAudioRoute.swift */; };
 		B1E700012F00000100BEEF01 /* IPTVModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1E700022F00000100BEEF02 /* IPTVModels.swift */; };
 		B1E700032F00000100BEEF03 /* IPTVParsers.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1E700042F00000100BEEF04 /* IPTVParsers.swift */; };
@@ -1245,6 +1246,7 @@
 		A3D1A0272F00000100BEEF27 /* CaptureAudioPolicy.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = CaptureAudioPolicy.swift; sourceTree = "<group>"; };
 		A3D1A0292F00000100BEEF29 /* CaptureTextureLifetime.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = CaptureTextureLifetime.swift; sourceTree = "<group>"; };
 		A3D1A02B2F00000100BEEF2B /* CaptureOutputRoute.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = CaptureOutputRoute.swift; sourceTree = "<group>"; };
+		A3D1A02F2F00000100BEEF2F /* CaptureAVSync.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = CaptureAVSync.swift; sourceTree = "<group>"; };
 		A3D1A02D2F00000100BEEF2D /* CaptureAudioRoute.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = CaptureAudioRoute.swift; sourceTree = "<group>"; };
 		B1E700022F00000100BEEF02 /* IPTVModels.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = IPTVModels.swift; sourceTree = "<group>"; };
 		B1E700042F00000100BEEF04 /* IPTVParsers.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = IPTVParsers.swift; sourceTree = "<group>"; };
@@ -2480,6 +2482,7 @@
 				A3D1A0272F00000100BEEF27 /* CaptureAudioPolicy.swift */,
 				A3D1A0292F00000100BEEF29 /* CaptureTextureLifetime.swift */,
 				A3D1A02B2F00000100BEEF2B /* CaptureOutputRoute.swift */,
+				A3D1A02F2F00000100BEEF2F /* CaptureAVSync.swift */,
 				A3D1A02D2F00000100BEEF2D /* CaptureAudioRoute.swift */,
 				A3D1A0082F00000100BEEF08 /* Immersive3D.metal */,
 			);
@@ -3221,6 +3224,7 @@
 				A3D1A0262F00000100BEEF26 /* CaptureAudioPolicy.swift in Sources */,
 				A3D1A0282F00000100BEEF28 /* CaptureTextureLifetime.swift in Sources */,
 				A3D1A02A2F00000100BEEF2A /* CaptureOutputRoute.swift in Sources */,
+				A3D1A02E2F00000100BEEF2E /* CaptureAVSync.swift in Sources */,
 				A3D1A02C2F00000100BEEF2C /* CaptureAudioRoute.swift in Sources */,
 				B1E700012F00000100BEEF01 /* IPTVModels.swift in Sources */,
 				B1E700032F00000100BEEF03 /* IPTVParsers.swift in Sources */,
