@@ -531,13 +531,13 @@ private func testAVSync() {
   held.hold = holdSeconds
   held.cap = frames
   let step = 1.0 / CaptureVideoDelayQueue.captureFrameRate
-  var kept = true
+  var withinCap = true
   for index in 0..<frames {
     if !held.push(id: index, received: Double(index) * step).isEmpty {
-      kept = false
+      withinCap = false
     }
   }
-  check(kept && held.waiting.count == frames && held.waiting.first?.id == 0, "the queue holds 2000 ms of frames at the capture rate")
+  check(withinCap && held.waiting.count == frames && held.waiting.first?.id == 0, "the queue holds 2000 ms of frames at the capture rate")
   let drawn = held.popDue(now: holdSeconds)
   check(drawn?.id == 0, "the frame that has waited 2000 ms is the one drawn")
   var full = CaptureVideoDelayQueue()
