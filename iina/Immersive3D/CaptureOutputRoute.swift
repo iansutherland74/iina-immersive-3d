@@ -161,12 +161,16 @@ enum CaptureOutputRoute {
 /// Persisted audio sync offset, in milliseconds, on top of the measured capture delay.
 /// `delay(automatic:offsetMs:)` is the raw sum. Playback uses `paths`: a positive
 /// offset holds the picture, and a negative offset holds the sound.
+/// The range is asymmetric. Negative delays audio and stays at -500 ms. Positive
+/// delays video and can hold the picture for up to 2000 ms.
 enum CaptureSyncOffset {
   static let defaultsKey = "IINACaptureAudioSyncOffsetMS"
   static let changedNotification = Notification.Name("IINACaptureAudioSyncOffsetChanged")
   static let routeChangedNotification = Notification.Name("IINACaptureAudioRouteChanged")
+  /// Negative delays loopback audio.
   static let minMs = -500
-  static let maxMs = 500
+  /// Positive delays video presentation.
+  static let maxMs = 2000
 
   struct Paths: Equatable {
     var audioDelay: Double
@@ -219,7 +223,9 @@ enum CaptureSyncOffset {
   }
 
   /// The offset that would cancel `averageDeltaMs` on top of the offset already applied.
-  /// Positive delta means the beep is later than the flash.
+  /// Positive delta means the beep is later than the flash, so the suggestion delays
+  /// video. `ms` is clamped to `minMs...maxMs` (-500...+2000). `raw` is the unclamped
+  /// sum so the log can say when the measurement was past the slider.
   static func suggested(currentMs: Int, averageDeltaMs: Int) -> (ms: Int, raw: Int) {
     let raw = currentMs + averageDeltaMs
     return (clamp(raw), raw)

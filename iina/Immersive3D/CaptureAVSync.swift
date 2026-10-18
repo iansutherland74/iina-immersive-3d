@@ -194,25 +194,50 @@ enum CaptureAVSyncLog {
 
 /// Frames wait until they are `hold` seconds old, then the newest due frame is
 /// the one to draw. A hold of zero keeps only the newest frame.
+/// `cap` is a frame count, sized for the longest video delay at the capture
+/// frame rate. `push` drops the oldest ids past that count and returns them.
+/// The caller still owns those pixel buffers and releases them on the draw queue.
 struct CaptureVideoDelayQueue: Equatable {
   struct Ticket: Equatable {
     var id: Int
     var received: Double
   }
 
+  /// `SCStreamConfiguration.minimumFrameInterval` for browser capture.
+  static let captureFrameRate = 30.0
+
+  /// Frames that cover `holdSeconds` at `frameRate`, plus one so the frame that
+  /// has just reached the delay is still queued when the next one arrives.
+  /// The result is a count, so a long offset cannot grow without a bound.
+  static func capacity(frameRate: Double, holdSeconds: Double) -> Int {
+    let rate = frameRate.isFinite && frameRate > 0 ? frameRate : captureFrameRate
+    let seconds = holdSeconds.isFinite && holdSeconds > 0 ? holdSeconds : 0
+    let frames = Int((rate * seconds).rounded(.up))
+    return max(1, frames + 1)
+  }
+
   var hold = 0.0
-  var cap = 24
+  var cap = CaptureVideoDelayQueue.capacity(
+    frameRate: CaptureVideoDelayQueue.captureFrameRate,
+    holdSeconds: Double(CaptureSyncOffset.maxMs) / 1000
+  )
   private(set) var waiting: [Ticket] = []
 
-  mutating func push(id: Int, received: Double) {
+  /// Appends a frame. The returned ids were the oldest and are no longer waiting.
+  /// A non-positive hold keeps only this frame and returns every id it replaced.
+  @discardableResult
+  mutating func push(id: Int, received: Double) -> [Int] {
     if hold <= 0 {
+      let dropped = waiting.map(\.id)
       waiting = [Ticket(id: id, received: received)]
-      return
+      return dropped
     }
     waiting.append(Ticket(id: id, received: received))
-    if waiting.count > cap {
-      waiting.removeFirst(waiting.count - cap)
-    }
+    guard waiting.count > cap else { return [] }
+    let overflow = waiting.count - cap
+    let dropped = waiting.prefix(overflow).map(\.id)
+    waiting.removeFirst(overflow)
+    return dropped
   }
 
   mutating func popDue(now: Double) -> Ticket? {
@@ -280,7 +305,7 @@ final class CaptureAVSyncTest {
     tracker = CaptureAVSyncTracker()
     lines = []
     lock.unlock()
-    emit("av sync test started. Play a flash and beep. Positive audio sync offset delays video; negative delays audio.")
+    emit("av sync test started. Play a flash and beep. Positive audio sync offset delays video (up to \(CaptureSyncOffset.maxMs) ms); negative delays audio (up to \(-CaptureSyncOffset.minMs) ms).")
   }
 
   func stop() {

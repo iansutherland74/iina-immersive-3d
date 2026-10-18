@@ -1604,7 +1604,7 @@ final class CaptureLoopbackOutput {
   }
 }
 
-/// Audio sync offset, ±500 ms. Positive delays video. Negative delays audio.
+/// Audio sync offset, -500...+2000 ms. Positive delays video. Negative delays audio.
 /// The same control is used in the capture window, the glasses panel, and Settings.
 final class CaptureSyncOffsetControl: NSView {
   enum Placement {
@@ -1635,7 +1635,7 @@ final class CaptureSyncOffsetControl: NSView {
     NSLayoutConstraint.activate([
       label.leadingAnchor.constraint(equalTo: leadingAnchor),
       label.centerYAnchor.constraint(equalTo: centerYAnchor),
-      label.widthAnchor.constraint(equalToConstant: 240),
+      label.widthAnchor.constraint(equalToConstant: 268),
       slider.leadingAnchor.constraint(equalTo: label.trailingAnchor, constant: 8),
       slider.trailingAnchor.constraint(equalTo: trailingAnchor),
       slider.centerYAnchor.constraint(equalTo: centerYAnchor),
@@ -1672,7 +1672,7 @@ final class CaptureSyncOffsetControl: NSView {
       slider.doubleValue = Double(clamped)
     }
     label.stringValue = CaptureSyncOffset.effectLabel(ms: clamped)
-    slider.toolTip = "Audio sync offset (ms). Positive delays video. Negative delays audio."
+    slider.toolTip = "Audio sync offset, from \(CaptureSyncOffset.minMs) ms to +\(CaptureSyncOffset.maxMs) ms. Positive delays video. Negative delays audio."
     label.toolTip = slider.toolTip
   }
 

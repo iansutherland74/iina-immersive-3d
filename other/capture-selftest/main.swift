@@ -391,8 +391,12 @@ private func testRoute() {
   check(CaptureLoopbackClock.decide(chunk: CaptureLoopbackClock.Chunk(hostTime: 10, duration: 0.02), now: 10, delay: 0) == .play, "loopback plays at once before a picture measurement")
   check(CaptureLoopbackClock.decide(chunk: CaptureLoopbackClock.Chunk(hostTime: 10, duration: 0.02), now: 11.2, delay: 0) == .drop, "audio buffered before playback started is dropped")
   check(CaptureLoopbackClock.decide(chunk: CaptureLoopbackClock.Chunk(hostTime: 11.19, duration: 0.02), now: 11.2, delay: 0) == .play, "a new loopback chunk plays without a video measurement")
-  check(CaptureSyncOffset.clamp(800) == 500 && CaptureSyncOffset.clamp(-800) == -500, "the sync offset stays inside ±500 ms")
+  check(CaptureSyncOffset.minMs == -500 && CaptureSyncOffset.maxMs == 2000, "audio sync runs from -500 ms to +2000 ms")
+  check(CaptureSyncOffset.clamp(2000) == 2000 && CaptureSyncOffset.clamp(2001) == 2000, "positive offset stops at +2000 ms")
+  check(CaptureSyncOffset.clamp(-500) == -500 && CaptureSyncOffset.clamp(-800) == -500, "negative offset stops at -500 ms")
+  check(CaptureSyncOffset.clamp(800) == 800, "an offset between -500 ms and +2000 ms is kept")
   check(CaptureSyncOffset.label(ms: 40) == "Audio sync +40 ms", "a positive offset shows a plus")
+  check(CaptureSyncOffset.label(ms: 2000) == "Audio sync +2000 ms", "a +2000 ms offset shows a plus")
   check(CaptureSyncOffset.label(ms: -15) == "Audio sync -15 ms", "a negative offset shows a minus")
   check(CaptureSyncOffset.label(ms: 0) == "Audio sync 0 ms", "zero offset is labeled")
   check(abs(CaptureSyncOffset.delay(automatic: 0.020, offsetMs: 40) - 0.060) < 0.0001, "the slider adds to the measured delay")
@@ -418,15 +422,27 @@ private func testRoute() {
   check(CaptureDefaultOutput.statusText(1852797029) == "1852797029 'nope'", "the OSStatus fourcc is logged")
   let picture = CaptureSyncOffset.paths(automatic: 0.004, offsetMs: 500)
   check(abs(picture.audioDelay - 0.004) < 0.0001 && abs(picture.videoHold - 0.5) < 0.0001, "a positive offset delays video and leaves the loopback delay")
+  let longPicture = CaptureSyncOffset.paths(automatic: 0.004, offsetMs: 2000)
+  check(abs(longPicture.audioDelay - 0.004) < 0.0001 && abs(longPicture.videoHold - 2) < 0.0001, "a +2000 ms offset delays video by 2000 ms")
+  let overPicture = CaptureSyncOffset.paths(automatic: 0.004, offsetMs: 4000)
+  check(abs(overPicture.videoHold - 2) < 0.0001, "video delay stays at 2000 ms")
   let sound = CaptureSyncOffset.paths(automatic: 0.004, offsetMs: -40)
   check(abs(sound.audioDelay - 0.044) < 0.0001 && sound.videoHold == 0, "a negative offset delays audio")
+  let farSound = CaptureSyncOffset.paths(automatic: 0.004, offsetMs: -800)
+  check(abs(farSound.audioDelay - 0.504) < 0.0001 && farSound.videoHold == 0, "audio delay stays at 500 ms")
   let none = CaptureSyncOffset.paths(automatic: 0.004, offsetMs: 0)
   check(abs(none.audioDelay - 0.004) < 0.0001 && none.videoHold == 0, "zero offset keeps the measured delay")
   check(CaptureSyncOffset.effectLabel(ms: 500) == "Audio sync +500 ms (delays video)", "a positive offset is labeled as delaying video")
+  check(CaptureSyncOffset.effectLabel(ms: 2000) == "Audio sync +2000 ms (delays video)", "a +2000 ms offset is labeled as delaying video")
+  check(CaptureSyncOffset.effectLabel(ms: 2400) == "Audio sync +2000 ms (delays video)", "a value past +2000 ms is labeled at the cap")
   check(CaptureSyncOffset.effectLabel(ms: -40) == "Audio sync -40 ms (delays audio)", "a negative offset is labeled as delaying audio")
   check(CaptureSyncOffset.effectLabel(ms: 0) == "Audio sync 0 ms", "zero offset names the setting")
   let suggested = CaptureSyncOffset.suggested(currentMs: 100, averageDeltaMs: 450)
-  check(suggested.ms == 500 && suggested.raw == 550, "the suggested offset stays inside ±500 ms")
+  check(suggested.ms == 550 && suggested.raw == 550, "a suggestion inside -500 to +2000 ms is kept")
+  let high = CaptureSyncOffset.suggested(currentMs: 1600, averageDeltaMs: 500)
+  check(high.ms == 2000 && high.raw == 2100, "a suggestion past +2000 ms is clamped")
+  let low = CaptureSyncOffset.suggested(currentMs: -200, averageDeltaMs: -400)
+  check(low.ms == -500 && low.raw == -600, "a suggestion past -500 ms is clamped")
 }
 
 private func testAVSync() {
@@ -466,8 +482,10 @@ private func testAVSync() {
   if let first = first {
     let line720 = CaptureAVSyncLog.line(match: first, currentOffsetMs: 0)
     check(line720.contains("capture=1280x720") && line720.contains("mode=2D") && line720.contains("suggested=+500 ms (delays video)"), "a 720p 2D measurement names the resolution, mode, and video delay")
-    let clamped = CaptureAVSyncLog.line(match: first, currentOffsetMs: 100)
-    check(clamped.contains("suggested=+500 ms") && clamped.contains("clamped from +600"), "a suggestion past ±500 ms says it was clamped")
+    let clamped = CaptureAVSyncLog.line(match: first, currentOffsetMs: 1600)
+    check(clamped.contains("suggested=+2000 ms") && clamped.contains("clamped from +2100"), "a suggestion past +2000 ms says it was clamped")
+    let lowSuggestion = CaptureAVSyncLog.line(match: first, currentOffsetMs: -1200)
+    check(lowSuggestion.contains("suggested=-500 ms") && lowSuggestion.contains("clamped from -700"), "a suggestion past -500 ms says it was clamped")
   } else {
     check(false, "a 720p 2D measurement names the resolution, mode, and video delay")
   }
@@ -504,6 +522,47 @@ private func testAVSync() {
   check(delayed.waiting.isEmpty && delayed.popDue(now: 4) == nil, "flush drops frames still waiting out a video delay")
   delayed.hold = 0
   check(delayed.popDue(now: 4) == nil, "a flushed queue stays empty when the offset is cleared")
+
+  let holdSeconds = Double(CaptureSyncOffset.maxMs) / 1000
+  let frames = CaptureVideoDelayQueue.capacity(frameRate: CaptureVideoDelayQueue.captureFrameRate, holdSeconds: holdSeconds)
+  check(CaptureVideoDelayQueue.captureFrameRate == 30 && frames == 61, "2000 ms at 30 fps is 60 intervals plus the frame that just became due")
+  check(CaptureVideoDelayQueue().cap == frames, "the hold queue cap is that frame count")
+  var held = CaptureVideoDelayQueue()
+  held.hold = holdSeconds
+  held.cap = frames
+  let step = 1.0 / CaptureVideoDelayQueue.captureFrameRate
+  var withinCap = true
+  for index in 0..<frames {
+    if !held.push(id: index, received: Double(index) * step).isEmpty {
+      withinCap = false
+    }
+  }
+  check(withinCap && held.waiting.count == frames && held.waiting.first?.id == 0, "the queue holds 2000 ms of frames at the capture rate")
+  let drawn = held.popDue(now: holdSeconds)
+  check(drawn?.id == 0, "the frame that has waited 2000 ms is the one drawn")
+  var full = CaptureVideoDelayQueue()
+  full.hold = holdSeconds
+  full.cap = frames
+  for index in 0..<frames {
+    _ = full.push(id: index, received: Double(index) * step)
+  }
+  let overflow = full.push(id: frames, received: Double(frames) * step)
+  check(overflow == [0], "a frame past the cap drops the oldest id")
+  check(full.waiting.count == frames && full.waiting.first?.id == 1 && full.waiting.last?.id == frames, "the queue stays at its frame cap")
+  var burst = CaptureVideoDelayQueue()
+  burst.hold = holdSeconds
+  burst.cap = frames
+  var lastDropped: [Int] = []
+  for index in 0..<400 {
+    lastDropped = burst.push(id: index, received: Double(index) * step)
+  }
+  check(burst.waiting.count == frames, "a long capture does not grow the hold queue past the frame cap")
+  check(burst.waiting.first?.id == 400 - frames, "frames older than the cap are the ones dropped")
+  check(lastDropped == [400 - frames - 1], "each extra frame drops the oldest id so its buffer can be released")
+  var replaced = CaptureVideoDelayQueue()
+  replaced.hold = 0
+  _ = replaced.push(id: 1, received: 0)
+  check(replaced.push(id: 2, received: 0.01) == [1], "clearing the video delay returns the frame it replaced")
 }
 
 private func testLoopbackOutput() {
