@@ -594,7 +594,7 @@ final class BrowserCaptureWindowController: NSWindowController, NSTableViewDataS
     if !audioAvailable {
       return "Sound stays in the other app. Routing it through IINA needs macOS 13."
     }
-    return "Plays the browser through IINA. Audio sync offset: positive delays the picture, negative delays the sound. A/V Sync Test measures a flash and a beep. macOS asks once to install IINA Capture Audio. While a capture is running, other apps use that silent device too. Stopping capture puts the previous output back."
+    return "Plays the browser through IINA. Audio sync offset (\(CaptureSyncOffset.minMs) to +\(CaptureSyncOffset.maxMs) ms): positive delays the picture, negative delays the sound. A/V Sync Test measures a flash and a beep. macOS asks once to install IINA Capture Audio. While a capture is running, other apps use that silent device too. Stopping capture puts the previous output back."
   }
 
   private func reflectSettings() {

@@ -1,7 +1,8 @@
 #!/bin/bash
 # Headless Browser Capture checks: session, drawable size, window follow, frame
 # coalescing, the quit-during-capture resize rule, latency smoothing, the sync
-# offset, the flash/beep measurement, the default-output read-back, audio policy, loopback route order,
+# offset (-500 to +2000 ms) and the video-hold frame cap, the flash/beep
+# measurement, the default-output read-back, audio policy, loopback route order,
 # output-device restart decisions, resampling into the glasses device, the
 # loopback ring, a tone through that loopback, texture lifetime, and one synthetic side-by-side frame. No
 # display is required.
