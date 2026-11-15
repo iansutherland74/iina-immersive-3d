@@ -703,8 +703,17 @@ final class Immersive3DController: NSObject, NSWindowDelegate {
     window.contentAspectRatio = aspect
     applyGlassesFrame(screen.frame, to: window)
     window.contentView?.layer?.contentsScale = screen.backingScaleFactor
-    NSApp.activate(ignoringOtherApps: true)
+    // Do not activate IINA. Activation switches the built-in display off the game's
+    // full-screen Space, and ScreenCaptureKit then stops compositing that Space (idle frames).
+    // orderFrontRegardless plus the window level still puts the picture on the glasses display.
     window.orderFrontRegardless()
+  }
+
+  /// Capture is running but its picture cannot stay on the glasses, because the
+  /// source is full screen there or the capture is aimed at that same display.
+  func releaseCaptureFromGlasses() {
+    guard session.source == .capture else { return }
+    perform(session.transition(.exit))
   }
 
   func repinExternalWindow(_ window: NSWindow, on screen: NSScreen) {

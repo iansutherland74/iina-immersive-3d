@@ -49,6 +49,7 @@ final class BrowserCaptureWindowController: NSWindowController, NSTableViewDataS
   private var chromeItem: NSMenuItem?
   private var videoItem: NSMenuItem?
   private var syncTestItem: NSMenuItem?
+  private var conflictBanner: String?
 
   private var audioAvailable: Bool {
     if #available(macOS 13.0, *) { return true }
@@ -94,10 +95,26 @@ final class BrowserCaptureWindowController: NSWindowController, NSTableViewDataS
         self?.hideRoutePanel()
       }
     }
+    manager.onGlassesConflict = { [weak self] text in
+      DispatchQueue.main.async {
+        self?.showConflict(text)
+        Immersive3DController.shared.releaseCaptureFromGlasses()
+      }
+    }
+    manager.onGlassesConflictCleared = { [weak self] in
+      DispatchQueue.main.async {
+        self?.showConflict(nil)
+        self?.setStatus("The full-screen window left the glasses. Send Capture to Glasses when the game is showing on the Mac display.")
+      }
+    }
+    manager.hostState = { [weak self] in
+      self?.currentHostState() ?? .empty
+    }
     settings.onDetected = { [weak self] insets in
       self?.showDetected(insets)
     }
     renderer.onBlack = { [weak self] black in
+      guard self?.conflictBanner == nil else { return }
       self?.showOutputMessage(black ? BrowserCaptureManager.protectedMessage : nil)
     }
     CaptureAVSyncTest.shared.currentOffsetMs = { BrowserCaptureSettings.shared.syncOffsetMs }
@@ -229,6 +246,12 @@ final class BrowserCaptureWindowController: NSWindowController, NSTableViewDataS
 
   /// The glasses session asked for the capture picture. Returns false when the display cannot be used.
   func presentCapture(on screen: NSScreen) -> Bool {
+    let gate = manager.glassesPictureBlocked()
+    if gate.blocked {
+      let text = gate.message ?? CapturePlacement.message(app: "", displayName: screen.localizedName)
+      showConflict(text)
+      return false
+    }
     guard ensureOutput() != nil else { return false }
     onGlasses = true
     guard let outputWindow else {
@@ -530,10 +553,12 @@ final class BrowserCaptureWindowController: NSWindowController, NSTableViewDataS
 
   private func beginCapture(_ target: BrowserCaptureTarget) {
     guard ensurePermission() else { return }
-    let excluded = excludedWindowIDs()
     guard ensureOutput() != nil else { return }
+    // The preview window has to exist before its id is excluded, or a display
+    // capture of that screen films the preview.
+    showConflict(nil)
+    let excluded = excludedWindowIDs()
     setStatus("Starting capture…")
-    showOutputMessage(nil)
     Task { [weak self] in
       do {
         try await self?.manager.start(target, excluding: excluded)
@@ -542,9 +567,12 @@ final class BrowserCaptureWindowController: NSWindowController, NSTableViewDataS
           self?.logRoute(offer)
           self?.showRoutePanel()
           self?.syncMenu()
-          self?.setStatus(self?.captureStatus() ?? "Capturing.")
-          self?.window?.orderOut(nil)
+          let blocked = self?.manager.glassesPictureBlocked().blocked ?? false
           Immersive3DController.shared.captureDidStart()
+          if !blocked {
+            self?.setStatus(self?.captureStatus() ?? "Capturing.")
+          }
+          self?.window?.orderOut(nil)
         }
       } catch {
         DispatchQueue.main.async {
@@ -696,12 +724,53 @@ final class BrowserCaptureWindowController: NSWindowController, NSTableViewDataS
     let routed = audioAvailable && settings.wantsAudio
     routePanelCheckbox?.state = routed ? .on : .off
     routePanelCheckbox?.isEnabled = audioAvailable
-    routePanelStatus?.stringValue = CaptureAudioPolicy.statusLine(
+    var line = CaptureAudioPolicy.statusLine(
       systemSupportsRouting: audioAvailable,
       userEnabled: settings.wantsAudio,
       deviceInstalled: CaptureSystemOutput.ourDeviceInstalled(),
       capturing: manager.isRunning
     )
+    let banner = conflictBanner ?? ""
+    if !banner.isEmpty {
+      line = banner + "\n\n" + line
+    }
+    routePanelStatus?.stringValue = line
+    let statusHeight: CGFloat = banner.isEmpty ? 84 : 150
+    routePanelStatus?.frame = NSRect(x: 16, y: 16, width: 528, height: statusHeight)
+    if let panel = routePanel {
+      var frame = panel.frame
+      let height: CGFloat = banner.isEmpty ? 150 : 230
+      frame.size.height = height
+      panel.setFrame(frame, display: true)
+      routePanelCheckbox?.frame = NSRect(x: 16, y: height - 42, width: 528, height: 22)
+    }
+  }
+
+  private func showConflict(_ text: String?) {
+    let trimmed = text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    conflictBanner = trimmed.isEmpty ? nil : trimmed
+    showOutputMessage(conflictBanner)
+    if let conflictBanner {
+      setStatus(conflictBanner)
+    }
+    updateRoutePanel()
+    if conflictBanner != nil {
+      routePanel?.orderFrontRegardless()
+    }
+  }
+
+  private func currentHostState() -> CaptureHostState {
+    let glasses = Immersive3DController.glassesCandidates().compactMap { screen -> CaptureDisplay? in
+      guard let id = screen.displayId, id != 0 else { return nil }
+      return CaptureDisplay(id: id, frame: screen.frame, name: screen.localizedName, isGlasses: true)
+    }
+    let pinned: UInt32
+    if onGlasses, let id = outputWindow?.screen?.displayId {
+      pinned = id
+    } else {
+      pinned = 0
+    }
+    return CaptureHostState(glasses: glasses, pinnedDisplayID: pinned)
   }
 
   private func ensurePermission() -> Bool {
@@ -736,7 +805,7 @@ final class BrowserCaptureWindowController: NSWindowController, NSTableViewDataS
       message.drawsBackground = true
       message.isBezeled = false
       message.isEditable = false
-      message.frame = NSRect(x: 24, y: 24, width: 912, height: 96)
+      message.frame = NSRect(x: 24, y: 24, width: 912, height: 160)
       message.autoresizingMask = [.width, .maxYMargin]
       message.isHidden = true
       renderer.addSubview(message)

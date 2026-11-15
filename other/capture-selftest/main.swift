@@ -203,6 +203,159 @@ private func testWindowMatch() {
   check(shadowOnly.decision == .keep, "an untitled window does not end whole-display capture")
 }
 
+private func captureDisplay(_ id: UInt32, _ name: String, _ frame: CGRect, glasses: Bool) -> CaptureDisplay {
+  CaptureDisplay(id: id, frame: frame, name: name, isGlasses: glasses)
+}
+
+private func testPlacement() {
+  let builtIn = captureDisplay(2, "Built-in Retina", CGRect(x: 0, y: 0, width: 1512, height: 982), glasses: false)
+  let glassesDisplay = captureDisplay(7, "SmartGlasses", CGRect(x: 1512, y: -98, width: 3840, height: 1080), glasses: true)
+  let displays = [builtIn, glassesDisplay]
+  let normal = chrome(10, title: "New Tab", width: 800, height: 600, onScreen: true, displayID: 2)
+  let onMac = CapturePlacementRequest(
+    kind: .window,
+    windowID: 10,
+    title: "New Tab",
+    owner: "Google Chrome",
+    bundleID: "com.google.Chrome",
+    windows: [normal],
+    displays: displays,
+    capturingDisplayID: 2,
+    pinnedDisplayID: 7
+  )
+  check(CapturePlacement.decide(onMac).isKeep, "a window on the Mac display can be sent to the glasses")
+
+  let offscreen = chrome(145, title: "Luna", width: 1512, height: 949, onScreen: false, displayID: 2)
+  let sameShadow = chrome(2003, title: "", width: 1512, height: 982, onScreen: true, displayID: 2)
+  var sameDisplay = onMac
+  sameDisplay.windowID = 145
+  sameDisplay.title = "Luna"
+  sameDisplay.windows = [offscreen, sameShadow]
+  sameDisplay.pinnedDisplayID = 0
+  check(CapturePlacement.decide(sameDisplay).isKeep, "an untitled window on the same display does not steal the capture")
+
+  let glassesShadow = chrome(2003, title: "", width: 3840, height: 1080, onScreen: true, displayID: 7)
+  let glassesHidden = chrome(2003, title: "", width: 3840, height: 1080, onScreen: false, displayID: 7)
+  var hiddenSpace = sameDisplay
+  hiddenSpace.windows = [offscreen, glassesHidden]
+  hiddenSpace.pinnedDisplayID = 0
+  if case .moveOutput(_, let hiddenNext, _) = CapturePlacement.decide(hiddenSpace) {
+    if case .display(let id) = hiddenNext {
+      check(id == 7, "a full-screen Space on the glasses counts even when isOnScreen is false")
+    } else {
+      check(false, "a full-screen Space on the glasses counts even when isOnScreen is false")
+    }
+  } else {
+    check(false, "a full-screen Space on the glasses counts even when isOnScreen is false")
+  }
+  var luna = sameDisplay
+  luna.windows = [offscreen, glassesShadow]
+  luna.pinnedDisplayID = 7
+  if case .moveOutput(let message, let next, _) = CapturePlacement.decide(luna) {
+    check(message.contains("Google Chrome") && message.contains("SmartGlasses") && message.contains("Esc"), "the glasses full-screen message says how to move Chrome")
+    if case .display(let id) = next {
+      check(id == 7, "an untitled full-screen window on the glasses captures that display")
+    } else {
+      check(false, "an untitled full-screen window on the glasses captures that display")
+    }
+  } else {
+    check(false, "full screen on the glasses moves IINA's picture off that display")
+  }
+
+  let titled = chrome(300, title: "Luna", width: 3840, height: 1080, onScreen: true, displayID: 7)
+  var titledRequest = luna
+  titledRequest.windows = [offscreen, titled]
+  if case .moveOutput(_, let next, _) = CapturePlacement.decide(titledRequest) {
+    if case .window(let window) = next {
+      check(window.id == 300, "a titled full-screen window on the glasses is captured directly")
+    } else {
+      check(false, "a titled full-screen window on the glasses is captured directly")
+    }
+  } else {
+    check(false, "a titled full-screen window on the glasses is captured directly")
+  }
+
+  let live = chrome(145, title: "Luna", width: 1512, height: 949, onScreen: true, displayID: 2)
+  var stillGlasses = titledRequest
+  stillGlasses.windows = [live, titled]
+  stillGlasses.windowID = 145
+  if case .moveOutput(_, let next, _) = CapturePlacement.decide(stillGlasses) {
+    if case .window(let window) = next {
+      check(window.id == 300, "the glasses full-screen window wins even when the built-in window is on screen")
+    } else {
+      check(false, "the glasses full-screen window wins even when the built-in window is on screen")
+    }
+  } else {
+    check(false, "the glasses full-screen window wins even when the built-in window is on screen")
+  }
+
+  let side = captureDisplay(8, "Side Monitor", CGRect(x: 5000, y: 0, width: 1920, height: 1080), glasses: false)
+  let sideFull = chrome(400, title: "Other", width: 1920, height: 1080, onScreen: true, displayID: 8)
+  var stay = stillGlasses
+  stay.windows = [live, sideFull]
+  stay.displays = [builtIn, glassesDisplay, side]
+  stay.pinnedDisplayID = 0
+  check(CapturePlacement.decide(stay).isKeep, "a live full-screen window stays when the other display is not the glasses")
+
+  var already = titledRequest
+  already.windowID = 300
+  already.capturingDisplayID = 7
+  already.windows = [titled]
+  if case .moveOutput(_, let next, _) = CapturePlacement.decide(already) {
+    if case .unchanged = next {
+      check(true, "capturing the glasses window does not switch away from it")
+    } else {
+      check(false, "capturing the glasses window does not switch away from it")
+    }
+  } else {
+    check(false, "the glasses window blocks pinning IINA on top of it")
+  }
+
+  var wholeBuiltIn = CapturePlacementRequest(
+    kind: .display,
+    windowID: 0,
+    title: "Capture whole display",
+    owner: "",
+    bundleID: "",
+    windows: [offscreen, glassesShadow],
+    displays: displays,
+    capturingDisplayID: 2,
+    pinnedDisplayID: 0
+  )
+  if case .moveOutput(_, let next, let reason) = CapturePlacement.decide(wholeBuiltIn) {
+    if case .display(let id) = next {
+      check(id == 7 && reason.contains("2"), "whole-display capture of the built-in follows the glasses")
+    } else {
+      check(false, "whole-display capture of the built-in follows the glasses")
+    }
+  } else {
+    check(false, "whole-display capture of the built-in follows the glasses")
+  }
+
+  var wholeGlasses = wholeBuiltIn
+  wholeGlasses.capturingDisplayID = 7
+  wholeGlasses.pinnedDisplayID = 7
+  if case .moveOutput(_, let next, _) = CapturePlacement.decide(wholeGlasses) {
+    if case .unchanged = next {
+      check(true, "capturing the glasses while pinned there only moves IINA's picture")
+    } else {
+      check(false, "capturing the glasses while pinned there only moves IINA's picture")
+    }
+  } else {
+    check(false, "capturing the glasses while pinned there only moves IINA's picture")
+  }
+
+  let popup = chrome(11, title: "Popup", width: 400, height: 300, onScreen: true, displayID: 7)
+  var small = onMac
+  small.windows = [normal, popup]
+  small.pinnedDisplayID = 0
+  check(CapturePlacement.decide(small).isKeep, "a small window on the glasses does not move the capture")
+
+  var desktop = wholeBuiltIn
+  desktop.windows = [normal]
+  check(CapturePlacement.decide(desktop).isKeep, "whole-display capture stays when nothing is full screen on the glasses")
+}
+
 private func testDrawableLock() {
   let builtIn = GlassesDrawable.lockedPixels(lockedWidth: 3840, lockedHeight: 1080, interimWidth: 3024, interimHeight: 1964)
   check(builtIn.width == 3840 && builtIn.height == 1080, "a Space change does not adopt the Mac screen")
@@ -1099,6 +1252,7 @@ enum CaptureSelfTest {
     testDrawableLock()
     testSession()
     testWindowMatch()
+    testPlacement()
     testCoalescer()
     testStagePool()
     testQuitDuringCapture()

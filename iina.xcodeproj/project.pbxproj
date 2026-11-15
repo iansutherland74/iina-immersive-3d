@@ -169,6 +169,7 @@
 		A3D1A01A2F00000100BEEF1A /* BrowserCaptureCrop.swift in Sources */ = {isa = PBXBuildFile; fileRef = A3D1A01B2F00000100BEEF1B /* BrowserCaptureCrop.swift */; };
 		A3D1A01C2F00000100BEEF1C /* GlassesSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = A3D1A01D2F00000100BEEF1D /* GlassesSession.swift */; };
 		A3D1A01E2F00000100BEEF1E /* CaptureWindowMatch.swift in Sources */ = {isa = PBXBuildFile; fileRef = A3D1A01F2F00000100BEEF1F /* CaptureWindowMatch.swift */; };
+		A3D1A0302F00000100BEEF30 /* CapturePlacement.swift in Sources */ = {isa = PBXBuildFile; fileRef = A3D1A0312F00000100BEEF31 /* CapturePlacement.swift */; };
 		A3D1A0202F00000100BEEF20 /* GlassesDrawable.swift in Sources */ = {isa = PBXBuildFile; fileRef = A3D1A0212F00000100BEEF21 /* GlassesDrawable.swift */; };
 		A3D1A0222F00000100BEEF22 /* StereoOffscreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = A3D1A0232F00000100BEEF23 /* StereoOffscreen.swift */; };
 		A3D1A0242F00000100BEEF24 /* CaptureFrameCoalescer.swift in Sources */ = {isa = PBXBuildFile; fileRef = A3D1A0252F00000100BEEF25 /* CaptureFrameCoalescer.swift */; };
@@ -1240,6 +1241,7 @@
 		A3D1A01B2F00000100BEEF1B /* BrowserCaptureCrop.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = BrowserCaptureCrop.swift; sourceTree = "<group>"; };
 		A3D1A01D2F00000100BEEF1D /* GlassesSession.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = GlassesSession.swift; sourceTree = "<group>"; };
 		A3D1A01F2F00000100BEEF1F /* CaptureWindowMatch.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = CaptureWindowMatch.swift; sourceTree = "<group>"; };
+		A3D1A0312F00000100BEEF31 /* CapturePlacement.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = CapturePlacement.swift; sourceTree = "<group>"; };
 		A3D1A0212F00000100BEEF21 /* GlassesDrawable.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = GlassesDrawable.swift; sourceTree = "<group>"; };
 		A3D1A0232F00000100BEEF23 /* StereoOffscreen.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = StereoOffscreen.swift; sourceTree = "<group>"; };
 		A3D1A0252F00000100BEEF25 /* CaptureFrameCoalescer.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = CaptureFrameCoalescer.swift; sourceTree = "<group>"; };
@@ -2476,6 +2478,7 @@
 				A3D1A01B2F00000100BEEF1B /* BrowserCaptureCrop.swift */,
 				A3D1A01D2F00000100BEEF1D /* GlassesSession.swift */,
 				A3D1A01F2F00000100BEEF1F /* CaptureWindowMatch.swift */,
+				A3D1A0312F00000100BEEF31 /* CapturePlacement.swift */,
 				A3D1A0212F00000100BEEF21 /* GlassesDrawable.swift */,
 				A3D1A0232F00000100BEEF23 /* StereoOffscreen.swift */,
 				A3D1A0252F00000100BEEF25 /* CaptureFrameCoalescer.swift */,
@@ -3218,6 +3221,7 @@
 				A3D1A01A2F00000100BEEF1A /* BrowserCaptureCrop.swift in Sources */,
 				A3D1A01C2F00000100BEEF1C /* GlassesSession.swift in Sources */,
 				A3D1A01E2F00000100BEEF1E /* CaptureWindowMatch.swift in Sources */,
+				A3D1A0302F00000100BEEF30 /* CapturePlacement.swift in Sources */,
 				A3D1A0202F00000100BEEF20 /* GlassesDrawable.swift in Sources */,
 				A3D1A0222F00000100BEEF22 /* StereoOffscreen.swift in Sources */,
 				A3D1A0242F00000100BEEF24 /* CaptureFrameCoalescer.swift in Sources */,
