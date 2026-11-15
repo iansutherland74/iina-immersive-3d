@@ -113,6 +113,19 @@ final class BrowserCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
   private var holdWake = 0
   private(set) var sourcePID: pid_t?
   private(set) var audioActive = false
+  private var placementKey = ""
+  private var placementApplied = ""
+  private var placementSince = 0.0
+  /// Window id we already activated, so a later follow tick does not steal focus again.
+  private var focusedWindowID: CGWindowID = 0
+  private var dynamicRangeName = "n/a"
+  private var targetSummary = ""
+  private var idleSince: CFTimeInterval = 0
+  private var loggedIdleDiag = false
+  private var loggedPixelFormat = false
+  private let placementLock = NSLock()
+  private var blocksGlassesOutput = false
+  private var conflictMessage: String?
 
   /// Called on the draw queue with a pixel buffer this process owns, and the time the copy was made.
   var onFrame: ((CVPixelBuffer, CMTime, CFTimeInterval, @escaping () -> Void) -> Void)?
@@ -123,8 +136,15 @@ final class BrowserCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
   var onMuteChanged: (() -> Void)?
   /// The stream gave up after an error. The glasses session drops the capture source.
   var onStopped: (() -> Void)?
+  /// The full-screen window is on the glasses, or the capture is aimed at the display IINA is pinned to.
+  /// The picture has to stay on the Mac or the stream films itself.
+  var onGlassesConflict: ((String) -> Void)?
+  /// The full-screen window left the glasses display.
+  var onGlassesConflictCleared: (() -> Void)?
   /// Read on the main thread. Window numbers are AppKit objects.
   var excludedWindowIDs: () -> Set<CGWindowID> = { [] }
+  /// Read on the main thread. Glasses screens and whether the picture is pinned.
+  var hostState: () -> CaptureHostState = { .empty }
 
   private override init() {
     super.init()
@@ -178,6 +198,13 @@ final class BrowserCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
   }
 
   var isRunning: Bool { running }
+
+  /// True when Send Capture to Glasses would put IINA's picture on the display being captured.
+  func glassesPictureBlocked() -> (blocked: Bool, message: String?) {
+    placementLock.lock()
+    defer { placementLock.unlock() }
+    return (blocksGlassesOutput, conflictMessage)
+  }
 
   func notePresentedVideo(_ time: CMTime) {
     guard audioActive, !routedAudio else { return }
@@ -304,6 +331,11 @@ final class BrowserCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
     guard type == .screen else { return }
     let status = Self.frameStatus(of: sampleBuffer)
     let image = CMSampleBufferGetImageBuffer(sampleBuffer)
+    if !loggedPixelFormat, let image {
+      loggedPixelFormat = true
+      let format = CVPixelBufferGetPixelFormatType(image)
+      browserCaptureLog.info("frame pixel format \(Self.pixelFormatName(format), privacy: .public) attachments=\(Self.statusName(status), privacy: .public)")
+    }
     noteFrame(status: status, hasImage: image != nil)
     guard accepting else { return }
     if status == .blank {
@@ -347,12 +379,23 @@ final class BrowserCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
     guard token == epoch else { return }
     let content = try await loadContent()
     guard token == epoch else { return }
-    let resolved = try Self.resolve(target, in: content, excluding: ids)
+    let resolvedFirst = try Self.resolve(target, in: content, excluding: ids)
+    let host = await MainActor.run { self.hostState() }
+    let aligned = Self.align(resolvedFirst, content: content, excluding: ids, host: host)
+    let resolved = aligned.capture
     let configuration = SCStreamConfiguration()
     configuration.width = resolved.pixelWidth
     configuration.height = resolved.pixelHeight
     configuration.pixelFormat = kCVPixelFormatType_32BGRA
     configuration.showsCursor = false
+    // 32BGRA is an 8-bit SDR buffer. macOS 15 and later (including Tahoe 26) can
+    // deliver HDR for an XDR display when this is left at the default, and the
+    // 8-bit buffer then comes back black. Ventura has no such property.
+    dynamicRangeName = "n/a"
+    if #available(macOS 15.0, *) {
+      configuration.captureDynamicRange = .SDR
+      dynamicRangeName = "SDR"
+    }
     // Three frames is enough for the capture to stay smooth. Eight frames sat
     // behind the depth pass and showed up as extra latency on the glasses.
     configuration.queueDepth = 3
@@ -400,16 +443,37 @@ final class BrowserCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
       let frame = content.windows.first { $0.windowID == resolved.target.id }?.frame ?? .zero
       trackedDisplay = Self.displayID(covering: frame, displays: content.displays)
     } else {
-      trackedBundle = ""
-      trackedOwner = ""
-      trackedTitle = ""
+      // A whole-display choice has an empty bundle. A full-screen Space that moved
+      // onto the glasses keeps the app identity so follow can return to that window
+      // once it is back on the Mac.
+      trackedBundle = resolved.target.bundleID
+      trackedOwner = resolved.target.owner
+      trackedTitle = resolved.target.title
       trackedDisplay = resolved.target.displayID
     }
     followClock = .empty
+    placementKey = aligned.decision.stableKey
+    placementApplied = placementKey
+    placementSince = CACurrentMediaTime()
+    focusedWindowID = 0
     loggedFirstFrame = false
+    loggedPixelFormat = false
+    idleSince = 0
+    loggedIdleDiag = false
     framesInWindow = 0
     windowStarted = CACurrentMediaTime()
     lastComplete = CACurrentMediaTime()
+    logTarget(resolved, content: content, decision: aligned.decision, host: host)
+    switch aligned.decision {
+    case .keep:
+      clearConflict(notify: false)
+    case .retarget(_, let reason):
+      browserCaptureLog.info("\(reason, privacy: .public)")
+      clearConflict(notify: false)
+    case .moveOutput(let message, _, let reason):
+      browserCaptureLog.info("\(reason, privacy: .public)")
+      announceConflict(message)
+    }
     accepting = true
     do {
       try await start(stream)
@@ -432,6 +496,7 @@ final class BrowserCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
     running = true
     ignoreStop = false
     audioActive = captureAudio
+    focusOffscreenSource(content: content, resolved: resolved)
     armFollow()
     armRedraw()
     if let audioProblem {
@@ -484,6 +549,12 @@ final class BrowserCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
       trackedTitle = ""
       trackedDisplay = 0
       followClock = .empty
+      placementKey = ""
+      placementApplied = ""
+      placementSince = 0
+      focusedWindowID = 0
+      targetSummary = ""
+      clearConflict(notify: false)
     }
     guard let stream else { return }
     self.stream = nil
@@ -537,7 +608,6 @@ final class BrowserCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
     defer { endSession() }
     guard shouldRun, token == epoch, let target = activeTarget else { return }
     let followingWindow = target.kind == .window || !trackedBundle.isEmpty || !trackedOwner.isEmpty
-    guard followingWindow else { return }
     let ids = await MainActor.run { self.excludedWindowIDs() }
     guard token == epoch else { return }
     excludedIDs = ids
@@ -567,6 +637,34 @@ final class BrowserCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
       clock: followClock
     )
     followClock = outcome.clock
+    let host = await MainActor.run { self.hostState() }
+    guard token == epoch, shouldRun else { return }
+    let placement = Self.placementDecision(target: target, records: records, content: content, host: host)
+    if let confirmed = confirmed(placement) {
+      let fresh = placementApplied != confirmed.stableKey
+      if fresh { placementApplied = confirmed.stableKey }
+      switch confirmed {
+      case .keep:
+        if fresh { clearConflict(notify: true) }
+      case .retarget(let next, let reason):
+        if fresh {
+          clearConflict(notify: true)
+          await applyNext(next, content: content, excluding: ids, token: token, reason: reason)
+        }
+        return
+      case .moveOutput(let message, let next, let reason):
+        if fresh {
+          announceConflict(message)
+          await applyNext(next, content: content, excluding: ids, token: token, reason: reason)
+        }
+        return
+      }
+    } else if !placement.isKeep {
+      // The full-screen Space is changing display. Hold the current filter until that
+      // has been true for a second, so a Space animation cannot flip the capture.
+      return
+    }
+    guard followingWindow else { return }
     switch outcome.decision {
     case .keep:
       if let current = windows.first(where: { $0.windowID == target.id }), target.kind == .window {
@@ -574,6 +672,10 @@ final class BrowserCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
         if display != 0 { trackedDisplay = display }
         let title = current.title ?? ""
         if !title.isEmpty { trackedTitle = title }
+        let size = Self.pixelSize(for: current, displays: content.displays)
+        if let configuration, abs(size.width - configuration.width) > 32 || abs(size.height - configuration.height) > 32 {
+          await updateStreamSize(width: size.width, height: size.height, token: token)
+        }
       }
     case .window(let found, let reason):
       if target.kind == .window && target.id == found.id {
@@ -681,7 +783,7 @@ final class BrowserCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
     activeTarget = target
     currentID = window.windowID
     sourcePID = window.owningApplication?.processID
-    let size = Self.pixelSize(for: window)
+    let size = Self.pixelSize(for: window, displays: content.displays)
     configuration?.width = size.width
     configuration?.height = size.height
     if let configuration {
@@ -694,6 +796,7 @@ final class BrowserCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
         }
       }
     }
+    focusIfOffscreen(window)
   }
 
   /// Replaces any frame the draw queue has not started. One draw runs at a time; the next draw is the newest copy.
@@ -939,11 +1042,40 @@ final class BrowserCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
       browserCaptureLog.info("first frame status=\(Self.statusName(status), privacy: .public) image=\(hasImage)")
     }
     let now = CACurrentMediaTime()
+    if status == .idle {
+      if idleSince == 0 { idleSince = now }
+      if !loggedIdleDiag, now - idleSince >= 3, !targetSummary.isEmpty {
+        loggedIdleDiag = true
+        browserCaptureLog.error("idle for 3s; holding the last complete frame. \(self.targetSummary, privacy: .public)")
+      }
+    } else if status == .complete || status == .started {
+      idleSince = 0
+      loggedIdleDiag = false
+    }
     if now - windowStarted >= 1 {
       let count = framesInWindow
       framesInWindow = 0
       windowStarted = now
       browserCaptureLog.info("frames \(count)/s status=\(Self.statusName(status), privacy: .public)")
+    }
+  }
+
+  static func pixelFormatName(_ format: OSType) -> String {
+    switch format {
+    case kCVPixelFormatType_32BGRA: return "BGRA"
+    case kCVPixelFormatType_32RGBA: return "RGBA"
+    case kCVPixelFormatType_64RGBAHalf: return "RGBAHalf"
+    case kCVPixelFormatType_ARGB2101010LEPacked: return "ARGB2101010"
+    default:
+      let bytes = [(format >> 24) & 0xff, (format >> 16) & 0xff, (format >> 8) & 0xff, format & 0xff]
+      let text = bytes.map { byte -> Character in
+        let value = UInt8(truncatingIfNeeded: byte)
+        if value >= 32 && value < 127, let scalar = UnicodeScalar(UInt32(value)) {
+          return Character(scalar)
+        }
+        return "."
+      }
+      return "\(format) \(String(text))"
     }
   }
 
@@ -1142,7 +1274,7 @@ final class BrowserCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
       resolved.title = window.title ?? target.title
       resolved.owner = window.owningApplication?.applicationName ?? target.owner
       resolved.bundleID = window.owningApplication?.bundleIdentifier ?? target.bundleID
-      let size = pixelSize(for: window)
+      let size = pixelSize(for: window, displays: content.displays)
       let filter = SCContentFilter(desktopIndependentWindow: window)
       return ResolvedCapture(target: resolved, filter: filter, pixelWidth: size.width, pixelHeight: size.height, pid: window.owningApplication?.processID)
     }
@@ -1193,12 +1325,27 @@ final class BrowserCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
     return left.contains(right) || right.contains(left)
   }
 
-  private static func pixelSize(for window: SCWindow) -> (width: Int, height: Int) {
+  /// Pixel size from the display the window sits on. `SCDisplay.width` is pixels and `frame` is points,
+  /// so a 1x glasses display stays 3840×1080 instead of being doubled and clamped. `NSScreen` is only
+  /// the fallback: this runs off the main thread, where AppKit screen lists are not reliable.
+  private static func pixelSize(for window: SCWindow, displays: [SCDisplay] = []) -> (width: Int, height: Int) {
     let frame = window.frame
     var scale: CGFloat = 2
-    if let screen = NSScreen.screens.first(where: { $0.frame.intersects(frame) }) {
+    var bestArea: CGFloat = 0
+    var matched = false
+    for display in displays where display.frame.width > 1 {
+      let overlap = frame.intersection(display.frame)
+      let area = overlap.isNull ? 0 : max(overlap.width, 0) * max(overlap.height, 0)
+      if area > bestArea {
+        bestArea = area
+        scale = CGFloat(display.width) / display.frame.width
+        matched = true
+      }
+    }
+    if !matched, let screen = NSScreen.screens.first(where: { $0.frame.intersects(frame) }) {
       scale = screen.backingScaleFactor
     }
+    if !scale.isFinite || scale <= 0 { scale = 2 }
     let width = Int((frame.width * scale).rounded())
     let height = Int((frame.height * scale).rounded())
     return clampedPixels(width, height)
@@ -1210,6 +1357,258 @@ final class BrowserCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
     if width % 2 != 0 { width -= 1 }
     if height % 2 != 0 { height -= 1 }
     return (max(width, 2), max(height, 2))
+  }
+
+  private struct AlignedCapture {
+    var capture: ResolvedCapture
+    var decision: CapturePlacementDecision
+  }
+
+  /// Aim the new stream at the display the full-screen window is actually on.
+  /// Doing this before `startCapture` avoids publishing the black built-in frame first.
+  private static func align(_ resolved: ResolvedCapture, content: SCShareableContent, excluding ids: Set<CGWindowID>, host: CaptureHostState) -> AlignedCapture {
+    let records = content.windows.filter { isFollowableWindow($0, excluding: ids) }.map { record($0, displays: content.displays) }
+    let decision = placementDecision(target: resolved.target, records: records, content: content, host: host)
+    guard let next = decision.next else { return AlignedCapture(capture: resolved, decision: decision) }
+    switch next {
+    case .unchanged:
+      return AlignedCapture(capture: resolved, decision: decision)
+    case .window(let record):
+      var updated = resolved.target
+      updated.kind = .window
+      updated.id = record.id
+      if !record.title.isEmpty { updated.title = record.title }
+      if !record.owner.isEmpty { updated.owner = record.owner }
+      if !record.bundleID.isEmpty { updated.bundleID = record.bundleID }
+      updated.displayID = record.displayID
+      if let again = try? resolve(updated, in: content, excluding: ids) {
+        return AlignedCapture(capture: again, decision: decision)
+      }
+      let displayID = record.displayID
+      if let display = content.displays.first(where: { $0.displayID == displayID }) {
+        return AlignedCapture(capture: resolvedDisplay(display, excluding: ids, in: content, app: updated), decision: decision)
+      }
+      return AlignedCapture(capture: resolved, decision: decision)
+    case .display(let id):
+      guard let display = content.displays.first(where: { $0.displayID == id }) else {
+        return AlignedCapture(capture: resolved, decision: decision)
+      }
+      var app = resolved.target
+      if app.bundleID.isEmpty, let window = records.first(where: { $0.displayID == id && !$0.bundleID.isEmpty && !CaptureWindowMatch.isPlaceholder($0) }) {
+        app.bundleID = window.bundleID
+        app.owner = window.owner
+      }
+      return AlignedCapture(capture: resolvedDisplay(display, excluding: ids, in: content, app: app), decision: decision)
+    }
+  }
+
+  private static func placementDecision(target: BrowserCaptureTarget, records: [CaptureWindowRecord], content: SCShareableContent, host: CaptureHostState) -> CapturePlacementDecision {
+    let frames = content.displays.map { (id: $0.displayID, frame: $0.frame) }
+    let capturing: UInt32
+    if target.kind == .display {
+      capturing = target.displayID
+    } else {
+      capturing = records.first { $0.id == target.id }?.displayID ?? 0
+    }
+    // A whole-display row stores the screen name in `owner`. That is not an app, so the
+    // window matcher must not treat it as one. App identity is kept only for a window target.
+    let appOwner = target.kind == .window ? target.owner : ""
+    let appBundle = target.kind == .window ? target.bundleID : ""
+    return CapturePlacement.decide(CapturePlacementRequest(
+      kind: target.kind == .display ? .display : .window,
+      windowID: target.kind == .window ? target.id : 0,
+      title: target.title,
+      owner: appOwner,
+      bundleID: appBundle,
+      windows: records,
+      displays: CapturePlacement.merging(frames, host: host),
+      capturingDisplayID: capturing,
+      pinnedDisplayID: host.pinnedDisplayID
+    ))
+  }
+
+  private static func resolvedDisplay(_ display: SCDisplay, excluding ids: Set<CGWindowID>, in content: SCShareableContent, app: BrowserCaptureTarget) -> ResolvedCapture {
+    let excluded = content.windows.filter { ids.contains($0.windowID) }
+    let filter = SCContentFilter(display: display, excludingWindows: excluded)
+    let size = clampedPixels(Int(display.width), Int(display.height))
+    var target = app
+    target.kind = .display
+    target.id = 0
+    target.displayID = display.displayID
+    target.title = "Capture whole display"
+    target.width = size.width
+    target.height = size.height
+    let pid = content.windows.first { window in
+      let bundle = window.owningApplication?.bundleIdentifier ?? ""
+      let owner = window.owningApplication?.applicationName ?? ""
+      if !app.bundleID.isEmpty && bundle == app.bundleID { return true }
+      if !app.owner.isEmpty && owner.caseInsensitiveCompare(app.owner) == .orderedSame { return true }
+      return false
+    }?.owningApplication?.processID
+    return ResolvedCapture(target: target, filter: filter, pixelWidth: size.width, pixelHeight: size.height, pid: pid)
+  }
+
+  /// The same decision has to hold for a second. A Space change reports intermediate frames.
+  private func confirmed(_ decision: CapturePlacementDecision) -> CapturePlacementDecision? {
+    let key = decision.stableKey
+    let now = CACurrentMediaTime()
+    if key != placementKey {
+      placementKey = key
+      placementSince = now
+      return nil
+    }
+    if now - placementSince < 1 { return nil }
+    return decision
+  }
+
+  private func announceConflict(_ message: String) {
+    placementLock.lock()
+    let changed = conflictMessage != message || !blocksGlassesOutput
+    conflictMessage = message
+    blocksGlassesOutput = true
+    placementLock.unlock()
+    guard changed else { return }
+    browserCaptureLog.error("\(message, privacy: .public)")
+    let hook = onGlassesConflict
+    DispatchQueue.main.async {
+      hook?(message)
+    }
+  }
+
+  private func clearConflict(notify: Bool) {
+    placementLock.lock()
+    let had = blocksGlassesOutput || conflictMessage != nil
+    conflictMessage = nil
+    blocksGlassesOutput = false
+    placementLock.unlock()
+    guard had, notify else { return }
+    browserCaptureLog.info("full screen window left the glasses display")
+    let hook = onGlassesConflictCleared
+    DispatchQueue.main.async {
+      hook?()
+    }
+  }
+
+  private func applyNext(_ next: CapturePlacementNext, content: SCShareableContent, excluding ids: Set<CGWindowID>, token: Int, reason: String) async {
+    switch next {
+    case .unchanged:
+      browserCaptureLog.info("\(reason, privacy: .public)")
+    case .window(let record):
+      guard token == epoch, let target = activeTarget else { return }
+      guard let window = content.windows.first(where: { $0.windowID == record.id }) else { return }
+      if target.kind == .window && target.id == record.id {
+        browserCaptureLog.info("\(reason, privacy: .public)")
+        focusIfOffscreen(window)
+        return
+      }
+      browserCaptureLog.info("\(reason, privacy: .public)")
+      var updated = target
+      updated.kind = .window
+      updated.id = record.id
+      updated.title = record.title.isEmpty ? trackedTitle : record.title
+      updated.owner = record.owner.isEmpty ? trackedOwner : record.owner
+      updated.bundleID = record.bundleID.isEmpty ? trackedBundle : record.bundleID
+      updated.width = record.width
+      updated.height = record.height
+      updated.displayID = record.displayID
+      if !record.title.isEmpty { trackedTitle = updated.title }
+      if !record.owner.isEmpty { trackedOwner = updated.owner }
+      if !record.bundleID.isEmpty { trackedBundle = updated.bundleID }
+      if record.displayID != 0 { trackedDisplay = record.displayID }
+      await retarget(updated, window: window, holding: content, token: token)
+      focusIfOffscreen(window)
+    case .display(let id):
+      guard token == epoch, let target = activeTarget else { return }
+      if target.kind == .display && target.displayID == id {
+        browserCaptureLog.info("\(reason, privacy: .public)")
+        return
+      }
+      guard let display = content.displays.first(where: { $0.displayID == id }) else { return }
+      browserCaptureLog.info("\(reason, privacy: .public)")
+      if trackedBundle.isEmpty {
+        let records = content.windows.filter { Self.isFollowableWindow($0, excluding: ids) }.map { Self.record($0, displays: content.displays) }
+        if let window = records.first(where: { $0.displayID == id && !$0.bundleID.isEmpty && !CaptureWindowMatch.isPlaceholder($0) }) {
+          trackedBundle = window.bundleID
+          trackedOwner = window.owner
+        }
+      }
+      trackedDisplay = id
+      let skip = content.windows.filter { ids.contains($0.windowID) }
+      await retargetDisplay(display, excluding: skip, holding: content, token: token)
+      focusOffscreenApp(on: id, content: content, excluding: ids)
+    }
+  }
+
+  private func updateStreamSize(width: Int, height: Int, token: Int) async {
+    guard token == epoch, let stream, let configuration else { return }
+    if configuration.width == width && configuration.height == height { return }
+    configuration.width = width
+    configuration.height = height
+    if var target = activeTarget {
+      target.width = width
+      target.height = height
+      activeTarget = target
+    }
+    await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+      stream.updateConfiguration(configuration) { error in
+        if let error {
+          browserCaptureLog.error("updateConfiguration failed: \(error.localizedDescription, privacy: .public)")
+        }
+        continuation.resume()
+      }
+    }
+    browserCaptureLog.info("capture size \(width)x\(height) pixelFormat=BGRA dynamicRange=\(self.dynamicRangeName, privacy: .public)")
+  }
+
+  /// ScreenCaptureKit does not composite a full-screen Space that is not the active Space on that display.
+  /// The public activation call brings that Space forward. Each window is activated once, including when
+  /// follow switches to a fullscreen window after capture has already started.
+  private func focusOffscreenSource(content: SCShareableContent, resolved: ResolvedCapture) {
+    guard resolved.target.kind == .window, let window = content.windows.first(where: { $0.windowID == resolved.target.id }) else { return }
+    focusIfOffscreen(window)
+  }
+
+  private func focusOffscreenApp(on displayID: CGDirectDisplayID, content: SCShareableContent, excluding ids: Set<CGWindowID>) {
+    let windows = content.windows.filter { Self.isFollowableWindow($0, excluding: ids) && !$0.isOnScreen }
+    let match = windows.first { window in
+      let record = Self.record(window, displays: content.displays)
+      guard record.displayID == displayID else { return false }
+      if !trackedBundle.isEmpty, record.bundleID == trackedBundle { return true }
+      if !trackedOwner.isEmpty, record.owner.caseInsensitiveCompare(trackedOwner) == .orderedSame { return true }
+      return false
+    }
+    if let match { focusIfOffscreen(match) }
+  }
+
+  private func focusIfOffscreen(_ window: SCWindow) {
+    guard !window.isOnScreen, window.windowID != focusedWindowID else { return }
+    guard let pid = window.owningApplication?.processID, pid > 0 else { return }
+    guard let app = NSRunningApplication(processIdentifier: pid), !app.isTerminated else { return }
+    focusedWindowID = window.windowID
+    let ok = app.activate(options: [.activateIgnoringOtherApps])
+    browserCaptureLog.info("source window \(window.windowID) is off the active space; activated pid=\(pid) ok=\(ok). A full screen space is composited only while it is the active space on its display")
+  }
+
+  private func logTarget(_ resolved: ResolvedCapture, content: SCShareableContent, decision: CapturePlacementDecision, host: CaptureHostState) {
+    let window = content.windows.first { $0.windowID == resolved.target.id }
+    let onScreen = window?.isOnScreen ?? false
+    let active = resolved.target.kind == .window ? CaptureVisibility.onActiveSpace(resolved.target.id) : false
+    let activeText = resolved.target.kind == .window ? (active ? "true" : "false") : "n/a"
+    let frame = window?.frame ?? .zero
+    let version = ProcessInfo.processInfo.operatingSystemVersion
+    let os = "\(version.majorVersion).\(version.minorVersion).\(version.patchVersion)"
+    let filter = resolved.target.kind == .window ? "desktopIndependentWindow" : "displayExcludingWindows"
+    let glasses = host.glasses.map { "\($0.id):\($0.name)" }.joined(separator: ",")
+    let records = content.windows.filter { Self.isFollowableWindow($0, excluding: excludedIDs) }.map { Self.record($0, displays: content.displays) }
+    let listed = records.prefix(8).map { item in
+      "\(item.id) '\(item.title)' \(item.width)x\(item.height) onScreen=\(item.onScreen) display=\(item.displayID)"
+    }.joined(separator: " | ")
+    let line = "capture target filter=\(filter) id=\(resolved.target.id) title=\(resolved.target.title) owner=\(resolved.target.owner) bundle=\(resolved.target.bundleID) onScreen=\(onScreen) activeSpace=\(activeText) frame=\(Int(frame.width.rounded()))x\(Int(frame.height.rounded())) display=\(resolved.target.kind == .display ? resolved.target.displayID : trackedDisplay) pixels=\(resolved.pixelWidth)x\(resolved.pixelHeight) pixelFormat=BGRA dynamicRange=\(dynamicRangeName) pinned=\(host.pinnedDisplayID) glasses=[\(glasses)] placement=\(decision.stableKey) os=\(os)"
+    targetSummary = line
+    browserCaptureLog.info("\(line, privacy: .public)")
+    if !listed.isEmpty {
+      browserCaptureLog.info("capture windows \(listed, privacy: .public)")
+    }
   }
 
   private func beginSession() -> Bool {
@@ -1236,4 +1635,20 @@ final class BrowserCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
 private struct CaptureFailure: LocalizedError {
   var errorDescription: String?
   init(_ text: String) { errorDescription = text }
+}
+
+/// `CGWindowListCopyWindowInfo` is the public on-screen list. A window absent from it is not on the
+/// active Space of its display. `CGWindowListCreateImage` is obsolete and is not used.
+private enum CaptureVisibility {
+  static func onActiveSpace(_ windowID: UInt32) -> Bool {
+    guard windowID != 0 else { return false }
+    guard let info = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else {
+      return false
+    }
+    for item in info {
+      let number = (item[kCGWindowNumber as String] as? NSNumber)?.uint32Value ?? 0
+      if number == windowID { return true }
+    }
+    return false
+  }
 }

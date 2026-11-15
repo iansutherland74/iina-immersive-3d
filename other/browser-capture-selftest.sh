@@ -30,6 +30,7 @@ sources=(
   "$root/iina/Immersive3D/GlassesDrawable.swift"
   "$root/iina/Immersive3D/GlassesSession.swift"
   "$root/iina/Immersive3D/CaptureWindowMatch.swift"
+  "$root/iina/Immersive3D/CapturePlacement.swift"
   "$root/iina/Immersive3D/CaptureFrameCoalescer.swift"
   "$root/iina/Immersive3D/CaptureAudioPolicy.swift"
   "$root/iina/Immersive3D/CaptureOutputRoute.swift"
