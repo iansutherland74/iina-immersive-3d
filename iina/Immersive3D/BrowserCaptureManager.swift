@@ -116,7 +116,8 @@ final class BrowserCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
   private var placementKey = ""
   private var placementApplied = ""
   private var placementSince = 0.0
-  private var didFocusSource = false
+  /// Window id we already activated, so a later follow tick does not steal focus again.
+  private var focusedWindowID: CGWindowID = 0
   private var dynamicRangeName = "n/a"
   private var targetSummary = ""
   private var idleSince: CFTimeInterval = 0
@@ -454,7 +455,7 @@ final class BrowserCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
     placementKey = aligned.decision.stableKey
     placementApplied = placementKey
     placementSince = CACurrentMediaTime()
-    didFocusSource = false
+    focusedWindowID = 0
     loggedFirstFrame = false
     loggedPixelFormat = false
     idleSince = 0
@@ -551,7 +552,7 @@ final class BrowserCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
       placementKey = ""
       placementApplied = ""
       placementSince = 0
-      didFocusSource = false
+      focusedWindowID = 0
       targetSummary = ""
       clearConflict(notify: false)
     }
@@ -795,6 +796,7 @@ final class BrowserCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
         }
       }
     }
+    focusIfOffscreen(window)
   }
 
   /// Replaces any frame the draw queue has not started. One draw runs at a time; the next draw is the newest copy.
@@ -1493,11 +1495,12 @@ final class BrowserCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
       browserCaptureLog.info("\(reason, privacy: .public)")
     case .window(let record):
       guard token == epoch, let target = activeTarget else { return }
+      guard let window = content.windows.first(where: { $0.windowID == record.id }) else { return }
       if target.kind == .window && target.id == record.id {
         browserCaptureLog.info("\(reason, privacy: .public)")
+        focusIfOffscreen(window)
         return
       }
-      guard let window = content.windows.first(where: { $0.windowID == record.id }) else { return }
       browserCaptureLog.info("\(reason, privacy: .public)")
       var updated = target
       updated.kind = .window
@@ -1513,6 +1516,7 @@ final class BrowserCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
       if !record.bundleID.isEmpty { trackedBundle = updated.bundleID }
       if record.displayID != 0 { trackedDisplay = record.displayID }
       await retarget(updated, window: window, holding: content, token: token)
+      focusIfOffscreen(window)
     case .display(let id):
       guard token == epoch, let target = activeTarget else { return }
       if target.kind == .display && target.displayID == id {
@@ -1531,6 +1535,7 @@ final class BrowserCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
       trackedDisplay = id
       let skip = content.windows.filter { ids.contains($0.windowID) }
       await retargetDisplay(display, excluding: skip, holding: content, token: token)
+      focusOffscreenApp(on: id, content: content, excluding: ids)
     }
   }
 
@@ -1556,14 +1561,32 @@ final class BrowserCaptureManager: NSObject, SCStreamOutput, SCStreamDelegate {
   }
 
   /// ScreenCaptureKit does not composite a full-screen Space that is not the active Space on that display.
-  /// The public activation call brings that Space forward. It runs once per capture, so later clicks are left alone.
+  /// The public activation call brings that Space forward. Each window is activated once, including when
+  /// follow switches to a fullscreen window after capture has already started.
   private func focusOffscreenSource(content: SCShareableContent, resolved: ResolvedCapture) {
-    guard !didFocusSource, resolved.target.kind == .window, let pid = resolved.pid else { return }
-    guard let window = content.windows.first(where: { $0.windowID == resolved.target.id }), !window.isOnScreen else { return }
-    didFocusSource = true
+    guard resolved.target.kind == .window, let window = content.windows.first(where: { $0.windowID == resolved.target.id }) else { return }
+    focusIfOffscreen(window)
+  }
+
+  private func focusOffscreenApp(on displayID: CGDirectDisplayID, content: SCShareableContent, excluding ids: Set<CGWindowID>) {
+    let windows = content.windows.filter { Self.isFollowableWindow($0, excluding: ids) && !$0.isOnScreen }
+    let match = windows.first { window in
+      let record = Self.record(window, displays: content.displays)
+      guard record.displayID == displayID else { return false }
+      if !trackedBundle.isEmpty, record.bundleID == trackedBundle { return true }
+      if !trackedOwner.isEmpty, record.owner.caseInsensitiveCompare(trackedOwner) == .orderedSame { return true }
+      return false
+    }
+    if let match { focusIfOffscreen(match) }
+  }
+
+  private func focusIfOffscreen(_ window: SCWindow) {
+    guard !window.isOnScreen, window.windowID != focusedWindowID else { return }
+    guard let pid = window.owningApplication?.processID, pid > 0 else { return }
     guard let app = NSRunningApplication(processIdentifier: pid), !app.isTerminated else { return }
+    focusedWindowID = window.windowID
     let ok = app.activate(options: [.activateIgnoringOtherApps])
-    browserCaptureLog.info("source window \(resolved.target.id) is off the active space; activated pid=\(pid) ok=\(ok). A full screen space is composited only while it is the active space on its display")
+    browserCaptureLog.info("source window \(window.windowID) is off the active space; activated pid=\(pid) ok=\(ok). A full screen space is composited only while it is the active space on its display")
   }
 
   private func logTarget(_ resolved: ResolvedCapture, content: SCShareableContent, decision: CapturePlacementDecision, host: CaptureHostState) {
